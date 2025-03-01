@@ -8,7 +8,7 @@ class VisionModel(nn.Module):
     def __init__(self, config: ml_collections.ConfigDict):
         super(VisionModel, self).__init__(config)
 
-        self.embedding_dim = config.embedding_dim
+        self.embedding_dim = config.vision.embedding_dim
         self.encoder = CLIPVisionModel.from_pretrained(config.vit_name)
 
     def encode(self, x: torch.Tensor):
