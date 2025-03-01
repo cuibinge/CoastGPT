@@ -1,12 +1,7 @@
-import math
-from typing import Callable, Dict, Tuple, Union
-
 import ml_collections
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
 from transformers import CLIPVisionModel
-from transformers import BatchEncoding
 
 
 class VisionModel(nn.Module):
