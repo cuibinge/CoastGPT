@@ -145,7 +145,7 @@ class Block(nn.Module):
 
 
 
-
+#MTP on ViT
 class VisionTransformer(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_c=3, num_classes=1000,
                  embed_dim=768, depth=12, num_heads=12, mlp_ratio=4.0, qkv_bias=True,
