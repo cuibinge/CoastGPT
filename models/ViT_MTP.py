@@ -243,54 +243,50 @@ class VisionTransformer(nn.Module):
         x = torch.cat((cls_token, x), dim=1)
         x = self.pos_drop(x + self.pos_embed)
 
-        # 存储中间特征
         intermediate_features = []
         for blk in self.blocks:
             x = blk(x)
             intermediate_features.append(x)
-
         x = self.norm(x)
 
-        # 多任务训练分支
         if labels is not None:
+            # 拆解标签为元组 (主分类标签, 多任务预测标签)
+            y_cls, y_patch = labels
+
             total_loss = 0
             grid_size = self.patch_embed.grid_size
 
+            # 多任务预测分支
             for i in range(self.num_future_predict):
                 h_shift, w_shift = self.offset_config[i]
                 valid_h = grid_size[0] - h_shift
                 valid_w = grid_size[1] - w_shift
 
-                # 特征选择策略
+                # 特征选择
                 feat = intermediate_features[-4 + i] if i < 4 else intermediate_features[-1]
 
-                # 空间特征提取
+                # 空间特征处理
                 spatial_feat = feat[:, 1:].view(B, grid_size[0], grid_size[1], -1)
                 valid_feat = spatial_feat[:, :valid_h, :valid_w, :].reshape(B, -1, self.embed_dim)
 
                 # 预测计算
                 logits = self.predict_heads[i](valid_feat)
 
-                # 标签对齐
-                labels_flat = labels.view(B, grid_size[0], grid_size[1])
+                # 标签处理
+                labels_flat = y_patch.view(B, grid_size[0], grid_size[1])
                 shifted_labels = labels_flat[:, h_shift:, w_shift:].contiguous().view(B, -1)
 
                 # 损失计算
                 loss = F.cross_entropy(logits.view(-1, self.num_classes), shifted_labels.view(-1))
-                total_loss += loss * (0.4 / (i + 1))  # 衰减加权
+                total_loss += loss * (0.4 / (i + 1))
 
             # 主分类损失
             cls_logits = self.head(x[:, 0])
-            cls_loss = F.cross_entropy(cls_logits, labels.view(-1))
+            cls_loss = F.cross_entropy(cls_logits, y_cls)
 
             return cls_logits, total_loss + cls_loss
         else:
-            # 推理模式
-            if self.dist_token is None:
-                return self.head(x[:, 0])
-            else:
-                x, x_dist = self.head(x[:, 0]), self.head_dist(x[:, 1])
-                return (x + x_dist) / 2
+            return self.head(x[:, 0])
 
     # 位置感知特征提取
     def forward_features_with_position(self, x):
