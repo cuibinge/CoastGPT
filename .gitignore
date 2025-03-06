@@ -1,1 +1,4 @@
 /.idea
+models/__pycache__/__init__.cpython-310.pyc
+models/__pycache__/test4MTP.cpython-310-pytest-8.3.4.pyc
+models/__pycache__/ViT_MTP.cpython-310.pyc
