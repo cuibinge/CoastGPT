@@ -10,9 +10,9 @@ import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import wandb
 
-from CustomTrainer import deepspeed_init_distributed
-from CustomTrainer.EpochBasedTrainer import EpochBasedTrainer
-from CustomTrainer.utils import (
+from Trainer import deepspeed_init_distributed
+from Trainer.EpochBasedTrainer import EpochBasedTrainer
+from Trainer.utils import (
     ConfigArgumentParser,
     auto_resume_helper,
     setup_logger,
