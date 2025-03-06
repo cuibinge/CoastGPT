@@ -11,16 +11,16 @@ import torch.distributed as dist
 import wandb
 
 from CustomTrainer import deepspeed_init_distributed
-from lhrs.CustomTrainer.EpochBasedTrainer import EpochBasedTrainer
-from lhrs.CustomTrainer.utils import (
+from CustomTrainer.EpochBasedTrainer import EpochBasedTrainer
+from CustomTrainer.utils import (
     ConfigArgumentParser,
     auto_resume_helper,
     setup_logger,
     str2bool,
 )
-from lhrs.Dataset.build_loader import build_loader
-from lhrs.models import build_model
-from lhrs.optimizer import build_optimizer
+from Dataset.build_loader import build_loader
+from models import build_model
+from optimizer import build_optimizer
 
 logger = logging.getLogger("train")
 
