@@ -31,9 +31,9 @@ class Conversation:
     def get_prompt(self):
         """根据分隔符风格生成对话提示。"""
         messages = self.messages
-        # 处理包含图片的第一条消息
+        # 处理包含图片的第一条消息当对话的第一条消息包含图像信息（以元组形式存储）时，根据版本号是否包含 "mmtag" 来对消息进行不同的处理，以便后续生成合适的提示信息
         if len(messages) > 0 and isinstance(messages[0][1], tuple):
-            messages = self.messages.copy()
+            messages = self.messages.copy()#如果第一条消息包含图像信息，这里对原始消息列表进行浅拷贝，避免直接修改原始消息列表
             init_role, init_msg = messages[0].copy()
             init_msg = init_msg[0].replace("<image>", "").strip()
             if "mmtag" in self.version:
