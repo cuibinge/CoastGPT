@@ -11,8 +11,8 @@ from deepspeed.utils.zero_to_fp32 import (
     load_state_dict_from_zero_checkpoint,
 )
 from peft import PeftModel
-from Vision_model import VisionModel  # 自定义视觉模型模块
-from Language_model import LanguageModel  # 自定义语言模型模块
+from vision_model import VisionModel  # 自定义视觉模型模块
+from language_model import LanguageModel  # 自定义语言模型模块
 
 
 # 定义 CoastGPT 类，继承自 PyTorch 的 nn.Module
