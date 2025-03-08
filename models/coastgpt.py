@@ -114,3 +114,119 @@ class CoastGPT(nn.Module):
             stopping_criteria=stopping_criteria,
             **kwargs,
         )
+
+    def load_vision_encoder(self, path: str):
+        """
+        从检查点文件加载视觉编码器。
+
+        Args:
+            path (str): 检查点文件的路径。
+        """
+        ckpt = torch.load(path, map_location="cpu")  # 将检查点加载到 CPU 内存
+        if "model" in ckpt:
+            ckpt = ckpt["model"]  # 如果检查点包含 "model" 键，则提取该部分
+        # 将状态字典加载到视觉编码器中，strict=False 表示允许部分键不匹配
+        self.rgb.encoder.load_state_dict(ckpt, strict=False)
+
+    def custom_load_state_dict(self, state_dict_path, strict=False):
+        """
+        从指定路径加载模型的状态字典。
+
+        如果路径是目录，则从零检查点加载；
+        如果是文件，则加载检查点并提取视觉和文本部分。
+
+        Args:
+            state_dict_path (str): 状态字典的路径（可以是文件或目录）。
+            strict (bool, optional): 是否严格要求状态字典的键与模型的键完全匹配。默认值为 False。
+        """
+        if os.path.isdir(state_dict_path):
+            # 从零检查点目录加载状态字典（可能是 DeepSpeed 等框架的特性）
+            self = load_state_dict_from_zero_checkpoint(self, state_dict_path)
+            if isinstance(self.language.text_encoder, PeftModel):
+                # 如果文本编码器是 PeftModel，则合并并卸载它
+                self.language.text_encoder = self.language.text_encoder.merge_and_unload()
+            return None
+
+        # 从文件加载检查点
+        ckpt = torch.load(state_dict_path, map_location="cpu")
+        if "model" in ckpt.keys():
+            ckpt = ckpt["model"]  # 提取 "model" 部分（如果存在）
+        text_path = pathlib.Path(state_dict_path).parent / "TextLoRA"  # 构造 TextLoRA 目录路径
+
+        # 从检查点加载视觉部分
+        self.vision.load_state_dict(ckpt["rgb_ckpt"], strict=strict)
+        del ckpt  # 删除检查点以释放内存
+
+        if text_path.exists():
+            # 如果 TextLoRA 目录存在，则加载文本 LoRA
+            self.language.text_encoder = PeftModel.from_pretrained(
+                self.language.text_encoder,
+                text_path,
+                is_trainable=self.stage > 2,  # 仅在 stage > 2 时设置为可训练
+                torch_dtype=torch.float16,  # 使用 float16 数据类型
+            )
+
+            if self.stage == 0:  # Eval 模式
+                # 在评估模式下合并并卸载 PeftModel
+                self.language.text_encoder = self.language.text_encoder.merge_and_unload()
+
+        return None
+
+    def prepare_for_training(
+            self,
+            freeze_vision: bool = False,
+            freeze_text: bool = False,
+            model_path: str = None,  # 注意：原始代码中此处应为 None 而非 False，已更正
+            tune_im_start: bool = False,
+            compute_dtype: torch.dtype = torch.float32,
+    ):
+        """
+        准备模型进行训练，设置梯度和数据类型。
+
+        Args:
+            freeze_vision (bool, optional): 是否冻结视觉参数。默认值为 False。
+            freeze_text (bool, optional): 是否冻结文本参数。默认值为 False。
+            model_path (str, optional): 加载模型的路径。默认值为 None。
+            tune_im_start (bool, optional): 在冻结文本时是否调整输入嵌入。默认值为 False。
+            compute_dtype (torch.dtype, optional): 计算使用的数据类型。默认值为 torch.float32。
+        """
+        self.train()  # 将模型设置为训练模式
+
+        # 设置视觉参数的 requires_grad 属性并转换数据类型
+        for param in self.vision.parameters():
+            if freeze_vision:
+                param.requires_grad = False  # 冻结参数，不计算梯度
+            else:
+                param.requires_grad = True  # 解冻参数，计算梯度
+            param.data = param.data.to(dtype=compute_dtype)  # 转换为指定数据类型
+
+        # 将视觉缓冲区转换为计算数据类型（排除索引和 ID 相关的缓冲区）
+        for name, buffer in self.vision.named_buffers():
+            if "index" not in name and "id" not in name:
+                buffer.data = buffer.data.to(dtype=compute_dtype)
+
+        if freeze_text:
+            self.language.eval()  # 将文本编码器设置为评估模式
+            # 冻结输入和输出嵌入的参数
+            for p in self.language.get_text_encoder().get_input_embeddings().parameters():
+                p.requires_grad = False
+            for p in self.language.get_text_encoder().get_output_embeddings().parameters():
+                p.requires_grad = False
+        else:
+            # 即使不冻结文本，仍然冻结输入和输出嵌入（可能是特定设计选择）
+            for p in self.language.get_text_encoder().get_input_embeddings().parameters():
+                p.requires_grad = False
+            for p in self.language.get_text_encoder().get_output_embeddings().parameters():
+                p.requires_grad = False
+
+        if tune_im_start and freeze_text:
+            # 如果 tune_im_start 为 True 且文本被冻结，则解冻输入嵌入
+            for p in self.language.get_text_encoder().get_input_embeddings().parameters():
+                p.requires_grad = True
+            # 输出嵌入保持冻结状态（已在前面设置，此处无需重复）
+
+        if model_path is not None:
+            # 如果提供了模型路径，则加载模型
+            self.custom_load_state_dict(model_path)
+
+
