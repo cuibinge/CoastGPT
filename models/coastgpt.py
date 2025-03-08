@@ -13,6 +13,7 @@ from deepspeed.utils.zero_to_fp32 import (
 from peft import PeftModel
 from vision_model import VisionModel  # 自定义视觉模型模块
 from language_model import LanguageModel  # 自定义语言模型模块
+from embedding_model import EmbeddingModel
 
 
 # 定义 CoastGPT 类，继承自 PyTorch 的 nn.Module
@@ -30,6 +31,7 @@ class CoastGPT(nn.Module):
         # 初始化视觉和语言组件
         self.vision = VisionModel(config)  # 视觉处理模块
         self.language = LanguageModel(config)  # 语言处理模块
+        self.multimodal = EmbeddingModel(config)  # 多模态嵌入模块
 
     def forward(self, data: Dict):
         """
@@ -43,8 +45,12 @@ class CoastGPT(nn.Module):
         """
         # 通过视觉模型处理图像
         image_embedding = self.vision(data)
+
+        #多模态嵌入处理
+        multimodal_embedding = self.multimodal(data, image_embedding=image_embedding)
+
         # 通过语言模型处理组合输入
-        output = self.language(data, image_embedding=image_embedding)
+        output = self.language(data, multimodal_embedding=multimodal_embedding)
 
         return output
 
@@ -228,5 +234,3 @@ class CoastGPT(nn.Module):
         if model_path is not None:
             # 如果提供了模型路径，则加载模型
             self.custom_load_state_dict(model_path)
-
-
