@@ -297,11 +297,11 @@ class LanguageModel(nn.Module):
     def forward(
         self,
         x: Dict[str, Union[str, torch.Tensor, BatchEncoding]],
-        image_embedding: torch.Tensor = None,
+        multimodal_embedding: torch.Tensor = None,
         **kwargs,
     ):
         modal_input = self.get_modal_input(x)
-        return self.decode(**self.encode(modal_input), image_embedding=image_embedding, **kwargs)
+        return self.decode(**self.encode(modal_input), image_embedding=multimodal_embedding, **kwargs)
 
 
     def prepare_inputs_for_multimodal(
