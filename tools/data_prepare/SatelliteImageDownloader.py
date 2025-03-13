@@ -3,7 +3,7 @@ import requests
 import math
 import os
 
-# 你的 Google Maps API Key
+# Google Maps API Key
 API_KEY = "AIzaSyAXVvMxySW3a-NE_baAYhCUcOUIzhJf5U4"
 
 # 读取 JSON 文件
