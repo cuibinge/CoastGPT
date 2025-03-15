@@ -146,6 +146,7 @@ class CoastGPT(nn.Module):
             state_dict_path (str): 状态字典的路径（可以是文件或目录）。
             strict (bool, optional): 是否严格要求状态字典的键与模型的键完全匹配。默认值为 False。
         """
+        return None
         if os.path.isdir(state_dict_path):
             # 从零检查点目录加载状态字典（可能是 DeepSpeed 等框架的特性）
             self = load_state_dict_from_zero_checkpoint(self, state_dict_path)
