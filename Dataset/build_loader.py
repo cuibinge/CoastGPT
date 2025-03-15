@@ -7,7 +7,7 @@ import torch
 import webdataset as wds
 from torch.utils.data import DataLoader, DistributedSampler
 
-from ..Trainer.utils import InfiniteSampler
+from Trainer.utils import InfiniteSampler
 from .build_transform import build_cls_transform, build_vlp_transform
 from .cap_dataset import (
     CaptionDatasetVQA,
