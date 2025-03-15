@@ -1,9 +1,5 @@
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
-from models.ViT_MTP import VisionTransformer
-import torch.nn.functional as F
+from models.test.ViT_MTP import VisionTransformer
 
 
 def test_vit_mtp():

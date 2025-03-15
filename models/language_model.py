@@ -10,7 +10,8 @@ from transformers.models.llama import LlamaForCausalLM
 from transformers.models.llama.tokenization_llama_fast import LlamaTokenizerFast
 from transformers import BatchEncoding
 
-from ..Dataset import conversation as conversation_lib
+# problem
+from Dataset import conversation as conversation_lib
 from . import (
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
@@ -69,7 +70,7 @@ class LanguageModel(nn.Module):
 
         Encoder: LLaMA-v2-7B
         """
-        super(LanguageModel, self).__init__(config)
+        super(LanguageModel, self).__init__()
 
         self.embedding_dim = config.text.hidden_size
         self.tune_pooler = config.tune_rgb_pooler

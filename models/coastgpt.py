@@ -11,9 +11,9 @@ from deepspeed.utils.zero_to_fp32 import (
     load_state_dict_from_zero_checkpoint,
 )
 from peft import PeftModel
-from vision_model import VisionModel  # 自定义视觉模型模块
-from language_model import LanguageModel  # 自定义语言模型模块
-from embedding_model import EmbeddingModel
+from .vision_model import VisionModel  # 自定义视觉模型模块
+from .language_model import LanguageModel  # 自定义语言模型模块
+from .embedding_model import EmbeddingModel
 
 
 # 定义 CoastGPT 类，继承自 PyTorch 的 nn.Module
@@ -67,6 +67,7 @@ class CoastGPT(nn.Module):
         """
         # 从视觉模型获取原始图像嵌入
         image_embedding = self.vision.encode(image)
+        image_embedding = self.multimodal.encode_test(image_embedding)
         if pool:
             # 如果请求池化，返回平均池化的嵌入向量
             return image_embedding.mean(dim=1)
