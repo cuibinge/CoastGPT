@@ -11,7 +11,7 @@ from transformers.models.llama.tokenization_llama_fast import LlamaTokenizerFast
 from transformers import BatchEncoding
 
 # problem
-from lhrs.Dataset import conversation as conversation_lib
+from Dataset import conversation as conversation_lib
 from . import (
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
