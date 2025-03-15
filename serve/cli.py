@@ -28,6 +28,7 @@ import cv2
 
 
 # 定义一个函数，用于按比例缩放边界框
+# cli.py 文件提供了一个简单的命令行界面，允许用户输入文本和图像，与预训练的多模态模型进行交互。通过辅助函数处理图像和边界框，使用对话模板管理对话流程，并根据用户输入生成响应
 def scale_bounding_box(box, scale_factor=1.2):
     # 提取边界框的左上角和右下角坐标
     top_left_x, top_left_y, bottom_right_x, bottom_right_y = box
