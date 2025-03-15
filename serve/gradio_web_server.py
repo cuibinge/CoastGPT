@@ -159,7 +159,7 @@ def http_bot(state, model_selector, temperature, top_p, max_new_tokens, request:
 # 定义标题的 Markdown 文本
 title_markdown = ("""
 # 🛰️ RemoteChat: Advanced Remote Sensing and Spatial Intelligence Model
-[[Project Page]()] [[Code]()] [[Model]()] | 📚 [[]()] [[GeoChat-v1]()]
+[[Project Page]()] [[Code]()] [[Model]()] | 📚 [[]()] [[CoastGPT]()]
 """)
 
 # 定义使用条款的 Markdown 文本
