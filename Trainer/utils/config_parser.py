@@ -19,7 +19,7 @@ class ConfigArgumentParser(argparse.ArgumentParser):
         self.config_parser.add_argument(
             "-c",
             "--config",
-            default=None,
+            default="Config/inferebce_test.yaml",
             metavar="FILE",
             help="where to load YAML configuration",
         )
