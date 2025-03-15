@@ -29,3 +29,17 @@ class EmbeddingModel(nn.Module):
         # 通过投影层将图像嵌入映射到语言嵌入维度
         projected_image_embedding = self.projection(image_embedding)
         return projected_image_embedding
+
+    def encode_test(self, image_embedding):
+        """
+        纯图像编码测试。
+
+        参数:
+            image_embedding: 视觉模型输出的图像嵌入，形状为 (batch_size, vision_embedding_dim)
+
+        返回:
+            multimodal_embedding: 多模态嵌入，形状为 (batch_size, language_embedding_dim)
+        """
+        # 通过投影层将图像嵌入映射到语言嵌入维度
+        projected_image_embedding = self.projection(image_embedding)
+        return projected_image_embedding
