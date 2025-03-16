@@ -1,4 +1,4 @@
-#源于LHRS
+#源于mmengine.runner.IterBasedRunner
 import logging
 from typing import List
 

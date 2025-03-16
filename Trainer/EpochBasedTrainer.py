@@ -1,5 +1,5 @@
 
-#源于LHRS
+#源于mmengine.runner.EpochBasedRunner
 import logging
 from typing import List
 
