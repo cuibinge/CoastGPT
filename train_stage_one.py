@@ -218,7 +218,7 @@ def add_hardware_config(parser):
 # 初始化训练环境的函数
 # 包括分布式训练环境的初始化、日志记录器的设置、随机种子的设置等
 def init_training_environment(config):
-    # 初始化分布式训练环境，获取当前进程的全局排名、本地排名和世界大小
+    # 初始化分布式训练环境
     config.rank, config.local_rank, config.world_size = deepspeed_init_distributed()
     # 判断是否为分布式训练
     config.is_distribute = config.world_size > 1
