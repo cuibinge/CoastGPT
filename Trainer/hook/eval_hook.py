@@ -17,7 +17,7 @@ from .logger_hook import LoggerHook
 
 logger = logging.getLogger("train")
 
-
+#源于mmdet.hooks.EvalHook
 class EvalHook(HookBase):
     """Run an evaluation function periodically.
 

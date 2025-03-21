@@ -28,9 +28,9 @@ class HookBase:
     # A weak reference to the trainer object. Set by the trainer when the hook is registered.
 
     def __init__(self):
-        import lhrs.CustomTrainer
+        import Trainer
 
-        self.trainer: "lhrs.CustomTrainer.Trainer" = None
+        self.trainer: "Trainer.Trainer" = None
 
     def before_train(self) -> None:
         """Called before the first iteration."""
@@ -75,7 +75,7 @@ class HookBase:
         return self.__class__.__name__
 
     @property
-    def metric_storage(self) -> "CustomTrainer.MetricStroge":
+    def metric_storage(self) -> "Trainer.MetricStroge":
         return self.trainer.metric_storage
 
     def log(self, *args, **kwargs) -> None:

@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 from ..utils.distribute import is_main_process
 from .hookbase import HookBase
 
-
+#源于mmengine.hooks.CheckpointHook
 class CheckpointerHook(HookBase):
     """
     Save checkpoints periodically.
