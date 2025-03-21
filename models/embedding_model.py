@@ -3,6 +3,7 @@ import torch  # 导入PyTorch核心库
 import torch.nn as nn  # 导入PyTorch的神经网络模块
 from typing import Dict, List, Optional, Tuple, Union
 
+
 class EmbeddingModel(nn.Module):
     def __init__(self, config: ml_collections.ConfigDict):
         """
@@ -12,6 +13,11 @@ class EmbeddingModel(nn.Module):
             config: 包含模型参数的配置字典，包括 vision.embedding_dim 和 language.embedding_dim
         """
         super(EmbeddingModel, self).__init__()
+        self.geo_encoder = nn.Sequential(
+            nn.Linear(2, 256),
+            nn.ReLU(),
+            nn.Linear(256, 1024)
+        )
         # 定义投影层
         self.projection = nn.Linear(config.vision.embedding_dim, config.language.embedding_dim)
 
@@ -26,9 +32,18 @@ class EmbeddingModel(nn.Module):
         返回:
             multimodal_embedding: 多模态嵌入，形状为 (batch_size, language_embedding_dim)
         """
-        # 通过投影层将图像嵌入映射到语言嵌入维度
-        projected_image_embedding = self.projection(image_embedding)
-        return projected_image_embedding
+        # 地理位置编码
+        lat, lon = data["lat"], data["lon"]
+        lat_norm = (lat + 90) / 180  # 标准化
+        lon_norm = (lon + 180) / 360
+        geo_input = torch.tensor([lat_norm, lon_norm])  # [2]
+        geo_embedding = self.geo_encoder(geo_input)
+        # 拼接地理位置到 Token 序列
+        geo_embedding = geo_embedding.unsqueeze(1)
+        multimodal_embedding = torch.cat([image_embedding, geo_embedding], dim=1)
+        # 通过投影层将多模态嵌入映射到语言嵌入维度
+        projected_multimodal_embedding = self.projection(multimodal_embedding)
+        return projected_multimodal_embedding
 
     def encode_test(self, image_embedding):
         """
