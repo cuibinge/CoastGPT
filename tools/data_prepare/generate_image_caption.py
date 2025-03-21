@@ -199,7 +199,7 @@ def main():
             # 构建数据项
             dataset["data"].append({
                 "name": filename.rsplit(".", 1)[0],
-                "metadata": {
+                "info": {
                     "satellite": metadata["satellite"],
                     "sensor": metadata["sensor"],
                     "acquisition_date": metadata["date"],
