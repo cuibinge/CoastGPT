@@ -59,10 +59,10 @@ def save_selected_entries_to_json(entries, output_file):
     print(f"Selected entries saved to {output_file}")
 
 if __name__ == "__main__":
-    API_KEY = "AIzaSyBKmYnmFFIggvLNzz7neF3gppE1RddN7QQ" # Replace with your API key
-    SESSION_TOKEN = "AJVsH2zAgabQ5NhJ37xR5lv6n9pNdwplEyaIj_qAP68gDgYT4jTAdAC_SPEkAm0mkoir-baCd9YK80IoFMuaOGFK" # Replace with your session token
-    JSON_FILE = "D:\LHRS\OSCapAnn(Stage1)\captions_01.json" # Replace with the path to your JSON file
-    OUTPUT_FOLDER = r"C:\Users\zhhq9\Desktop\captions_01" # Folder to save downloaded tiles
+    API_KEY = "" # Replace with your API key
+    SESSION_TOKEN = "" # Replace with your session token
+    JSON_FILE = "D:\LHRS\OSCapAnn(Stage1)\captions_02.json" # Replace with the path to your JSON file
+    OUTPUT_FOLDER = r"C:\Users\zhhq9\Desktop\captions_02" # Folder to save downloaded tiles
     ZOOM = 18 # Adjust zoom level as needed
 
     # Extract all entries from the JSON file
