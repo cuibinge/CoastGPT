@@ -46,7 +46,7 @@ class CoastGPT(nn.Module):
         # 通过视觉模型处理图像
         image_embedding = self.vision(data)
 
-        #多模态嵌入处理
+        # 多模态嵌入处理
         multimodal_embedding = self.multimodal(data, image_embedding=image_embedding)
 
         # 通过语言模型处理组合输入
@@ -184,7 +184,8 @@ class CoastGPT(nn.Module):
             self,
             freeze_vision: bool = False,
             freeze_text: bool = False,
-            model_path: str = None,  # 注意：原始代码中此处应为 None 而非 False，已更正
+            tune_multimodal: bool = False,
+            model_path: str = None,
             tune_im_start: bool = False,
             compute_dtype: torch.dtype = torch.float32,
     ):
@@ -194,6 +195,7 @@ class CoastGPT(nn.Module):
         Args:
             freeze_vision (bool, optional): 是否冻结视觉参数。默认值为 False。
             freeze_text (bool, optional): 是否冻结文本参数。默认值为 False。
+            tune_multimodal (bool, optional): 是否冻结多模态参数。默认值为 False。
             model_path (str, optional): 加载模型的路径。默认值为 None。
             tune_im_start (bool, optional): 在冻结文本时是否调整输入嵌入。默认值为 False。
             compute_dtype (torch.dtype, optional): 计算使用的数据类型。默认值为 torch.float32。
@@ -226,6 +228,14 @@ class CoastGPT(nn.Module):
                 p.requires_grad = False
             for p in self.language.get_text_encoder().get_output_embeddings().parameters():
                 p.requires_grad = False
+
+        # 多模态相关参数是否训练
+        for param in self.multimodal.parameters():
+            if tune_multimodal:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+            param.data = param.data.to(dtype=compute_dtype)
 
         if tune_im_start and freeze_text:
             # 如果 tune_im_start 为 True 且文本被冻结，则解冻输入嵌入
