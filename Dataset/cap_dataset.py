@@ -25,7 +25,7 @@ from webdataset.tariterators import (
     valid_sample,
 )
 
-from models import (
+from Models import (
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
     DEFAULT_IMAGE_TOKEN,

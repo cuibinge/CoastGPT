@@ -19,8 +19,8 @@ from Trainer.utils import (
     str2bool,
 )
 from Dataset.build_loader import build_loader
-from models import build_model
-from optimizer import build_optimizer
+from Models import build_model
+from Trainer.optimizer import build_optimizer
 
 # 创建训练过程专用的日志记录器
 logger = logging.getLogger("train")

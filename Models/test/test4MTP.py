@@ -1,5 +1,5 @@
 import torch
-from models.test.ViT_MTP import VisionTransformer
+from Models.test.ViT_MTP import VisionTransformer
 
 
 def test_vit_mtp():
