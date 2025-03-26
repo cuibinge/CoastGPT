@@ -1,5 +1,5 @@
 # CoastGPT
-# LHRS-Bot Installation Guide
+# CoastGPT Installation Guide
 
 ## Preparation
 
