@@ -12,7 +12,7 @@
 
 ### 1. Clone Repository
 ```bash
-git clone git@github.com:NJU-LHRS/LHRS-Bot.git
+git clone git@github.com:cuibinge/CoastGPT.git
 cd LHRS-Bot
 conda create -n lhrs python=3.10
 conda activate lhrs
