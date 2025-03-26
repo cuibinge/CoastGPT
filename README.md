@@ -13,8 +13,8 @@
 ### 1. Clone Repository
 ```bash
 git clone git@github.com:cuibinge/CoastGPT.git
-cd LHRS-Bot
-conda create -n lhrs python=3.10
-conda activate lhrs
+cd CoastGPT
+conda create -n CoastGPT python=3.10
+conda activate CoastGPT
 pip install requirement
 ```
