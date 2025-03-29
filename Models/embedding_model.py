@@ -52,10 +52,10 @@ class EmbeddingModel(nn.Module):
         timestamp = data["timestamp"]  # 假设格式为 [year, month, day, hour, minute, second]
         # 标准化时间特征
         time_norm = torch.tensor([
-            (timestamp[0] - 2000) / 50.0,  # 年份标准化（假设2000-2050）
+            (timestamp[0] - 2000) / 100.0,  # 年份标准化
             timestamp[1] / 12.0,  # 月份
             timestamp[2] / 31.0,  # 日
-            timestamp[3] / 240,  # 小时
+            timestamp[3] / 24,  # 小时
             timestamp[4] / 60.0,  # 分钟
             timestamp[5] / 60.0  # 秒
         ])
@@ -64,7 +64,7 @@ class EmbeddingModel(nn.Module):
 
         # 拼接所有嵌入
         multimodal_embedding = torch.cat([image_embedding, geo_embedding, time_embedding], dim=1)
-        
+
         # 通过投影层将多模态嵌入映射到语言嵌入维度
         projected_multimodal_embedding = self.projection(multimodal_embedding)
         return projected_multimodal_embedding
