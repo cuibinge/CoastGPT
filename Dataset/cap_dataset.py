@@ -79,23 +79,30 @@ class CaptionDataset(torch.utils.data.Dataset):
         self,
         root: Union[Path, str] = ".data/rsicd",
         transform: T.Compose = None,
+        specific_dataset: str = None
     ):
         if isinstance(root, str):
             root = Path(root)
 
         self.root = root
         self.transform = transform
-        self.img_dir = list(self.root.glob("*_Image"))
-        self.json_dir = []
-        for i in self.img_dir:
-            if "OSM" not in i.stem:
-                self.json_dir.append(i.parent / (i.stem.split("_Image")[0] + ".json"))
-            else:
-                may_be_exist = i.parent / "OSMCapAnn"
-                if may_be_exist.exists():
-                    self.json_dir.append(may_be_exist)
-                else:
+        self.specific_dataset = specific_dataset
+
+        if specific_dataset:
+            self.img_dir = [Path(specific_dataset).parent]
+            self.json_dir = [Path(specific_dataset)]
+        else:
+            self.img_dir = list(self.root.glob("*_Image"))
+            self.json_dir = []
+            for i in self.img_dir:
+                if "OSM" not in i.stem:
                     self.json_dir.append(i.parent / (i.stem.split("_Image")[0] + ".json"))
+                else:
+                    may_be_exist = i.parent / "OSMCapAnn"
+                    if may_be_exist.exists():
+                        self.json_dir.append(may_be_exist)
+                    else:
+                        self.json_dir.append(i.parent / (i.stem.split("_Image")[0] + ".json"))
 
         self.img_list = []
         self.cap_list = []
@@ -108,32 +115,45 @@ class CaptionDataset(torch.utils.data.Dataset):
     def load_dataset(self):
         for i in range(len(self.img_dir)):
             if "OSM" not in self.img_dir[i].stem:
-                with open(self.json_dir[i], "rb") as f:
-                    data = json.load(f)
-
-            if "TextRS" in self.img_dir[i].stem:
-                text_rs = data["TextRS"]
-                for j in range(len(text_rs)):
-                    img_path = self.img_dir[i] / (text_rs[j]["image"] + ".png")
-                    if valid_path(img_path):
-                        self.img_list.append(self.img_dir[i] / (text_rs[j]["image"] + ".png"))
-                        self.cap_list.append(text_rs[j]["annotation"]["caption"][0])
-            elif "UAVICD" in self.img_dir[i].stem:
-                for j in range(len(data["images"])):
-                    img_path = self.img_dir[i] / data["images"][j]["SubFolder"] / data["images"][j]["ImageName"]
-                    if valid_path(img_path):
-                        self.img_list.append(
-                            self.img_dir[i] / data["images"][j]["SubFolder"] / data["images"][j]["ImageName"]
-                        )
-                        self.cap_list.append(data["images"][j]["Caption"])
-            elif "NWPU" in self.img_dir[i].stem:
-                for sub_folder in data.keys():
-                    sub_data = data[sub_folder]
-                    for j in range(len(sub_data)):
-                        img_path = self.img_dir[i] / sub_folder / sub_data[j]["filename"]
-                        if valid_path(img_path):
-                            self.img_list.append(self.img_dir[i] / sub_folder / sub_data[j]["filename"])
-                            self.cap_list.append(sub_data[j]["raw"])
+                try:
+                    with open(self.json_dir[i], "rb") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict) and "data" in data:
+                        for item in data["data"]:
+                            name = item["name"]
+                            country, city = item["info"]["location"]
+                            img_path = self.img_dir[i] / country / city / (name + ".jpg")
+                            if valid_path(img_path):
+                                self.img_list.append(img_path)
+                                self.cap_list.append(item["caption"])
+                    elif "TextRS" in self.img_dir[i].stem:
+                        text_rs = data["TextRS"]
+                        for j in range(len(text_rs)):
+                            img_path = self.img_dir[i] / (text_rs[j]["image"] + ".png")
+                            if valid_path(img_path):
+                                self.img_list.append(self.img_dir[i] / (text_rs[j]["image"] + ".png"))
+                                self.cap_list.append(text_rs[j]["annotation"]["caption"][0])
+                    elif "UAVICD" in self.img_dir[i].stem:
+                        for j in range(len(data["images"])):
+                            img_path = self.img_dir[i] / data["images"][j]["SubFolder"] / data["images"][j]["ImageName"]
+                            if valid_path(img_path):
+                                self.img_list.append(
+                                    self.img_dir[i] / data["images"][j]["SubFolder"] / data["images"][j]["ImageName"]
+                                )
+                                self.cap_list.append(data["images"][j]["Caption"])
+                    elif "NWPU" in self.img_dir[i].stem:
+                        for sub_folder in data.keys():
+                            sub_data = data[sub_folder]
+                            for j in range(len(sub_data)):
+                                img_path = self.img_dir[i] / sub_folder / sub_data[j]["filename"]
+                                if valid_path(img_path):
+                                    self.img_list.append(self.img_dir[i] / sub_folder / sub_data[j]["filename"])
+                                    self.cap_list.append(sub_data[j]["raw"])
+                    else:
+                        logger.warning(f"JSON 文件 {self.json_dir[i]} 格式不符合预期，跳过。")
+                except FileNotFoundError:
+                    logger.warning(f"文件未找到: {self.json_dir[i]}")
+                    continue
             elif "OSM" in self.img_dir[i].stem:
                 for json_file in self.json_dir[i].iterdir():
                     if json_file.is_file() and json_file.suffix == ".json":
@@ -155,11 +175,7 @@ class CaptionDataset(torch.utils.data.Dataset):
                         self.img_list.append(image_path)
                         self.cap_list.append(item["conv"])
             else:
-                for j in range(len(data["images"])):
-                    img_path = self.img_dir[i] / data["images"][j]["filename"]
-                    if valid_path(img_path):
-                        self.img_list.append(self.img_dir[i] / data["images"][j]["filename"])
-                        self.cap_list.append(data["images"][j]["sentences"][0]["raw"])
+                logger.warning(f"不支持的数据集类型: {self.img_dir[i].stem}")
 
     def __len__(self) -> int:
         return len(self.cap_list)
