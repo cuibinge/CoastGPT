@@ -20,7 +20,7 @@ from Trainer.utils import (
 )
 from Dataset.build_loader import build_loader
 from models import build_model
-from optimizer import build_optimizer
+from Trainer.optimizer import build_optimizer
 
 # 创建名为 'train' 的日志记录器
 # 用于记录训练过程中的各种信息，方便调试和监控
