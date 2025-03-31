@@ -10,7 +10,7 @@ from transformers import TextStreamer
 from Trainer.utils import ConfigArgumentParser, str2bool
 from Dataset.build_transform import build_vlp_transform
 from Dataset.conversation import SeparatorStyle, default_conversation
-from models import (
+from Models import (
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
     DEFAULT_IMAGE_PATCH_TOKEN,
@@ -18,8 +18,8 @@ from models import (
     IMAGE_TOKEN_INDEX,
     tokenizer_image_token,
 )
-from models.coastgpt import CoastGPT
-from models.utils import KeywordsStoppingCriteria, type_dict
+from Models.coastgpt import CoastGPT
+from Models.utils import KeywordsStoppingCriteria, type_dict
 
 
 def load_image(image_file):
