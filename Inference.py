@@ -51,7 +51,7 @@ def parse_option():
     )
 
     # basic
-    parser.add_argument("--image-file", type=str, default="Image/yzq.jpg", help="path to image")
+    parser.add_argument("--image-file", type=str, default="Images/yzq.jpg", help="path to image")
     parser.add_argument(
         "--model-path",
         type=str,
