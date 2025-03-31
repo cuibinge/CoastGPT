@@ -18,6 +18,12 @@ class VisionModel(nn.Module):
         # 从预训练模型加载CLIP视觉编码器，模型名称由配置中的vit_name指定
         self.encoder = CLIPVisionModel.from_pretrained(config.vit_name)
 
+        self.extract_stage = [
+            self.encoder.config.num_hidden_layers // 3 - 1,
+            self.encoder.config.num_hidden_layers // 3 * 2 - 1,
+            self.encoder.config.num_hidden_layers - 2,
+        ]
+
     def encode(self, x: torch.Tensor):
         """
         对输入图像进行编码
@@ -35,7 +41,14 @@ class VisionModel(nn.Module):
             output_hidden_states=True, # 返回所有隐藏状态
         )
         # 从输出中提取最后一层隐藏状态，去掉CLS token（第0个位置），仅保留补丁嵌入
-        image_embeds = outputs.hidden_states[-7][:, 1:, :]
+        # image_embeds = outputs.hidden_states[-7][:, 1:, :]
+
+        image_embeds = []
+        for idx, stage in enumerate(self.extract_stage):
+            current_hidden_states = outputs.hidden_states[stage][:, 1:, :]
+            image_embeds.append(current_hidden_states)
+        image_embeds = torch.cat(image_embeds, dim=1)
+
         return image_embeds
 
     def forward(self, x):
