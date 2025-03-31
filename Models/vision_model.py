@@ -35,7 +35,7 @@ class VisionModel(nn.Module):
             output_hidden_states=True, # 返回所有隐藏状态
         )
         # 从输出中提取最后一层隐藏状态，去掉CLS token（第0个位置），仅保留补丁嵌入
-        image_embeds = outputs.hidden_states[-1][:, 1:, :]
+        image_embeds = outputs.hidden_states[-7][:, 1:, :]
         return image_embeds
 
     def forward(self, x):
