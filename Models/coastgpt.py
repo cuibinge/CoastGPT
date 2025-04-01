@@ -43,6 +43,9 @@ class CoastGPT(nn.Module):
         返回:
             结合视觉和语言处理的模型输出
         """
+        out = dict()
+        total_loss = 0.0
+
         # 通过视觉模型处理图像
         image_embedding = self.vision(data)
 
@@ -52,7 +55,12 @@ class CoastGPT(nn.Module):
         # 通过语言模型处理组合输入
         output = self.language(data, multimodal_embedding=multimodal_embedding)
 
-        return output
+        text_loss = output
+        total_loss += text_loss
+        out.update({"text_loss": text_loss})
+        out.update({"total_loss": total_loss})
+
+        return out
 
     def encode_image(self, image, pool):
         """
