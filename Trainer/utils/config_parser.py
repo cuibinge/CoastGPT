@@ -19,7 +19,7 @@ class ConfigArgumentParser(argparse.ArgumentParser):
         self.config_parser.add_argument(
             "-c",
             "--config",
-            default="Configs/train.yaml",
+            default="Configs/inference.yaml",
             metavar="FILE",
             help="where to load YAML configuration",
         )
