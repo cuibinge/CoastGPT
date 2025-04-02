@@ -16,6 +16,7 @@ from .language_model import LanguageModel  # 自定义语言模型模块
 # from .embedding_model import EmbeddingModel
 from .embedding_model_r1 import EmbeddingModel
 
+
 # 定义 CoastGPT 类，继承自 PyTorch 的 nn.Module
 class CoastGPT(nn.Module):
     def __init__(self, config: ml_collections.ConfigDict):
@@ -154,39 +155,46 @@ class CoastGPT(nn.Module):
             state_dict_path (str): 状态字典的路径（可以是文件或目录）。
             strict (bool, optional): 是否严格要求状态字典的键与模型的键完全匹配。默认值为 False。
         """
-        return None
-        if os.path.isdir(state_dict_path):
-            # 从零检查点目录加载状态字典（可能是 DeepSpeed 等框架的特性）
-            self = load_state_dict_from_zero_checkpoint(self, state_dict_path)
-            if isinstance(self.language.text_encoder, PeftModel):
-                # 如果文本编码器是 PeftModel，则合并并卸载它
-                self.language.text_encoder = self.language.text_encoder.merge_and_unload()
-            return None
+        # return None
+        # if os.path.isdir(state_dict_path):
+        #     # 从零检查点目录加载状态字典（可能是 DeepSpeed 等框架的特性）
+        #     self = load_state_dict_from_zero_checkpoint(self, state_dict_path)
+        #     if isinstance(self.language.text_encoder, PeftModel):
+        #         # 如果文本编码器是 PeftModel，则合并并卸载它
+        #         self.language.text_encoder = self.language.text_encoder.merge_and_unload()
+        #     return None
 
         # 从文件加载检查点
         ckpt = torch.load(state_dict_path, map_location="cpu")
-        if "model" in ckpt.keys():
-            ckpt = ckpt["model"]  # 提取 "model" 部分（如果存在）
-        text_path = pathlib.Path(state_dict_path).parent / "TextLoRA"  # 构造 TextLoRA 目录路径
 
-        # 从检查点加载视觉部分
-        self.vision.load_state_dict(ckpt["rgb_ckpt"], strict=strict)
-        del ckpt  # 删除检查点以释放内存
+        msg = self.load_state_dict(ckpt["module"], strict=strict)
 
-        if text_path.exists():
-            # 如果 TextLoRA 目录存在，则加载文本 LoRA
-            self.language.text_encoder = PeftModel.from_pretrained(
-                self.language.text_encoder,
-                text_path,
-                is_trainable=self.stage > 2,  # 仅在 stage > 2 时设置为可训练
-                torch_dtype=torch.float16,  # 使用 float16 数据类型
-            )
-
-            if self.stage == 0:  # Eval 模式
-                # 在评估模式下合并并卸载 PeftModel
-                self.language.text_encoder = self.language.text_encoder.merge_and_unload()
+        print(f"After loading: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
 
         return None
+
+        # if "model" in ckpt.keys():
+        #     ckpt = ckpt["model"]  # 提取 "model" 部分（如果存在）
+        # text_path = pathlib.Path(state_dict_path).parent / "TextLoRA"  # 构造 TextLoRA 目录路径
+        #
+        # # 从检查点加载视觉部分
+        # self.vision.load_state_dict(ckpt["rgb_ckpt"], strict=strict)
+        # del ckpt  # 删除检查点以释放内存
+        #
+        # if text_path.exists():
+        #     # 如果 TextLoRA 目录存在，则加载文本 LoRA
+        #     self.language.text_encoder = PeftModel.from_pretrained(
+        #         self.language.text_encoder,
+        #         text_path,
+        #         is_trainable=self.stage > 2,  # 仅在 stage > 2 时设置为可训练
+        #         torch_dtype=torch.float16,  # 使用 float16 数据类型
+        #     )
+        #
+        #     if self.stage == 0:  # Eval 模式
+        #         # 在评估模式下合并并卸载 PeftModel
+        #         self.language.text_encoder = self.language.text_encoder.merge_and_unload()
+        #
+        # return None
 
     def prepare_for_training(
             self,
