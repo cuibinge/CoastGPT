@@ -51,11 +51,11 @@ def parse_option():
     )
 
     # basic
-    parser.add_argument("--image-file", type=str, default="Images/yzq.jpg", help="path to image")
+    parser.add_argument("--image-file", type=str, default="Images/test.png", help="path to image")
     parser.add_argument(
         "--model-path",
         type=str,
-        default="Checkpoint/Stage3/FINAL.pt",
+        default="Checkpoint/test/checkpoints/iter_1999/mp_rank_00_model_states.pt",
         help="pretrained checkpoint path for vision encoder",
     )
     parser.add_argument("--seed", type=int, default=322, help="random seed")
