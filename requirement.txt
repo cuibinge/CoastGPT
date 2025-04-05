@@ -17,3 +17,6 @@
     accelerate==0.25.0,
     albumentations,
     bitsandbytes==0.41.3,
+    deepspeed,
+    wandb
+
