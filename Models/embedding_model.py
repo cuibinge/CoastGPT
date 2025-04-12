@@ -2,6 +2,7 @@ import ml_collections  # 导入ml_collections库，用于管理配置
 import torch  # 导入PyTorch核心库
 import torch.nn as nn  # 导入PyTorch的神经网络模块
 from typing import Dict, List, Optional, Tuple, Union
+from .common_arch import AttnPooler, LayerNorm, LayerNormFp32
 
 
 class EmbeddingModel(nn.Module):
@@ -12,22 +13,44 @@ class EmbeddingModel(nn.Module):
         参数:
             config: 包含模型参数的配置字典，包括 vision.embedding_dim 和 language.embedding_dim
         """
+        self.vision_embedding_dim = config.vision.embedding_dim
+        self.language_embedding_dim = config.language.embedding_dim
+
         super(EmbeddingModel, self).__init__()
         # 地理位置编码器
         self.geo_encoder = nn.Sequential(
             nn.Linear(2, 256),
             nn.ReLU(),
-            nn.Linear(256, 1024)
+            nn.Linear(256, self.language_embedding_dim)
         )
 
         # 时间编码器
         self.time_encoder = nn.Sequential(
             nn.Linear(6, 256),  # 输入6维时间特征（年、月、日、时、分、秒）
             nn.ReLU(),
-            nn.Linear(256, 1024)
+            nn.Linear(256, self.language_embedding_dim)
         )
         # 定义投影层
-        self.projection = nn.Linear(config.vision.embedding_dim, config.language.embedding_dim)
+        # self.projection = nn.Linear(config.vision.embedding_dim, config.language.embedding_dim)
+
+        # 使用LHRS的连接层
+        if config.adjust_norm:
+            norm_layer = (
+                LayerNormFp32 if config.dtype in ("float16", "bfloat16") else LayerNorm
+            )
+        else:
+            norm_layer = LayerNorm
+
+        self.projection = AttnPooler(
+            num_query=config.rgb_vision.attn_pooler.num_query,
+            num_layers=config.rgb_vision.attn_pooler.num_layers,
+            num_attention_heads=config.rgb_vision.attn_pooler.num_attn_heads,
+            encoder_hidden_size=config.vision.embedding_dim,
+            hidden_size=config.vision.embedding_dim,
+            output_size=config.text.hidden_size,
+            norm_layer=norm_layer,
+            checkpoint=getattr(config, "use_checkpoint", False),
+        )
 
     def forward(self, data: Dict, image_embedding):
         """
@@ -62,12 +85,12 @@ class EmbeddingModel(nn.Module):
         time_embedding = self.time_encoder(time_norm)
         time_embedding = time_embedding.unsqueeze(1)
 
+        #图像编码
+        image_embedding = self.projection(image_embedding)
+
         # 拼接所有嵌入
         multimodal_embedding = torch.cat([image_embedding, geo_embedding, time_embedding], dim=1)
-
-        # 通过投影层将多模态嵌入映射到语言嵌入维度
-        projected_multimodal_embedding = self.projection(multimodal_embedding)
-        return projected_multimodal_embedding
+        return multimodal_embedding
 
     def encode_test(self, image_embedding):
         """
