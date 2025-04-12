@@ -20,6 +20,7 @@ from Trainer.utils import (
 )
 from Dataset.build_loader import build_loader
 from Models.coastgpt import CoastGPT
+from Models.dynamic_tanh import convert_ln_to_dyt
 from Trainer.optimizer import build_optimizer
 
 logger = logging.getLogger("train")
@@ -179,6 +180,8 @@ def parse_option():
 def main(config):
     logger.info(f"Creating model")
     model = CoastGPT(config)
+    # 将归一化层转化为DyT
+    model = convert_ln_to_dyt(model)
     logger.info(str(model) + "\n")
 
     logger.info(f"Building Dataset")
