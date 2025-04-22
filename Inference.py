@@ -55,7 +55,9 @@ def parse_option():
     parser.add_argument(
         "--model-path",
         type=str,
-        default="Checkpoint/test/checkpoints/iter_1999/mp_rank_00_model_states.pt",
+        default="Checkpoint/testlhrs/checkpoints/iter_999/mp_rank_00_model_states.pt",
+        # default="Checkpoint/test/checkpoints/iter_1999/mp_rank_00_model_states.pt",
+        # default="/home/yangkaidi/Project/LHRS-Bot/Checkpoint/Stage1/FINAL.pt",
         help="pretrained checkpoint path for vision encoder",
     )
     parser.add_argument("--seed", type=int, default=322, help="random seed")
