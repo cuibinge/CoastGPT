@@ -41,13 +41,13 @@ class VisionModel(nn.Module):
             output_hidden_states=True, # 返回所有隐藏状态
         )
         # 从输出中提取最后一层隐藏状态，去掉CLS token（第0个位置），仅保留补丁嵌入
-        image_embeds = outputs.hidden_states[11][:, 1:, :]
+        # image_embeds = outputs.hidden_states[11][:, 1:, :]
 
-        # image_embeds = []
-        # for idx, stage in enumerate(self.extract_stage):
-        #     current_hidden_states = outputs.hidden_states[stage][:, 1:, :]
-        #     image_embeds.append(current_hidden_states)
-        # image_embeds = torch.cat(image_embeds, dim=1)
+        image_embeds = []
+        for idx, stage in enumerate(self.extract_stage):
+            current_hidden_states = outputs.hidden_states[stage][:, 1:, :]
+            image_embeds.append(current_hidden_states)
+        image_embeds = torch.cat(image_embeds, dim=1)
 
         return image_embeds
 
