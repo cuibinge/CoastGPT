@@ -181,7 +181,7 @@ def main(config):
     logger.info(f"Creating model")
     model = CoastGPT(config)
     # 将归一化层转化为DyT
-    model = convert_ln_to_dyt(model)
+    # model = convert_ln_to_dyt(model)
     logger.info(str(model) + "\n")
 
     logger.info(f"Building Dataset")
