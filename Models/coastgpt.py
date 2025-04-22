@@ -165,9 +165,24 @@ class CoastGPT(nn.Module):
         #     return None
 
         # 从文件加载检查点
+        # ckpt = torch.load(state_dict_path, map_location="cpu")
+        #
+        # msg = self.load_state_dict(ckpt["module"], strict=strict)
+        #
+        # print(f"After loading: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
+
+        # # 从文件加载检查点
         ckpt = torch.load(state_dict_path, map_location="cpu")
 
-        msg = self.load_state_dict(ckpt["module"], strict=strict)
+        # # 提取multimodal模块的权重
+        filtered_state_dict = {k: v for k, v in ckpt["module"].items() if k.startswith("multimodal.")}
+
+        # # 提取multimodal和vision模块的权重
+        # filtered_state_dict = {k: v for k, v in ckpt["module"].items() if
+        #                        k.startswith("multimodal.") or k.startswith("vision.")}
+
+        # 加载multimodal模块的权重
+        msg = self.load_state_dict(filtered_state_dict, strict=False)
 
         print(f"After loading: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
 
