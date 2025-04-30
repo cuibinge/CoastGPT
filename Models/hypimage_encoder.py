@@ -142,7 +142,7 @@ class ViT(torch.nn.Module):
         return x
 
 # 图像编码器，结合CNN和ViT处理图像数据
-class ImageEncoder(torch.nn.Module):
+class HypImageEncoder(torch.nn.Module):
     def __init__(self, patch_size, bands, num_classes, dim, depth, heads, mlp_dim, pool='cls',
                  embed_dim=512, dim_head=16, dropout=0., emb_dropout=0.):
         super().__init__()
