@@ -111,4 +111,5 @@ vision:
 language:
   embedding_dim: 4096
 vit_name: openai/clip-vit-large-patch14
+hf_model: False
 
