@@ -165,27 +165,62 @@ class CoastGPT(nn.Module):
         #     return None
 
         # 从文件加载检查点
-        # ckpt = torch.load(state_dict_path, map_location="cpu")
-        #
-        # msg = self.load_state_dict(ckpt["module"], strict=strict)
-        #
-        # print(f"After loading: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
-
-        # # 从文件加载检查点
         ckpt = torch.load(state_dict_path, map_location="cpu")
 
-        # # 提取multimodal模块的权重
-        filtered_state_dict = {k: v for k, v in ckpt["module"].items() if k.startswith("multimodal.")}
+        # # 获取模块（module）字典
+        # module = ckpt.get('module', {})
+        #
+        # # 遍历字典中的每个键并修改
+        # modified_module = {}
+        # for key, value in module.items():
+        #     # 替换键中的prefix
+        #     if key.startswith('rgb.'):
+        #         new_key = key.replace('rgb', 'vision', 1)
+        #     elif key.startswith('rgb_pooler.'):
+        #         new_key = key.replace('rgb_pooler', 'multimodal.projection', 1)
+        #     elif key.startswith('text.'):
+        #         new_key = key.replace('text', 'language', 1)
+        #     else:
+        #         new_key = key
+        #
+        #     modified_module[new_key] = value
+        #
+        # # 更新checkpoint中的module部分
+        # ckpt['module'] = modified_module
+        #
+        # # 保存修改后的checkpoint
+        # torch.save(ckpt, '/root/shared-nvme/CoastGPT/Checkpoint/test2/checkpoints/iter_1299/test.pt')
 
-        # # 提取multimodal和vision模块的权重
-        # filtered_state_dict = {k: v for k, v in ckpt["module"].items() if
-        #                        k.startswith("multimodal.") or k.startswith("vision.")}
 
-        # 加载multimodal模块的权重
-        msg = self.load_state_dict(filtered_state_dict, strict=False)
+        if any(key.startswith('module') for key in ckpt.keys()):
+            # filtered_state_dict = {k: v for k, v in ckpt["module"].items() if k.startswith("multimodal.")}
+            filtered_state_dict = {k: v for k, v in ckpt["module"].items() if
+                                   k.startswith("multimodal.") or k.startswith("vision.")}
 
-        print(f"After loading: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
+            msg = self.load_state_dict(filtered_state_dict, strict=False)
+            print(f"After loading: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
+        else:
+            vision_ckpt = ckpt["rgb_ckpt"]
+            multimodal_ckpt = ckpt["other_ckpt"]["rgb_pooler"]
 
+            msg = self.vision.load_state_dict(vision_ckpt)
+            print(f"After loading vision: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
+            msg = self.multimodal.projection.load_state_dict(multimodal_ckpt)
+            print(f"After loading multimodal: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
+
+        text_path = pathlib.Path(state_dict_path).parent / "TextLoRA"  # 构造 TextLoRA 目录路径
+        if text_path.exists():
+            # 如果 TextLoRA 目录存在，则加载文本 LoRA
+            self.language.text_encoder = PeftModel.from_pretrained(
+                self.language.text_encoder,
+                text_path,
+                is_trainable=self.stage > 2,  # 仅在 stage > 2 时设置为可训练
+                torch_dtype=torch.float16,  # 使用 float16 数据类型
+            )
+
+            if self.stage == 0:  # Eval 模式
+                # 在评估模式下合并并卸载 PeftModel
+                self.language.text_encoder = self.language.text_encoder.merge_and_unload()
         return None
 
         # if "model" in ckpt.keys():
