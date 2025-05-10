@@ -51,13 +51,13 @@ def parse_option():
     )
 
     # basic
-    parser.add_argument("--image-file", type=str, default="Images/test.png", help="path to image")
+    parser.add_argument("--image-file", type=str, default="Images/test4.png", help="path to image")
     parser.add_argument(
         "--model-path",
         type=str,
-        default="Checkpoint/testlhrs/checkpoints/iter_999/mp_rank_00_model_states.pt",
-        # default="Checkpoint/test/checkpoints/iter_1999/mp_rank_00_model_states.pt",
-        # default="/home/yangkaidi/Project/LHRS-Bot/Checkpoint/Stage1/FINAL.pt",
+        # default="Checkpoint/testlhrs/checkpoints/iter_999/mp_rank_00_model_states.pt",
+        # default="Checkpoint/testlhrs/checkpoints/iter_9999/mp_rank_00_model_states.pt",
+        default="Checkpoint/test2/checkpoints/iter_1299/mp_rank_00_model_states.pt",
         help="pretrained checkpoint path for vision encoder",
     )
     parser.add_argument("--seed", type=int, default=322, help="random seed")
