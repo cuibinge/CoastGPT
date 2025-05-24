@@ -1,5 +1,5 @@
 OUTPUT_PATH="./Checkpoint/test"  # Path to save the output
-DATA_PATH="/home/share/Data/LHRS/PretrainData"  # Path to the step_one dataset
+DATA_PATH="/root/shared-nvme/data/PretrainData"  # Path to the step_one dataset
 SCRIPT_PATH=./main_pretrain_stage1.py
 CONFIG_PATH=./Configs/train.yaml
 
