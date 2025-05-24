@@ -57,7 +57,9 @@ def parse_option():
         type=str,
         # default="Checkpoint/testlhrs/checkpoints/iter_999/mp_rank_00_model_states.pt",
         # default="Checkpoint/testlhrs/checkpoints/iter_9999/mp_rank_00_model_states.pt",
-        default="Checkpoint/test2/checkpoints/iter_1299/mp_rank_00_model_states.pt",
+        # default="Checkpoint/test2/checkpoints/iter_1299/mp_rank_00_model_states.pt",
+        # default="Checkpoint/LHRS/Stage2/FINAL.pt",
+        default="/root/shared-nvme/CoastGPT/Checkpoint/test/checkpoints/FINAL.pt",
         help="pretrained checkpoint path for vision encoder",
     )
     parser.add_argument("--seed", type=int, default=322, help="random seed")
