@@ -16,6 +16,7 @@ from .language_model import LanguageModel  # 自定义语言模型模块
 # from .embedding_model import EmbeddingModel
 from .embedding_model_r1 import EmbeddingModel
 
+logger = logging.getLogger("train")
 
 # 定义 CoastGPT 类，继承自 PyTorch 的 nn.Module
 class CoastGPT(nn.Module):
@@ -131,6 +132,21 @@ class CoastGPT(nn.Module):
             **kwargs,
         )
 
+    def custom_save_checkpoint(self, file_name: str):
+        fp32_ckpt = get_fp32_state_dict_from_zero_checkpoint(file_name)
+        vision_ckpt = get_rgb_maybe_zero_3(fp32_ckpt.items())
+        other_ckpt = get_other_maybe_zero_3(fp32_ckpt.items())
+
+        if self.stage >= 2:
+            file_name = pathlib.Path(file_name)
+            if file_name.is_file():
+                loar_output_path = file_name.parent / "TextLoRA"
+            else:
+                loar_output_path = file_name / "TextLoRA"
+            self.text.text_encoder.save_pretrained(str(loar_output_path))
+
+        return dict(vision_ckpt=vision_ckpt, other_ckpt=other_ckpt)
+
     def load_vision_encoder(self, path: str):
         """
         从检查点文件加载视觉编码器。
@@ -142,7 +158,7 @@ class CoastGPT(nn.Module):
         if "model" in ckpt:
             ckpt = ckpt["model"]  # 如果检查点包含 "model" 键，则提取该部分
         # 将状态字典加载到视觉编码器中，strict=False 表示允许部分键不匹配
-        self.rgb.encoder.load_state_dict(ckpt, strict=False)
+        self.vision.encoder.load_state_dict(ckpt, strict=False)
 
     def custom_load_state_dict(self, state_dict_path, strict=False):
         """
@@ -196,13 +212,20 @@ class CoastGPT(nn.Module):
             # filtered_state_dict = {k: v for k, v in ckpt["module"].items() if k.startswith("multimodal.")}
             filtered_state_dict = {k: v for k, v in ckpt["module"].items() if
                                    k.startswith("multimodal.") or k.startswith("vision.")}
-
             msg = self.load_state_dict(filtered_state_dict, strict=False)
             print(f"After loading: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
-        else:
+
+        elif any(key.startswith('vision_ckpt') for key in ckpt.keys()) :
+            vision_ckpt = ckpt["vision_ckpt"]
+            multimodal_ckpt = ckpt["other_ckpt"]["multimodal_projection"]
+            msg = self.vision.load_state_dict(vision_ckpt)
+            print(f"After loading vision: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
+            msg = self.multimodal.projection.load_state_dict(multimodal_ckpt)
+            print(f"After loading multimodal: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
+
+        elif any(key.startswith('rgb_ckpt') for key in ckpt.keys()) :
             vision_ckpt = ckpt["rgb_ckpt"]
             multimodal_ckpt = ckpt["other_ckpt"]["rgb_pooler"]
-
             msg = self.vision.load_state_dict(vision_ckpt)
             print(f"After loading vision: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
             msg = self.multimodal.projection.load_state_dict(multimodal_ckpt)
@@ -312,3 +335,58 @@ class CoastGPT(nn.Module):
         if model_path is not None:
             # 如果提供了模型路径，则加载模型
             self.custom_load_state_dict(model_path)
+
+def maybe_zero_3(param, ignore_status=False, name=None):
+    from deepspeed import zero
+    from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+
+    if hasattr(param, "ds_id"):
+        if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+            if not ignore_status:
+                logger.warning(
+                    f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}"
+                )
+        with zero.GatheredParameters([param]):
+            param = param.data.detach().cpu().clone()
+    else:
+        param = param.detach().cpu().clone()
+    return param
+
+
+def get_other_maybe_zero_3(named_params):
+    # 定义需要处理的键名
+    names = ["multimodal.projection", "embed_tokens"]
+    multimodal_projection = dict()
+    text_proj = dict()
+    embed_tokens = dict()
+    lm_head = dict()
+
+    # 将输入的 named_params 转换为列表，方便遍历
+    params = list(named_params)
+    # 初始化 to_return 字典，键名需要与 names 列表中的键名一致
+    to_return = dict(
+        multimodal_projection=multimodal_projection,
+        embed_tokens=embed_tokens,
+        text_proj=text_proj,
+        lm_head=lm_head,
+    )
+    # 遍历参数
+    for k, v in params:
+        for name in names:
+            if name in k:
+                # 使用 name 作为键名，而不是其他变量名
+                # 这里需要将 name 映射到 to_return 的键名
+                if name == "multimodal.projection":
+                    to_return["multimodal_projection"][k.split(name + ".")[-1]] = v
+                elif name == "embed_tokens":
+                    to_return["embed_tokens"][k.split(name + ".")[-1]] = v
+
+    return to_return
+
+
+def get_rgb_maybe_zero_3(named_params):
+    to_return = {k[len("vision.") :]: t for k, t in named_params if "vision." in k}
+    to_return = {
+        k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()
+    }
+    return to_return
