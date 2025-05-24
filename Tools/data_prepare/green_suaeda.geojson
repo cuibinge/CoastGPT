@@ -1,0 +1,49 @@
+{
+    "type": "FeatureCollection",
+    "name": "Suaeda_Spectral_Samples",
+    "features": [
+        {
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [
+                    119.02193,
+                    37.720307
+                ]
+            },
+            "properties": {
+                "instrument": "HI: 9162087 (HR-1024i)",
+                "label": "盐地碱蓬",
+                "color": "黄绿、翠绿或深绿",
+                "height": "高大",
+                "leaf_shape": "细长",
+                "salinity_range": "0.4% ~ 1%",
+                "ecotype": "绿色高大",
+                "country_code": "CHN",
+                "area(km²)": 2.2e-07,
+                "area(m²)": 0.22,
+                "spatial_scale": "Patch Level",
+                "location_info": {
+                    "province": "山东省",
+                    "city": "垦利区"
+                },
+                "temporal_info": {
+                    "timestamp": "2024-08-20T13:05:31+00:00",
+                    "datetime_local": "2024-08-20 21:05:31",
+                    "season": "Summer",
+                    "part_of_day": "Evening",
+                    "weekday": "Tuesday",
+                    "timezone": "Asia/Shanghai",
+                    "solar_term": "立秋"
+                },
+                "bands": {
+                    "range_nm": "339.6 ~ 2509.1",
+                    "center_nm": 1265.0,
+                    "reflectance_range": "-23.08 ~ 23490.00",
+                    "total_bands": 993
+                },
+                "caption": "盐地碱蓬呈现出绿色，植株高大，叶片细长，分布于湿润低盐区域。"
+            }
+        }
+    ]
+}
