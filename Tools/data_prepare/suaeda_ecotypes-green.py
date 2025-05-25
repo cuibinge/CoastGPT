@@ -3,15 +3,18 @@ import json
 import re
 import math
 from datetime import datetime
-import pytz
 from dateutil import tz
+import pytz
 from geopy.geocoders import Nominatim
+import time
 
-sig_dir = r"C:\Users\zhhq9\Desktop\suaeda_ecotypes\green"
-output_geojson = os.path.join(r"C:\Users\zhhq9\Desktop\suaeda_ecotypes", "green_suaeda.geojson")
+# 输入/输出目录
+sig_dir = r"C:\Users\zhhq9\Desktop\suaeda_ecotypes\绿碱蓬"
+geojson_output_dir = r"C:\Users\zhhq9\Desktop\suaeda_ecotypes\绿碱蓬\json"
+os.makedirs(geojson_output_dir, exist_ok=True)
+
 geolocator = Nominatim(user_agent="geojson_generator")
 
-# 节气计算
 def get_solar_term(date: datetime) -> str:
     solar_terms = [
         ("小寒", 1, 5), ("大寒", 1, 20), ("立春", 2, 4), ("雨水", 2, 19),
@@ -26,30 +29,25 @@ def get_solar_term(date: datetime) -> str:
             return term
     return "小寒"
 
-# 基于视角+拍摄距离估算实际图像覆盖面积
 def calculate_area_and_scale():
-    distance_m = 1.0  # 假设拍摄距离 1 米
-    fov_deg = 30      # 假设水平视角 30°
-    width_m = 2 * distance_m * math.tan(math.radians(fov_deg / 2))  # ≈ 0.536 m
-    height_m = width_m * (240 / 320)  # 保持图像纵横比
-    area_km2 = (width_m * height_m) / 1e6  # 转为 km²
-    area_m2 = width_m * height_m
-    return area_m2, area_km2, "Patch Level"
+    distance_m = 1.0
+    fov_deg = 30
+    width_m = 2 * distance_m * math.tan(math.radians(fov_deg / 2))
+    height_m = width_m * (240 / 320)
+    return width_m * height_m, (width_m * height_m) / 1e6, "Patch Level"
 
-# 解析 .sig 文件
 def extract_metadata(file_path):
-    metadata = {"bands": [], "coordinates": None, "timestamp": None}
-    with open(file_path, "r", encoding="utf-8") as file:
-        lines = file.readlines()
+    metadata = {"coordinates": None, "timestamp": None, "data": []}
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
 
-    # 提取经纬度和时间（在文件头部）
     for line in lines:
-        if line.lower().startswith("longitude"):
+        if "longitude" in line.lower():
             match = re.search(r"(\d+\.\d+)[Ee]", line)
             if match:
                 dmm = float(match.group(1))
                 lon = round(int(dmm / 100) + (dmm % 100) / 60, 6)
-        elif line.lower().startswith("latitude"):
+        elif "latitude" in line.lower():
             match = re.search(r"(\d+\.\d+)[Nn]", line)
             if match:
                 dmm = float(match.group(1))
@@ -60,32 +58,29 @@ def extract_metadata(file_path):
                 dt = datetime.strptime(match.group(1), "%Y/%m/%d %H:%M:%S")
                 metadata["timestamp"] = dt.astimezone(pytz.utc).isoformat()
 
-    for i in range(27, min(1020, len(lines))):
-        line = lines[i].strip()
-        if not line:
-            continue
-        parts = line.split()
-        if len(parts) >= 2:
+    for line in lines:
+        parts = line.strip().split()
+        if len(parts) == 4:
             try:
-                wavelength = float(parts[0])
-                reflectance = float(parts[1])
-                metadata["bands"].append((wavelength, reflectance))
-            except ValueError:
-                # 非数值行跳过
+                metadata["data"].append([float(p) for p in parts])
+            except:
                 continue
 
-    if 'lon' in locals() and 'lat' in locals():
+    if 'lat' in locals() and 'lon' in locals():
         metadata["coordinates"] = [lon, lat]
+
     return metadata
 
-# 生成 GeoJSON
-features = []
+# 主循环：每个.sig生成一个GeoJSON
 for file in os.listdir(sig_dir):
-    if not file.endswith(".sig"): 
+    if not file.endswith(".sig"):
         continue
-    metadata = extract_metadata(os.path.join(sig_dir, file))
+
+    sig_path = os.path.join(sig_dir, file)
+    metadata = extract_metadata(sig_path)
+
     if not metadata["coordinates"] or not metadata["timestamp"]:
-        print(f"跳过: {file}")
+        print(f"跳过无效文件: {file}")
         continue
 
     dt = datetime.fromisoformat(metadata["timestamp"])
@@ -96,14 +91,22 @@ for file in os.listdir(sig_dir):
                    else "Noon" if local_dt.hour < 14 else "Afternoon" if local_dt.hour < 18 else "Evening")
     solar_term = get_solar_term(local_dt)
     area_m2, area_km2, scale = calculate_area_and_scale()
-    wavelengths = [w[0] for w in metadata["bands"]]
-    reflectances = [w[1] for w in metadata["bands"]]
+
+    wavelengths = [d[0] for d in metadata["data"]]
+    reference = [d[1] for d in metadata["data"]]
+    target = [d[2] for d in metadata["data"]]
+    reflectance = [d[3] for d in metadata["data"]]
 
     try:
+        time.sleep(1)  # 防止请求过快
         loc = geolocator.reverse((metadata["coordinates"][1], metadata["coordinates"][0]), language="zh-CN", timeout=10)
         addr = loc.raw.get("address", {})
-    except:
+    except Exception as e:
+        print(f"地理信息失败：{file} - {e}")
         addr = {}
+
+    province = addr.get("state") or addr.get("state_district") or addr.get("region", "")
+    city = addr.get("city") or addr.get("town") or addr.get("county", "")
 
     feature = {
         "type": "Feature",
@@ -127,7 +130,7 @@ for file in os.listdir(sig_dir):
                 "province": addr.get("state", ""),
                 "city": addr.get("city", addr.get("town", ""))
             },
-            "temporal_info": {
+             "temporal_info": {
                 "timestamp": metadata["timestamp"],
                 "datetime_local": local_dt.strftime("%Y-%m-%d %H:%M:%S"),
                 "season": season,
@@ -136,25 +139,26 @@ for file in os.listdir(sig_dir):
                 "timezone": "Asia/Shanghai",
                 "solar_term": solar_term
             },
-            "bands": {
-                "range_nm": f"{min(wavelengths):.1f} ~ {max(wavelengths):.1f}",
-                "center_nm": round(sum(wavelengths)/len(wavelengths), 1),
-                "reflectance_range": f"{min(reflectances):.2f} ~ {max(reflectances):.2f}",
-                "total_bands": len(metadata["bands"])
+             "bands": {
+                "wavelengths_nm_range": f"{min(wavelengths):.1f} ~ {max(wavelengths):.1f}",
+                "reference_values_range": f"{min(reference):.2f} ~ {max(reference):.2f}",
+                "target_values_range": f"{min(target):.2f} ~ {max(target):.2f}",
+                "reflectance_range": f"{min(reflectance):.2f} ~ {max(reflectance):.2f}",
+                "total_bands": len(metadata["data"]),
+                "data": metadata["data"]
             },
-            "caption": "盐地碱蓬呈现出绿色，植株高大，叶片细长，分布于湿润低盐区域。",
+            "caption": "盐地碱蓬呈现出绿色，植株高大，叶片细长，分布于湿润低盐区域。"
         }
     }
-    features.append(feature)
 
-# 保存 GeoJSON
-geojson = {
-    "type": "FeatureCollection",
-    "name": "Suaeda_Spectral_Samples",
-    "features": features
-}
+    geojson_data = {
+        "type": "FeatureCollection",
+        "name": file.replace(".sig", ".sig.jpg"),
+        "features": [feature]
+    }
 
-with open(output_geojson, "w", encoding="utf-8") as f:
-    json.dump(geojson, f, ensure_ascii=False, indent=4)
+    output_path = os.path.join(geojson_output_dir, file.replace(".sig", ".geojson"))
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(geojson_data, f, ensure_ascii=False, indent=2)
 
-print(f"GeoJSON 文件已生成: {output_geojson}")
+    print(f"已生成: {output_path}")
