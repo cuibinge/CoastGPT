@@ -3,6 +3,9 @@ import os
 import random
 import re
 from threading import Thread
+import requests
+import json
+import hashlib
 
 import cv2
 import gradio as gr
@@ -33,7 +36,74 @@ introduction = """
 Using Instruction:
 
 """
+def translate_text(text, from_lang='en', to_lang='zh'):
+    """使用百度翻译API将文本从源语言翻译到目标语言"""
+    # 请替换为您的百度翻译API密钥
+    appid = '20240416002025318'
+    appkey = 'WZgorbYnwFIA1BTeqLR4'
+    
+    # 如果文本为空，直接返回
+    if not text or not text.strip():
+        return text
+    
+    # 添加调试信息
+    print(f"正在翻译文本: {text[:50]}...")
+    
+    # 百度翻译API单次请求长度限制，需要分段翻译
+    max_length = 2000  # 百度翻译API单次请求的最大字符数
+    
+    # 如果文本长度超过限制，分段翻译
+    if len(text) > max_length:
+        segments = []
+        for i in range(0, len(text), max_length):
+            segment = text[i:i+max_length]
+            segments.append(segment)
+        
+        # 分段翻译并合并结果
+        translated_segments = []
+        for segment in segments:
+            translated_segment = translate_segment(segment, appid, appkey, from_lang, to_lang)
+            translated_segments.append(translated_segment)
+        
+        return ''.join(translated_segments)
+    else:
+        # 文本长度在限制范围内，直接翻译
+        return translate_segment(text, appid, appkey, from_lang, to_lang)
 
+def translate_segment(text, appid, appkey, from_lang, to_lang):
+    """翻译单个文本段落"""
+    endpoint = 'http://api.fanyi.baidu.com/api/trans/vip/translate'
+    salt = str(random.randint(32768, 65536))
+    sign_str = appid + text + salt + appkey
+    sign = hashlib.md5(sign_str.encode()).hexdigest()
+    
+    headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+    payload = {
+        'appid': appid,
+        'q': text,
+        'from': from_lang,
+        'to': to_lang,
+        'salt': salt,
+        'sign': sign
+    }
+    
+    try:
+        response = requests.post(endpoint, data=payload)
+        print(f"翻译API响应状态码: {response.status_code}")
+        result = response.json()
+        print(f"翻译API响应: {result}")
+        
+        if 'trans_result' in result:
+            # 合并所有翻译结果
+            translated = ''.join([item['dst'] for item in result['trans_result']])
+            print(f"翻译结果: {translated[:50]}...")
+            return translated
+        else:
+            print(f"翻译API返回错误: {result.get('error_msg', '未知错误')}")
+            return text
+    except Exception as e:
+        print(f"翻译过程中出错: {e}")
+        return text
 
 def _get_args():
     parser = ConfigArgumentParser()
@@ -220,18 +290,19 @@ class WebUIDemo(object):
             output_token, skip_special_tokens=True
         ).strip()
 
-        output_text = output_text.split("<s>")[-1].stip()
+        output_text = output_text.split("<s>")[-1].strip()
+        
+        # 直接翻译输出文本并替换原文
+        try:
+            translated_text = translate_text(output_text)
+            if translated_text != output_text and translated_text.strip():
+                output_text = translated_text  # 直接替换为中文
+        except Exception as e:
+            print(f"翻译出错: {e}")
+            # 翻译失败时保留原文
 
         conv.messages[-1][1] = output_text
         return output_text, output_token.cpu().numpy()
-
-    def stream_answer(self, conv, img_list, **kargs):
-        generation_kwargs = self.answer_prepare(conv, img_list, **kargs)
-        streamer = TextIteratorStreamer(self.tokenizer, skip_special_tokens=True)
-        generation_kwargs["streamer"] = streamer
-        thread = Thread(target=self.model_generate, kwargs=generation_kwargs)
-        thread.start()
-        return streamer
 
     def model_generate(self, *args, **kwargs):
         with torch.inference_mode():
@@ -523,6 +594,13 @@ class WebUIDemo(object):
                 chatbot = chatbot + [[(file_path,), None]]
 
         return text_box_show, chatbot, chat_state, img_list, upload_flag, replace_flag
+    def stream_answer(self, conv, img_list, **kargs):
+        generation_kwargs = self.answer_prepare(conv, img_list, **kargs)
+        streamer = TextIteratorStreamer(self.tokenizer, skip_special_tokens=True)
+        generation_kwargs["streamer"] = streamer
+        thread = Thread(target=self.model_generate, kwargs=generation_kwargs)
+        thread.start()
+        return streamer
 
     def gradio_stream_answer(self, chatbot, chat_state, img_list, temperature):
         if len(img_list) > 0:
@@ -541,7 +619,31 @@ class WebUIDemo(object):
             output += escapped
             chatbot[-1][1] = output
             yield chatbot, chat_state
-        chat_state.messages[-1][1] = output
+        
+        # 流式输出完成后，直接替换为中文
+        try:
+            print("开始翻译完整输出...")
+            # 确保输出文本不为空
+            if output and output.strip():
+                translated_output = translate_text(output)
+                print(f"翻译完成: {translated_output[:50]}...")
+                
+                # 检查翻译结果是否有效且与原文不同
+                if translated_output and translated_output != output:
+                    # 直接替换为中文，不保留英文
+                    chatbot[-1][1] = translated_output
+                    chat_state.messages[-1][1] = translated_output
+                    yield chatbot, chat_state
+                else:
+                    print("翻译结果与原文相同或为空，保留原文")
+                    chat_state.messages[-1][1] = output
+            else:
+                print("输出为空，跳过翻译")
+                chat_state.messages[-1][1] = output
+        except Exception as e:
+            print(f"翻译过程中出错: {e}")
+            chat_state.messages[-1][1] = output
+        
         return chatbot, chat_state
 
     def gradio_visualize(self, chatbot, gr_img):
