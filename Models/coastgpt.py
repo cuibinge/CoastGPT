@@ -143,7 +143,7 @@ class CoastGPT(nn.Module):
                 loar_output_path = file_name.parent / "TextLoRA"
             else:
                 loar_output_path = file_name / "TextLoRA"
-            self.text.text_encoder.save_pretrained(str(loar_output_path))
+            self.language.text_encoder.save_pretrained(str(loar_output_path))
 
         return dict(vision_ckpt=vision_ckpt, other_ckpt=other_ckpt)
 
