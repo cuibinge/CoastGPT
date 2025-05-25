@@ -297,9 +297,9 @@ class Trainer:
 
         if self.deepspeed:
             self.model.save_checkpoint(self.ckpt_dir, file_name, client_state=data)
-            if isinstance(self.model.text.text_encoder, PeftModel):
+            if isinstance(self.model.language.text_encoder, PeftModel):
                 text_path = os.path.join(self.ckpt_dir, "TextLoRA")
-                self.model.text.text_encoder.save_pretrained(text_path)
+                self.model.language.text_encoder.save_pretrained(text_path)
         else:
             torch.save(data, file_path)
 

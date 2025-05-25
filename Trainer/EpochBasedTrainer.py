@@ -122,6 +122,7 @@ class EpochBasedTrainer(Trainer):
         self.model.train()
         # 遍历当前轮次内的迭代次数
         for self.inner_iter in range(self.inner_iter, self.epoch_len):
+        # for self.inner_iter in range(0, 10):
             # 调用 'before_iter' 钩子函数
             self._call_hooks("before_iter")
             # 以下代码被注释掉，功能是打印需要梯度更新的参数名称

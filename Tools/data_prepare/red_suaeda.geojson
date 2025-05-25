@@ -1,0 +1,49 @@
+{
+    "type": "FeatureCollection",
+    "name": "Suaeda_Spectral_Samples",
+    "features": [
+        {
+            "type": "Feature",
+            "geometry": {
+                "type": "Point",
+                "coordinates": [
+                    119.225087,
+                    37.718057
+                ]
+            },
+            "properties": {
+                "instrument": "HI: 9162087 (HR-1024i)",
+                "label": "盐地碱蓬",
+                "color": "浅红、赤红或紫红",
+                "height": "矮小",
+                "leaf_shape": "肉质化",
+                "salinity_range": "1%~1.6%",
+                "ecotype": "红色矮小",
+                "country_code": "CHN",
+                "area(km²)": 2.2e-07,
+                "area(m²)": 0.22,
+                "spatial_scale": "Patch Level",
+                "location_info": {
+                    "province": "山东省",
+                    "city": "垦利区"
+                },
+                "temporal_info": {
+                    "timestamp": "2024-08-21T09:50:18+00:00",
+                    "datetime_local": "2024-08-21 17:50:18",
+                    "season": "Summer",
+                    "part_of_day": "Afternoon",
+                    "weekday": "Wednesday",
+                    "timezone": "Asia/Shanghai",
+                    "solar_term": "立秋"
+                },
+                "bands": {
+                    "range_nm": "339.6 ~ 2509.1",
+                    "center_nm": 1265.0,
+                    "reflectance_range": "317.37 ~ 366717.00",
+                    "total_bands": 993
+                },
+                "caption": "盐地碱蓬呈现出红色，植株矮小，叶片粗短肉质化，生于高盐泥滩区。"
+            }
+        }
+    ]
+}

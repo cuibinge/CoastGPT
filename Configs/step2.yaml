@@ -104,3 +104,11 @@ schedule:
   decay_rate: 0.1
   multisteps: []
   gamma: 0.1
+
+# test
+vision:
+  embedding_dim: 1024
+language:
+  embedding_dim: 4096
+vit_name: openai/clip-vit-large-patch14
+tune_multimodal: True
