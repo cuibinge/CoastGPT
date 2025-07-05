@@ -88,16 +88,16 @@ class CaptionDataset(torch.utils.data.Dataset):
         self.img_dir = list(self.root.glob("*_Image"))
         self.json_dir = []
         for i in self.img_dir:
-            if "captions" in i.stem:
-                self.json_dir.append(i.parent / "OSCapAnn" / (i.stem.split("_Image")[0] + ".json"))
-            elif "OSM" not in i.stem:
-                self.json_dir.append(i.parent / (i.stem.split("_Image")[0] + ".json"))
+            if "captions" in i.name:
+                self.json_dir.append(i.parent / "OSCapAnn" / (i.name.split("_Image")[0] + ".json"))
+            elif "OSM" not in i.name:
+                self.json_dir.append(i.parent / (i.name.split("_Image")[0] + ".json"))
             else:
                 may_be_exist = i.parent / "OSMCapAnn"
                 if may_be_exist.exists():
                     self.json_dir.append(may_be_exist)
                 else:
-                    self.json_dir.append(i.parent / (i.stem.split("_Image")[0] + ".json"))
+                    self.json_dir.append(i.parent / (i.name.split("_Image")[0] + ".json"))
 
         self.img_list = []
         self.cap_list = []
@@ -164,11 +164,14 @@ class CaptionDataset(torch.utils.data.Dataset):
                         self.img_list.append(image_path)
                         self.cap_list.append(item["conv"])
             else:
-                for j in range(len(data["images"])):
-                    img_path = self.img_dir[i] / data["images"][j]["filename"]
-                    if valid_path(img_path):
-                        self.img_list.append(self.img_dir[i] / data["images"][j]["filename"])
-                        self.cap_list.append(data["images"][j]["sentences"][0]["raw"])
+                for item in data["data"]:
+                    name = item["name"]
+                    for it in item["features"]:
+                        properties = it["properties"]
+                        img_path = self.img_dir[i] / (name + ".png")
+                        if valid_path(img_path):
+                            self.img_list.append(img_path)
+                            self.cap_list.append(properties["caption1"])
 
     def __len__(self) -> int:
         return len(self.cap_list)
