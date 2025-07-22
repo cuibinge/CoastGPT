@@ -1,8 +1,8 @@
-MODEL_PATH="./Checkpoint/LHRS/Stage1/FINAL.pt" # Path to the Stage1 model
-OUTPUT_PATH="./Checkpoint/test_stage2"  # Path to save the output
-DATA_PATH="/root/shared-nvme/data/Stage2Data_old"  # Path to the Stage 2 dataset
+MODEL_PATH="" # Path to the Stage1 model
+OUTPUT_PATH=""  # Path to save the output
+DATA_PATH=""  # Path to the Stage 2 dataset
 CONFIG_PATH=./Configs/step2.yaml
-SCRIPT_PATH=./main_pretrain_stage2.py
+SCRIPT_PATH=./train_stage_two.py
 
 deepspeed \
     --num_node=1 \

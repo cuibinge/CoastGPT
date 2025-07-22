@@ -1,6 +1,6 @@
-OUTPUT_PATH="./Checkpoint/test"  # Path to save the output
-DATA_PATH="/root/shared-nvme/data/PretrainData"  # Path to the step_one dataset
-SCRIPT_PATH=./main_pretrain_stage1.py
+OUTPUT_PATH=""  # Path to save the output
+DATA_PATH=""  # Path to the step_one dataset
+SCRIPT_PATH=./train_stage_one.py
 CONFIG_PATH=./Configs/train.yaml
 
 deepspeed \
