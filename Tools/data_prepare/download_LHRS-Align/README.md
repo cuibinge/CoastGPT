@@ -1,2 +1,5 @@
-LHRS-Align数据集下载流程：运行get_session_token.py脚本获取会话令牌——>运行download.py脚本下载相应的图像\n
+LHRS-Align数据集下载流程：运行get_session_token.py脚本获取会话令牌——>运行download.py脚本下载相应的图像
+
+
+
 download.py主要功能：从LHRS论文的作者提供JSON里读出中心坐标，然后根据坐标计算瓦片号，并拼成Google卫星瓦片URL，最后把瓦片下载下来存成PNG格式
