@@ -257,15 +257,15 @@ class LanguageModel(nn.Module):
         """
         return x
 
+    # 修改decode方法
     def decode(
         self,
         input_ids: torch.Tensor,
         image_embedding: torch.Tensor = None,
         attention_mask: Optional[Union[torch.Tensor, None]] = None,
         labels: torch.Tensor = None,
-    ) -> Tuple[torch.Tensor]:
-        #    cl_loss_func: Callable = None,
-        #    cl_logit_scale: torch.Tensor = None) -> Tuple[torch.Tensor]:
+        output_attentions: bool = False,
+    ) -> Union[torch.Tensor, Dict]:
         (
             input_ids,
             attention_mask,
@@ -279,7 +279,7 @@ class LanguageModel(nn.Module):
             image_embedding=image_embedding if image_embedding is not None else None,
             past_key_values=None,
         )
-
+    
         outputs = self.text_encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -287,22 +287,31 @@ class LanguageModel(nn.Module):
             inputs_embeds=inputs_embeds,
             labels=labels,
             output_hidden_states=True,
+            output_attentions=output_attentions,  # 输出注意力图
             use_cache=False,
             return_dict=True,
         )
-
-        text_loss = outputs["loss"]
-
-        return text_loss
-
+    
+        if output_attentions:
+            return outputs
+        else:
+            return outputs["loss"]
+    
+    # 修改forward方法
     def forward(
         self,
         x: Dict[str, Union[str, torch.Tensor, BatchEncoding]],
         multimodal_embedding: torch.Tensor = None,
+        output_attentions: bool = False,
         **kwargs,
     ):
         modal_input = self.get_modal_input(x)
-        return self.decode(**self.encode(modal_input), image_embedding=multimodal_embedding, **kwargs)
+        return self.decode(
+            **self.encode(modal_input), 
+            image_embedding=multimodal_embedding, 
+            output_attentions=output_attentions,
+            **kwargs
+        )
 
 
     def prepare_inputs_for_multimodal(

@@ -1,120 +1,124 @@
+"""
+该脚本用于对模型视觉定位的预测结果进行评估：
+"""
+import json
 import re
-import logging
+import numpy as np
+import argparse
+from sklearn.metrics import average_precision_score
 
-logger = logging.getLogger("Visual Grounding evaluation")
+def parse_boxes(s):
+    """解析边界框字符串，支持多个框的情况"""
+    boxes = []
+    # 匹配所有方括号内的坐标
+    matches = re.findall(r'\[([^\]]+)\]', s)
+    for match in matches:
+        try:
+            # 分割坐标字符串并转换为浮点数
+            coords = [float(x.strip()) for x in match.split(',')]
+            if len(coords) == 4:
+                boxes.append(coords)
+        except:
+            continue
+    return boxes
+
+def calculate_iou(bbox_pred, bbox_gt):
+    """计算两个边界框的 IoU"""
+    # 确保坐标有效性
+    x1_pred, y1_pred, x2_pred, y2_pred = bbox_pred
+    x1_gt, y1_gt, x2_gt, y2_gt = bbox_gt
+    
+    # 计算交集坐标
+    xi1 = max(x1_pred, x1_gt)
+    yi1 = max(y1_pred, y1_gt)
+    xi2 = min(x2_pred, x2_gt)
+    yi2 = min(y2_pred, y2_gt)
+    
+    # 计算交集面积
+    inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+    if inter_area == 0:
+        return 0.0
+    
+    # 计算并集面积
+    pred_area = (x2_pred - x1_pred) * (y2_pred - y1_pred)
+    gt_area = (x2_gt - x1_gt) * (y2_gt - y1_gt)
+    union_area = pred_area + gt_area - inter_area
+    
+    return inter_area / union_area
+
+def main(json_file):
+    # 存储结果
+    all_scores = []
+    all_ious = []
+    y_true = []  # 用于AP计算的二进制标签
+    correct_count = 0
+    correct_count25 = 0
+    
+    # 读取并处理 JSON 文件
+    with open(json_file, 'r') as f:
+        data = json.load(f)
+    
+    for item in data:
+        # 解析边界框
+        pred_boxes = parse_boxes(item['pred'])
+        gt_boxes = parse_boxes(item['target'])
+        
+        if not pred_boxes or not gt_boxes:
+            continue  # 跳过解析失败的条目
+        
+        # 找到匹配的框对（使用最小索引数量）
+        n_pairs = min(len(pred_boxes), len(gt_boxes))
+        
+        for i in range(n_pairs):
+            # 计算 IoU
+            iou = calculate_iou(pred_boxes[i], gt_boxes[i])
+            # 使用默认置信度1.0（因为新格式没有提供置信度）
+            score = 1.0
+            
+            all_ious.append(iou)
+            all_scores.append(score)
+            
+            # 检查是否大于0.5并计数
+            if iou >= 0.5:
+                correct_count += 1
+                y_true.append(1)
+            else:
+                y_true.append(0)
+            
+            if iou >= 0.25:
+                correct_count25 += 1
+    
+    # 计算 Acc@IoU
+    accuracy25 = np.mean(np.array(all_ious) >= 0.25) if all_ious else 0
+    accuracy = np.mean(np.array(all_ious) >= 0.5) if all_ious else 0
+    
+    # 计算 AP@0.5
+    ap = average_precision_score(y_true, all_scores) if y_true else 0
+    
+    # 计算平均 IoU
+    mean_iou = np.mean(all_ious) if all_ious else 0
+    
+    # 输出结果
+    print(f"Acc@IoU=0.25: {accuracy25:}")
+    print(f"Acc@IoU=0.5: {accuracy:}")
+    print(f"AP@IoU=0.5: {ap:}")
+    print(f"Samples with IoU >= 0.25: {correct_count25}/{len(all_ious)}")
+    print(f"Samples with IoU >= 0.5: {correct_count}/{len(all_ious)}")
+    print(f"Total samples: {len(all_ious)}")
 
 
-class VGMetricsCalculator:
-
-    def __init__(self):
-        pass
-
-    def calculate_iou(self, box1, box2):
-        """
-        计算两个边界框的交并比（IOU）。
-        :param box1: 第一个边界框的坐标 (x1, y1, x2, y2)
-        :param box2: 第二个边界框的坐标 (x3, y3, x4, y4)
-        :return: IOU 值
-        """
-         # 边界框1
-        x1, y1, x2, y2 = box1
-        # 边界框2
-        x3, y3, x4, y4 = box2
-
-        # 计算两个边界框的交集
-        intersection_x1 = max(x1, x3)
-        intersection_y1 = max(y1, y3)
-        intersection_x2 = min(x2, x4)
-        intersection_y2 = min(y2, y4)
-
-        # 交际区域的面积
-        intersection_area = max(0, intersection_x2 - intersection_x1) * max(
-            0, intersection_y2 - intersection_y1
-        )
-
-        # 计算两个边界框的面积
-        box1_area = (x2 - x1) * (y2 - y1)
-        box2_area = (x4 - x3) * (y4 - y3)
-
-        # 计算两个边界框的并集面积
-        union_area = box1_area + box2_area - intersection_area
-
-        # 计算IOU值
-        iou = intersection_area / union_area
-
-        return iou
-
-    def evaluate(self, predictions):
-        """
-        评估预测结果，根据阈值计算准确率
-        :param predictions: 包含预测结果和真实结果的列表
-        :return: 准确率、失败样本数和包含失败样本的准确率
-        """
-        # 正则表达式，用于从文本中提取边界框坐标
-        pattern = r"\[([0-9., ]+)\]"
-        parse_result = []
-        fail_instance = 0
-
-        for item in predictions:
-            pred_match = re.findall(pattern, item["pred"])
-            if len(pred_match) == 0:
-                fail_instance += 1
-
-            try:
-                pred_result = [list(map(float, match.split(","))) for match in pred_match]
-            except:
-                fail_instance += 1
-                continue
-
-            target_match = re.findall(pattern, item["target"])
-            target_result = [list(map(float, match.split(","))) for match in target_match]
-
-            new_pred_result = []
-            new_target_result = []
-
-            for pred, target in zip(pred_result, target_result):
-                if len(pred) == 4:
-                    new_pred_result.append(pred)
-                    new_target_result.append(target)
-                elif len(pred) > 4:
-                    while len(pred) != 4:
-                        pred.pop()
-                    new_pred_result.append(pred)
-                    new_target_result.append(target)
-                else:
-                    fail_instance += 1
-
-            if len(new_pred_result) > 0:
-                parse_result.append(
-                    dict(
-                        filename=item["filename"],
-                        pred=new_pred_result,
-                        target=new_target_result,
-                    )
-                )
-
-        count = 0
-        total = 0
-
-        for item in parse_result:
-            preds = item["pred"]
-            targets = item["target"]
-
-            for pred, target in zip(preds, targets):
-                iou_score = self.calculate_iou(pred, target)
-                if iou_score > 0.5:
-                    count += 1
-                    print(item["filename"])
-                total += 1
-
-        # 计算准确率
-        accuracy = count / total * 100 if total > 0 else 0
-        # 计算包含失败样本的准确率
-        accuracy_fail = count / (total + fail_instance) * 100 if (total + fail_instance) > 0 else 0
-
-        # 记录日志
-        logger.info(f"Accuracy: {accuracy}%")
-        logger.info(f"Fail Sample: {fail_instance}")
-        logger.info(f"Accuracy With Fail Sample: {accuracy_fail}%")
-
-        return accuracy, fail_instance, accuracy_fail
+if __name__ == "__main__":
+    # 设置命令行参数解析
+    parser = argparse.ArgumentParser(description='计算视觉定位任务的评估指标')
+    parser.add_argument(
+        '--json-file', 
+        type=str, 
+        required=True,
+        help='包含预测和真实边界框的JSON文件路径'
+    )
+    
+    # 解析命令行参数
+    args = parser.parse_args()
+    
+    # 调用主函数，传入JSON文件路径
+    main(args.json_file)

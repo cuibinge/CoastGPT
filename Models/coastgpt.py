@@ -15,6 +15,8 @@ from .vision_model import VisionModel  # 自定义视觉模型模块
 from .language_model import LanguageModel  # 自定义语言模型模块
 # from .embedding_model import EmbeddingModel
 from .embedding_model_r1 import EmbeddingModel
+from .attention_supervision import AttentionSupervision
+
 
 logger = logging.getLogger("train")
 
@@ -34,6 +36,7 @@ class CoastGPT(nn.Module):
         self.vision = VisionModel(config)  # 视觉处理模块
         self.language = LanguageModel(config)  # 语言处理模块
         self.multimodal = EmbeddingModel(config)  # 多模态嵌入模块
+        self.attention_supervision = AttentionSupervision()
 
     def forward(self, data: Dict):
         """
@@ -55,8 +58,29 @@ class CoastGPT(nn.Module):
         multimodal_embedding = self.multimodal(data, image_embedding=image_embedding)
 
         # 通过语言模型处理组合输入
-        output = self.language(data, multimodal_embedding=multimodal_embedding)
+        output = self.language(data, multimodal_embedding=multimodal_embedding, output_attentions=True)
+        # 如果是训练模式且数据中包含分割掩码
+        if self.training and 'seg_mask' in data:
+            # 获取分割token的索引
+            seg_token_indices = data.get('seg_token_indices', None)
+            if seg_token_indices is not None:
+                # 计算注意力图
+                attention_maps = output.get('attentions', None)
+                if attention_maps is not None:
+                    attention_map = self.attention_supervision.compute_attention_map(
+                        attention_maps, seg_token_indices
+                    )
+                    
+                    # 计算KL散度损失
+                    seg_mask = data['seg_mask']
+                    kl_loss = self.attention_supervision.compute_kl_loss(attention_map, seg_mask)
+                    
+                    # 将KL散度损失添加到总损失中
+                    total_loss += kl_loss
+                    out.update({"kl_loss": kl_loss})
+        
 
+        text_loss = output if isinstance(output, torch.Tensor) else output.get('loss', 0.0)
         text_loss = output
         total_loss += text_loss
         out.update({"text_loss": text_loss})
