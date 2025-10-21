@@ -265,14 +265,14 @@ class MultiScaleGeoEncoder:
         return vec
 
 
-# ============ 小示例 ============
-if __name__ == "__main__":
-    enc = MultiScaleGeoEncoder()
-    # 例：舟山群岛附近
-    lon, lat = 122.20, 29.95
-    feats = enc.encode(lon, lat, dem_path=None, zone_vector_path=None)
-    vec = enc.to_vector(feats)
-    print("Feature keys:", list(feats.keys()))
-    print("Vector length:", len(vec))
-    print("Vector: ",vec)
-    print("lat_belt:", enc.cfg.belt_config.names[feats['lat_belt_index']])
+# # ============ 小示例 ============
+# if __name__ == "__main__":
+#     enc = MultiScaleGeoEncoder()
+#     # 例：舟山群岛附近
+#     lon, lat = 122.20, 29.95
+#     feats = enc.encode(lon, lat, dem_path=None, zone_vector_path=None)
+#     vec = enc.to_vector(feats)
+#     print("Feature keys:", list(feats.keys()))
+#     print("Vector length:", len(vec))
+#     print("Vector: ",vec)
+#     print("lat_belt:", enc.cfg.belt_config.names[feats['lat_belt_index']])
