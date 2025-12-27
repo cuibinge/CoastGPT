@@ -4,30 +4,7 @@
 将时间周期性特征编码为向量，支持与主干网络融合（FiLM/通道拼接）
 """
 
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
-
-# =============== 基础工具：连续周期的多谐波编码（Fourier特征） ===============
-def fourier_time_feats(t_values: torch.Tensor, period: float, harmonics: int = 3) -> torch.Tensor:
-    """
-    连续周期标量的多谐波编码（sin/cos组合）
-    参数：
-        t_values: (B,) —— 时间标量（如小时、积日、月龄）
-        period: float —— 周期长度（如24=日内周期，365.2422=年周期）
-        harmonics: int —— 谐波阶数（默认3，可调2~6）
-    返回：
-        (B, 2*K) —— 编码向量，顺序为[sin(1x), cos(1x), sin(2x), cos(2x), ...]
-    """
-    # 归一化为角度：theta = 2π * t / 周期
-    theta = 2 * math.pi * (t_values / period).unsqueeze(-1)  # (B, 1)
-    feats = []
-    for k in range(1, harmonics + 1):
-        feats.append(torch.sin(k * theta))
-        feats.append(torch.cos(k * theta))
-    return torch.cat(feats, dim=-1)  # (B, 2*K)
 
 
 # =============== 离散周期编码：可学习Embedding ===============

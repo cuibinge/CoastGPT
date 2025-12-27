@@ -29,205 +29,6 @@ set_seed(3667)
 device = torch.device("npu:3" if torch_npu.npu.is_available() else "cpu")
 print(f"使用设备: {device}")
 
-# -------------------------- 核心优化：基于SLERP的损失函数 --------------------------
-def lonlat_to_unit_vector(lonlat):
-    """
-    将经纬度转换为单位球面上的三维向量。
-    输入: lonlat - (batch_size, 2)，格式[经度, 纬度]（角度制）
-    输出: unit_vec - (batch_size, 3)，单位球面向量
-    """
-    lon_rad = torch.deg2rad(lonlat[:, 0])
-    lat_rad = torch.deg2rad(lonlat[:, 1])
-    
-    x = torch.cos(lat_rad) * torch.cos(lon_rad)
-    y = torch.cos(lat_rad) * torch.sin(lon_rad)
-    z = torch.sin(lat_rad)
-    
-    # 确保向量是单位长度（处理数值误差）
-    unit_vec = torch.stack([x, y, z], dim=1)
-    unit_vec = unit_vec / torch.norm(unit_vec, dim=-1, keepdim=True)
-    return unit_vec
-
-class SphericalCosineLoss(nn.Module):
-    """
-    基于球面余弦相似度的损失函数。
-    它优化的是预测点和真实点在单位球面上的夹角，间接等价于优化测地线距离。
-    """
-    def __init__(self, earth_radius=6371.0):
-        super().__init__()
-        self.earth_radius = earth_radius
-
-    def forward(self, pred_lonlat, true_lonlat):
-        """
-        输入: pred_lonlat, true_lonlat - (batch_size, 2)，角度制经纬度
-        输出: loss (优化用), avg_geodesic_distance (评估用, 单位：公里)
-        """
-        v_pred = lonlat_to_unit_vector(pred_lonlat)
-        v_true = lonlat_to_unit_vector(true_lonlat)
-        
-        # 计算余弦相似度，clip避免数值问题导致的超出范围
-        cos_theta = torch.sum(v_pred * v_true, dim=-1)
-        cos_theta = torch.clamp(cos_theta, -1.0 + 1e-8, 1.0 - 1e-8)
-        
-        # 损失函数：1 - cos(theta)，当theta=0时损失为0，theta增大损失增大
-        loss = 1 - cos_theta
-        
-        # 计算实际的测地线距离，用于评估
-        theta_rad = torch.arccos(cos_theta)
-        geodesic_distance = self.earth_radius * theta_rad
-        
-        return torch.mean(loss), torch.mean(geodesic_distance)
-
-# -------------------------- 原有辅助函数（保持不变） --------------------------
-def batch_encode_coords(coords_batch, geo_encoder, agg_method="mean"):
-    coords_squeezed = coords_batch.squeeze(1)  # (batch_size, num_points, 2)
-    batch_size, num_points, _ = coords_squeezed.shape
-    
-    coords_flat = coords_squeezed.reshape(-1, 2)
-    lon_deg_list = coords_flat[:, 0].cpu().numpy()
-    lat_deg_list = coords_flat[:, 1].cpu().numpy()
-    
-    point_feats = []
-    for lon, lat in zip(lon_deg_list, lat_deg_list):
-        feat_dict = geo_encoder.encode(lon_deg=lon, lat_deg=lat)
-        feat_vec = geo_encoder.to_vector(feat_dict)
-        point_feats.append(feat_vec)
-    
-    point_feats = np.stack(point_feats, axis=0)
-    point_feats = torch.tensor(point_feats, dtype=torch.float32).to(device)
-    point_feats = point_feats.reshape(batch_size, num_points, -1)
-    
-    if agg_method == "mean":
-        encoded_tensor = point_feats.mean(dim=1)  # (batch_size, D)
-    elif agg_method == "concat":
-        encoded_tensor = point_feats.reshape(batch_size, -1)
-    else:
-        raise ValueError("agg_method must be 'mean' or 'concat'")
-    
-    return encoded_tensor
-
-def get_dataloaders(train_root, val_root, batch_size=16, img_size=256):
-    clip_processor = CLIPImageProcessor.from_pretrained(
-        "/home/ma-user/work/CoastGPT/hf_cache/hub/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41/"
-    )
-    clip_processor.size["shortest_edge"] = img_size
-    clip_processor.crop_size["height"] = img_size
-    clip_processor.crop_size["width"] = img_size
-
-    train_dataset = GeoDataset(root_dir=train_root)
-    val_dataset = GeoDataset(root_dir=val_root)
-
-    print(f"训练集大小: {len(train_dataset)}, 验证集大小: {len(val_dataset)}")
-
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True,
-        drop_last=True
-    )
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True,
-        drop_last=False
-    )
-
-    return train_dataloader, val_dataloader, clip_processor
-
-# -------------------------- 模型定义（优化Decoder输出） --------------------------
-class CLIPViTImageEncoder(nn.Module):
-    def __init__(self, embed_dim=512, clip_model_name="/home/ma-user/work/CoastGPT/hf_cache/hub/models--openai--clip-vit-large-patch14/snapshots/32bd64288804d66eefd0ccbe215aa642df71cc41/"):
-        super().__init__()
-        self.clip_config = CLIPVisionConfig.from_pretrained(clip_model_name)
-        self.clip_config.image_size = 256
-        self.clip_vision_model = CLIPVisionModel.from_pretrained(
-            clip_model_name,
-            config=self.clip_config,
-            ignore_mismatched_sizes=True
-        )
-        self.clip_hidden_dim = self.clip_config.hidden_size
-        self.projection = nn.Sequential(
-            nn.Linear(self.clip_hidden_dim, self.clip_hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(self.clip_hidden_dim // 2, embed_dim)
-        )
-        self.normalize = nn.LayerNorm(embed_dim)
-
-    def forward(self, x):
-        clip_output = self.clip_vision_model(pixel_values=x)
-        cls_feat = clip_output.last_hidden_state[:, 0, :]
-        x = self.projection(cls_feat)
-        x = self.normalize(x)
-        return x / torch.norm(x, dim=-1, keepdim=True)
-
-class CoordinateEncoder(nn.Module):
-    def __init__(self, input_dim, embed_dim=512, hidden_dim=256):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, embed_dim)
-        self.normalize = nn.LayerNorm(embed_dim)
-        self.relu = nn.ReLU()
-        
-    def forward(self, x):
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
-        x = self.fc3(x)
-        x = self.normalize(x)
-        return x / torch.norm(x, dim=-1, keepdim=True)
-
-class LonLatDecoder(nn.Module):
-    """经纬度Decoder：增加输出约束，防止数值异常"""
-    def __init__(self, embed_dim=512, hidden_dim=512, num_layers=3):
-        super().__init__()
-        layers = []
-        layers.append(nn.Linear(embed_dim, hidden_dim))
-        layers.append(nn.ReLU())
-        layers.append(nn.Dropout(0.2))
-        
-        for _ in range(num_layers - 2):
-            layers.append(nn.Linear(hidden_dim, hidden_dim))
-            layers.append(nn.ReLU())
-            layers.append(nn.LayerNorm(hidden_dim))
-            layers.append(nn.Dropout(0.2))
-        
-        # 输出层：使用tanh将输出限制在[-1, 1]，再缩放至经纬度范围
-        layers.append(nn.Linear(hidden_dim, 2))
-        self.decoder = nn.Sequential(*layers)
-        
-    def forward(self, image_embeds):
-        raw_output = self.decoder(image_embeds)
-        # 经度范围: [-180, 180], 纬度范围: [-90, 90]
-        lon = raw_output[:, 0] * 180.0  # tanh输出[-1,1] → 经度[-180,180]
-        lat = raw_output[:, 1] * 90.0   # tanh输出[-1,1] → 纬度[-90,90]
-        return torch.stack([lon, lat], dim=1)
-
-class EncoderDecoderCLIP(nn.Module):
-    def __init__(self, coord_input_dim, embed_dim=512, temperature=0.07):
-        super().__init__()
-        self.image_encoder = CLIPViTImageEncoder(embed_dim=embed_dim)
-        self.lonlat_decoder = LonLatDecoder(embed_dim=embed_dim)
-        self.coord_encoder = CoordinateEncoder(coord_input_dim, embed_dim)
-        self.temperature = temperature
-        
-    def forward(self, images, coordinates):
-        image_embeds = self.image_encoder(images)
-        pred_lonlat = self.lonlat_decoder(image_embeds)
-        coord_embeds = self.coord_encoder(coordinates)
-        return image_embeds, coord_embeds, pred_lonlat
-
-# -------------------------- 损失函数和训练逻辑 --------------------------
-def contrastive_loss(image_embeds, coord_embeds, temperature=0.07):
-    batch_size = image_embeds.shape[0]
-    logits = torch.matmul(image_embeds, coord_embeds.t()) / temperature
-    labels = torch.arange(batch_size, device=image_embeds.device)
-    loss_i = nn.functional.cross_entropy(logits, labels)
-    loss_t = nn.functional.cross_entropy(logits.t(), labels)
-    return (loss_i + loss_t) / 2
 
 def train_epoch(model, dataloader, optimizer, spherical_loss_fn, device, geo_encoder, scheduler=None):
     model.train()
@@ -240,7 +41,7 @@ def train_epoch(model, dataloader, optimizer, spherical_loss_fn, device, geo_enc
     with tqdm(dataloader, unit="batch", desc="Training") as tepoch:
         for images, coordinates in tepoch:
             images = images.to(device)
-            encoded_coords = batch_encode_coords(coordinates, geo_encoder)
+
             
             true_coords = coordinates.squeeze(1).to(device)
             true_lonlat = true_coords.mean(dim=1)
@@ -249,7 +50,7 @@ def train_epoch(model, dataloader, optimizer, spherical_loss_fn, device, geo_enc
             image_embeds, coord_embeds, pred_lonlat = model(images, encoded_coords)
             
             # 计算损失
-            loss_contrastive = contrastive_loss(image_embeds, coord_embeds)
+
             loss_spherical, _ = spherical_loss_fn(pred_lonlat, true_lonlat)
             
             # 组合损失
@@ -278,54 +79,8 @@ def train_epoch(model, dataloader, optimizer, spherical_loss_fn, device, geo_enc
     avg_spherical_loss = total_spherical_loss / total_batches
     return avg_loss, avg_contrastive_loss, avg_spherical_loss
 
-def validate_epoch(model, dataloader, spherical_loss_fn, device, geo_encoder):
-    model.eval()
-    total_val_loss = 0.0
-    total_val_contrastive_loss = 0.0
-    total_val_spherical_loss = 0.0
-    total_val_geodesic_distance = 0.0
-    total_samples = 0
-    
-    with torch.no_grad(), tqdm(dataloader, unit="batch", desc="Validation") as tepoch:
-        for images, coordinates in tepoch:
-            batch_size = images.shape[0]
-            total_samples += batch_size
-            
-            images = images.to(device)
-            encoded_coords = batch_encode_coords(coordinates, geo_encoder)
-            
-            true_coords = coordinates.squeeze(1).to(device)
-            true_lonlat = true_coords.mean(dim=1)
-            
-            image_embeds, coord_embeds, pred_lonlat = model(images, encoded_coords)
-            
-            val_contrastive_loss = contrastive_loss(image_embeds, coord_embeds)
-            val_spherical_loss, val_geodesic_distance = spherical_loss_fn(pred_lonlat, true_lonlat)
-            
-            val_total_loss = 0.7 * val_contrastive_loss.item() + 0.3 * val_spherical_loss.item()
-            
-            # 累计指标
-            total_val_loss += val_total_loss
-            total_val_contrastive_loss += val_contrastive_loss.item()
-            total_val_spherical_loss += val_spherical_loss.item()
-            total_val_geodesic_distance += val_geodesic_distance.item() * batch_size # 累计总距离
-            
-            tepoch.set_postfix(
-                val_total_loss=total_val_loss / (tepoch.n + 1),
-                val_geodesic_dist=val_geodesic_distance.item()
-            )
-    
-    avg_val_loss = total_val_loss / len(dataloader)
-    avg_val_contrastive_loss = total_val_contrastive_loss / len(dataloader)
-    avg_val_spherical_loss = total_val_spherical_loss / len(dataloader)
-    avg_val_geodesic_distance = total_val_geodesic_distance / total_samples
-    
-    return avg_val_loss, avg_val_contrastive_loss, avg_val_spherical_loss, avg_val_geodesic_distance
 
 def train(model, train_dataloader, val_dataloader, num_epochs, device, geo_encoder, save_path=None):
-    optimizer = optim.Adam(model.parameters(), lr=5e-5, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
-    spherical_loss_fn = SphericalCosineLoss()
     
     history = {
         'train_total_loss': [], 'train_contrastive_loss': [], 'train_spherical_loss': [],
