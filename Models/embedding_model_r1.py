@@ -22,7 +22,7 @@ class EmbeddingModel(nn.Module):
             norm_layer = LayerNorm
 
         moe_cfg = getattr(config, "moe_proj", ml_collections.ConfigDict())
-
+        
         # 🌟 修复 1：实例化时接入任务感知参数
         self.projection = MoEProjection(
             num_experts=int(moe_cfg.get("num_experts", 4)),
@@ -33,8 +33,8 @@ class EmbeddingModel(nn.Module):
             hidden_size=getattr(config, "alignment_dim", 768),
             output_size=config.text.hidden_size,
             # ====== 新增的任务感知参数 ======
-            num_tasks=int(moe_cfg.get("num_tasks", 3)),  # 从 config 读取任务总数
-            task_dim=int(moe_cfg.get("task_dim", 256)),  # 任务 Embedding 维度
+            num_tasks=int(moe_cfg.get("num_tasks", 3)),     # 从 config 读取任务总数
+            task_dim=int(moe_cfg.get("task_dim", 256)),      # 任务 Embedding 维度
             # ==============================
             norm_layer=norm_layer,
             checkpoint=getattr(config, "use_checkpoint", False),
@@ -49,7 +49,7 @@ class EmbeddingModel(nn.Module):
         # 防御性编程：如果 DataLoader 没有传 task_ids (比如纯预训练阶段)，默认全部给 0
         batch_size = image_embedding.shape[0]
         device = image_embedding.device
-
+        
         if "task_ids" in data:
             task_ids = data["task_ids"].to(device)
         else:
@@ -68,7 +68,7 @@ class EmbeddingModel(nn.Module):
         if task_ids is None:
             batch_size = image_embedding.shape[0]
             task_ids = torch.zeros(batch_size, dtype=torch.long, device=image_embedding.device)
-
+            
         projected_image_embedding = self.projection(image_embedding, task_ids)
         return projected_image_embedding
 
