@@ -18,11 +18,9 @@ from .language_model import LanguageModel  # 自定义语言模型模块
 # from .embedding_model import EmbeddingModel
 from .embedding_model_r1 import EmbeddingModel
 from . import physics_decoder as phys
-
 # 物理解码与损失函数（兼容部分环境缺失符号）
 PhysicsDecoder = phys.PhysicsDecoder
 pixelwise_mse = getattr(phys, "pixelwise_mse", lambda pred, gt: F.mse_loss(pred, gt))
-
 
 def _edge_preserve_default(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
     # 简单梯度一致性正则（不依赖 Sobel），在缺失 edge_preserve_loss 时回退使用
@@ -32,9 +30,7 @@ def _edge_preserve_default(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor
     dw_g = torch.abs(gt[:, :, :, 1:] - gt[:, :, :, :-1])
     return F.l1_loss(dh_p, dh_g) + F.l1_loss(dw_p, dw_g)
 
-
 edge_preserve_loss = getattr(phys, "edge_preserve_loss", _edge_preserve_default)
-
 
 def _tv_default(x: torch.Tensor) -> torch.Tensor:
     # 总变分回退实现
@@ -42,9 +38,7 @@ def _tv_default(x: torch.Tensor) -> torch.Tensor:
     dw = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1]).mean()
     return dh + dw
 
-
 total_variation_loss = getattr(phys, "total_variation_loss", _tv_default)
-
 
 def _consistency_default(phy_full, phy_s1, phy_s2, phy_s3) -> torch.Tensor:
     # 多尺度一致性回退实现
@@ -54,9 +48,7 @@ def _consistency_default(phy_full, phy_s1, phy_s2, phy_s3) -> torch.Tensor:
     s3_up = F.interpolate(phy_s3, size=(H, W), mode="bilinear", align_corners=False)
     return (F.mse_loss(phy_full, s1_up) + F.mse_loss(phy_full, s2_up) + F.mse_loss(phy_full, s3_up)) / 3.0
 
-
 consistency_loss_multiscale = getattr(phys, "consistency_loss_multiscale", _consistency_default)
-
 
 def _sam_default(pred: torch.Tensor, gt: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     # 光谱角映射回退实现
@@ -70,21 +62,17 @@ def _sam_default(pred: torch.Tensor, gt: torch.Tensor, eps: float = 1e-6) -> tor
     ang = torch.acos(cos)
     return ang.mean()
 
-
 spectral_loss_sam = getattr(phys, "spectral_loss_sam", _sam_default)
 from .physics_constraints import compute_sar_sigma0_gt
 from .moe_seg import AquacultureSegMOE, dice_loss
-
 # 在不支持 NPU 的环境下忽略 torch_npu 导入错误
 try:
     import torch_npu  # noqa: F401
-
     HAS_TORCH_NPU = True
 except Exception:
     HAS_TORCH_NPU = False
 
 logger = logging.getLogger("train")
-
 
 # 定义 CoastGPT 类，继承自 PyTorch 的 nn.Module
 class CoastGPT(nn.Module):
@@ -191,21 +179,21 @@ class CoastGPT(nn.Module):
         if hasattr(self.multimodal, "get_aux_loss"):
             # 获取辅助损失
             mm_aux_loss = self.multimodal.get_aux_loss()
-
+            
             # 定义辅助损失的权重（建议在 0.01 左右，防止其梯度压过主任务 text_loss）
             # 最好从 config 中读取，这里做个 fallback 默认给 0.01
-            mm_aux_weight = getattr(self.config, "mm_moe_aux_weight", 0.01)
-
+            mm_aux_weight = getattr(self.config, "mm_moe_aux_weight", 0.01) 
+            
             if mm_aux_loss is not None and mm_aux_loss > 0:
                 # 累加到总损失中，注意对齐 dtype 防止混合精度报错
                 total_loss += (mm_aux_weight * mm_aux_loss).to(total_loss.dtype)
-
+                
                 # 更新到 out 字典，便于日志监控
                 out.update({
                     "mm_moe_aux_loss_raw": mm_aux_loss,
                     "mm_moe_aux_loss_weighted": mm_aux_weight * mm_aux_loss
                 })
-
+            
             # 🌟 强烈建议：把门控状态也记录下来，这是调试 MoE 是否坍塌的唯一“眼睛”
             if hasattr(self.multimodal, "get_gate_stats"):
                 gate_stats = self.multimodal.get_gate_stats()
@@ -274,15 +262,10 @@ class CoastGPT(nn.Module):
             tv_w = self.physics_tv_weight
             cons_w = self.physics_consistency_weight
             reg_tv = (
-                total_variation_loss(phy_pred["phy_full"]) if tv_w > 0 else torch.tensor(0.0,
-                                                                                         device=fused_spatial.device,
-                                                                                         dtype=torch.float32)
+                total_variation_loss(phy_pred["phy_full"]) if tv_w > 0 else torch.tensor(0.0, device=fused_spatial.device, dtype=torch.float32)
             )
             reg_cons = (
-                consistency_loss_multiscale(phy_pred["phy_full"], phy_pred["phy_s1"], phy_pred["phy_s2"],
-                                            phy_pred["phy_s3"]) if cons_w > 0 else torch.tensor(0.0,
-                                                                                                device=fused_spatial.device,
-                                                                                                dtype=torch.float32)
+                consistency_loss_multiscale(phy_pred["phy_full"], phy_pred["phy_s1"], phy_pred["phy_s2"], phy_pred["phy_s3"]) if cons_w > 0 else torch.tensor(0.0, device=fused_spatial.device, dtype=torch.float32)
             )
 
             # 监督：支持多尺度与全分辨率
@@ -303,9 +286,7 @@ class CoastGPT(nn.Module):
 
             if phy_gt is not None:
                 # 对齐 GT 尺寸到各尺度
-                gt_full = F.interpolate(phy_gt, size=(H, W), mode="bilinear", align_corners=False) if phy_gt.shape[
-                                                                                                      -2:] != (
-                                                                                                      H, W) else phy_gt
+                gt_full = F.interpolate(phy_gt, size=(H, W), mode="bilinear", align_corners=False) if phy_gt.shape[-2:] != (H, W) else phy_gt
                 l_full = pixelwise_mse(phy_pred["phy_full"], gt_full)
 
                 # 多尺度 GT
@@ -322,15 +303,12 @@ class CoastGPT(nn.Module):
 
                 # 边缘保持项（仅在全分辨率上）
                 edge_w = self.physics_edge_weight
-                l_edge = edge_preserve_loss(phy_pred["phy_full"], gt_full) if edge_w > 0 else torch.tensor(0.0,
-                                                                                                           device=gt_full.device,
-                                                                                                           dtype=torch.float32)
+                l_edge = edge_preserve_loss(phy_pred["phy_full"], gt_full) if edge_w > 0 else torch.tensor(0.0, device=gt_full.device, dtype=torch.float32)
 
                 # 光谱损失（需要多通道GT）
                 spec_w = self.physics_spectral_weight
                 spec_l = (
-                    spectral_loss_sam(phy_pred["phy_full"], gt_full) if spec_w > 0 and gt_full.shape[
-                        1] > 1 else torch.tensor(0.0, device=gt_full.device, dtype=torch.float32)
+                    spectral_loss_sam(phy_pred["phy_full"], gt_full) if spec_w > 0 and gt_full.shape[1] > 1 else torch.tensor(0.0, device=gt_full.device, dtype=torch.float32)
                 )
 
                 # 权重汇总
@@ -342,8 +320,8 @@ class CoastGPT(nn.Module):
                 physics_weight = self.physics_loss_weight
 
                 phy_loss = (
-                                   w_full * l_full + w_s1 * l_s1 + w_s2 * l_s2 + w_s3 * l_s3
-                           ) + edge_w * l_edge + tv_w * reg_tv + cons_w * reg_cons + spec_w * spec_l
+                    w_full * l_full + w_s1 * l_s1 + w_s2 * l_s2 + w_s3 * l_s3
+                ) + edge_w * l_edge + tv_w * reg_tv + cons_w * reg_cons + spec_w * spec_l
                 # 保持与文本损失相同的数据类型，避免混合精度导致的类型不一致
                 total_loss += (physics_weight * phy_loss).to(text_loss.dtype)
                 out.update({
@@ -411,8 +389,7 @@ class CoastGPT(nn.Module):
                 # CrossEntropy
                 ce = F.cross_entropy(seg_logits, target, ignore_index=self.seg_ignore_index)
                 # Dice（在 float32 概率上计算）
-                dl = dice_loss(seg_logits, target, num_classes=self.seg_head.num_classes,
-                               ignore_index=self.seg_ignore_index)
+                dl = dice_loss(seg_logits, target, num_classes=self.seg_head.num_classes, ignore_index=self.seg_ignore_index)
                 seg_loss = self.seg_ce_weight * ce + self.seg_dice_weight * dl
                 total_loss += (self.seg_loss_weight * seg_loss).to(text_loss.dtype)
                 out.update({"seg_loss": seg_loss, "seg_ce_loss": ce, "seg_dice_loss": dl})
@@ -531,7 +508,6 @@ class CoastGPT(nn.Module):
         # 其他关键模块参数（统一转为 CPU Tensor）
         other_ckpt = get_other_maybe_zero_3(named_params)
         return dict(vision_ckpt=vision_ckpt, other_ckpt=other_ckpt)
-
     # def custom_save_checkpoint(self, file_name: str):
     #     # 转换 ZeRO 检查点至 FP32 完整权重
     #     fp32_ckpt = get_fp32_state_dict_from_zero_checkpoint(file_name)
@@ -620,6 +596,7 @@ class CoastGPT(nn.Module):
         # # 保存修改后的checkpoint
         # torch.save(ckpt, '/root/shared-nvme/CoastGPT/Checkpoint/test2/checkpoints/iter_1299/test.pt')
 
+
         if any(key.startswith('module') for key in ckpt.keys()):
             # filtered_state_dict = {k: v for k, v in ckpt["module"].items() if k.startswith("multimodal.")}
             filtered_state_dict = {k: v for k, v in ckpt["module"].items() if
@@ -627,7 +604,7 @@ class CoastGPT(nn.Module):
             msg = self.load_state_dict(filtered_state_dict, strict=False)
             print(f"After loading: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
 
-        elif any(key.startswith('vision_ckpt') for key in ckpt.keys()):
+        elif any(key.startswith('vision_ckpt') for key in ckpt.keys()) :
             vision_ckpt = ckpt["vision_ckpt"]
             multimodal_ckpt = ckpt["other_ckpt"]["multimodal_projection"]
             msg = self.vision.load_state_dict(vision_ckpt)
@@ -635,7 +612,7 @@ class CoastGPT(nn.Module):
             msg = self.multimodal.projection.load_state_dict(multimodal_ckpt)
             print(f"After loading multimodal: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
 
-        elif any(key.startswith('rgb_ckpt') for key in ckpt.keys()):
+        elif any(key.startswith('rgb_ckpt') for key in ckpt.keys()) :
             vision_ckpt = ckpt["rgb_ckpt"]
             multimodal_ckpt = ckpt["other_ckpt"]["rgb_pooler"]
             msg = self.vision.load_state_dict(vision_ckpt)
@@ -771,7 +748,6 @@ class CoastGPT(nn.Module):
             # 如果提供了模型路径，则加载模型
             self.custom_load_state_dict(model_path)
 
-
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
     from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
@@ -815,16 +791,13 @@ def get_other_maybe_zero_3(named_params):
                 # 使用 name 作为键名，而不是其他变量名
                 # 这里需要将 name 映射到 to_return 的键名
                 if name == "multimodal.projection":
-                    to_return["multimodal_projection"][k.split(name + ".")[-1]] = maybe_zero_3(v, ignore_status=True,
-                                                                                               name=k)
+                    to_return["multimodal_projection"][k.split(name + ".")[-1]] = maybe_zero_3(v, ignore_status=True, name=k)
                 elif name == "embed_tokens":
                     to_return["embed_tokens"][k.split(name + ".")[-1]] = maybe_zero_3(v, ignore_status=True, name=k)
                 elif name == "physics":
                     to_return["physics"][k.split(name + ".")[-1]] = maybe_zero_3(v, ignore_status=True, name=k)
 
     return to_return
-
-
 # def get_other_maybe_zero_3(named_params):
 #     names = ["multimodal.projection", "embed_tokens"]
 #     to_return = {"multimodal_projection": {}, "embed_tokens": {}}
@@ -838,7 +811,7 @@ def get_other_maybe_zero_3(named_params):
 
 
 def get_rgb_maybe_zero_3(named_params):
-    to_return = {k[len("vision."):]: t for k, t in named_params if "vision." in k}
+    to_return = {k[len("vision.") :]: t for k, t in named_params if "vision." in k}
     # to_return = {k: t for k, t in named_params if k.startswith("vision.")}
     to_return = {
         k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()
