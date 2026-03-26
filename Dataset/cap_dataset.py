@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import re
+import numpy as np
 from dataclasses import dataclass
 from multiprocessing import Value
 from pathlib import Path
@@ -33,6 +34,7 @@ from Models import (
     IMAGE_TOKEN_INDEX,
 )
 from . import conversation as conversation_lib
+import torch_npu
 
 _SHARD_SHUFFLE_SIZE = 2000
 _SHARD_SHUFFLE_INITIAL = 500
@@ -106,6 +108,27 @@ class CaptionDataset(torch.utils.data.Dataset):
 
     def post_process(self):
         pass
+
+    def load_physics(self, idx: int):
+        """
+        加载与图像空间对齐的物理真值 (TSM) 与有效域掩码 (Mask)。
+        这部分数据必须在制作 CoastBench 时提前由定量遥感算法生成。
+        """
+        img_path = Path(self.img_list[idx])
+
+        # 假设物理真值存储在与图像同级的 TSM 文件夹或具有特定后缀
+        # 实际路径逻辑请根据你的 CoastBench 存储规范严格修改
+        tsm_path = img_path.parent / (img_path.stem + "_tsm.npy")
+        mask_path = img_path.parent / (img_path.stem + "_mask.npy")
+
+        if tsm_path.exists() and mask_path.exists():
+            # 加载并转换为张量，通常需要下采样到特征图的尺度 (如 F32 对应的尺度)
+            # 或者在这里保持原图尺寸，在损失函数计算前进行 F.interpolate
+            tsm_tensor = torch.from_numpy(np.load(tsm_path)).float()
+            mask_tensor = torch.from_numpy(np.load(mask_path)).float()
+            return tsm_tensor, mask_tensor
+        else:
+            return None, None
 
     def load_dataset(self):
         for i in range(len(self.img_dir)):
@@ -192,17 +215,18 @@ class CaptionDataset(torch.utils.data.Dataset):
             captions = pre_caption(captions)
 
         x = self.load_image(idx)
-        return dict(rgb=x, text=captions)
+        tsm, mask = self.load_physics(idx)  # 新增物理数据加载
+        return dict(rgb=x, text=captions, tsm=tsm, mask=mask)
 
 
 class VGEvalDataset(CaptionDataset):
     def __init__(
-        self,
-        root: Union[Path, str] = ".data/rsicd",
-        target: Union[Path, str] = None,
-        transform: T.Compose = None,
-        tokenizer: transformers.PreTrainedTokenizer = None,
-        **kwargs,
+            self,
+            root: Union[Path, str] = ".data/rsicd",
+            target: Union[Path, str] = None,
+            transform: T.Compose = None,
+            tokenizer: transformers.PreTrainedTokenizer = None,
+            **kwargs,
     ):
         prompt_type = kwargs.pop("prompt_type", "llava_llama_2")
         conversation_lib.default_conversation = conversation_lib.conv_templates[prompt_type]
@@ -274,10 +298,10 @@ class VGEvalDataset(CaptionDataset):
 
 class CapEvalDataset(CaptionDataset):
     def __init__(
-        self,
-        root: Union[Path, str] = ".data/rsicd",
-        target: Union[Path, str] = None,
-        transform: T.Compose = None,
+            self,
+            root: Union[Path, str] = ".data/rsicd",
+            target: Union[Path, str] = None,
+            transform: T.Compose = None,
     ):
         if isinstance(root, str):
             root = Path(root)
@@ -397,10 +421,10 @@ class CaptionDatasetVQA(CaptionDataset):
 
 class InstructDataset(CaptionDataset):
     def __init__(
-        self,
-        tokenizer: transformers.PreTrainedTokenizer,
-        crop_size: int = 224,
-        **kwargs,
+            self,
+            tokenizer: transformers.PreTrainedTokenizer,
+            crop_size: int = 224,
+            **kwargs,
     ):
         self.tune_im_start = kwargs.pop("tune_im_start", False)
         prompt_type = kwargs.pop("prompt_type", "llava_llama_2")
@@ -437,6 +461,27 @@ class InstructDataset(CaptionDataset):
 
         self.cap_list = new_cap_list
         self.img_list = new_img_list
+
+    def load_physics(self, idx: int):
+        """
+        加载与图像空间对齐的物理真值 (TSM) 与有效域掩码 (Mask)。
+        这部分数据必须在制作 CoastBench 时提前由定量遥感算法生成。
+        """
+        img_path = Path(self.img_list[idx])
+
+        # 假设物理真值存储在与图像同级的 TSM 文件夹或具有特定后缀
+        # 实际路径逻辑请根据你的 CoastBench 存储规范严格修改
+        tsm_path = img_path.parent / (img_path.stem + "_tsm.npy")
+        mask_path = img_path.parent / (img_path.stem + "_mask.npy")
+
+        if tsm_path.exists() and mask_path.exists():
+            # 加载并转换为张量，通常需要下采样到特征图的尺度 (如 F32 对应的尺度)
+            # 或者在这里保持原图尺寸，在损失函数计算前进行 F.interpolate
+            tsm_tensor = torch.from_numpy(np.load(tsm_path)).float()
+            mask_tensor = torch.from_numpy(np.load(mask_path)).float()
+            return tsm_tensor, mask_tensor
+        else:
+            return None, None
 
     def load_dataset(self):
         for i in range(len(self.img_dir)):
@@ -484,16 +529,27 @@ class InstructDataset(CaptionDataset):
 
     def __getitem__(self, idx: int) -> Dict:
         out_dict = super().__getitem__(idx)
+
+        # 文本特征的 Tokenize 预处理
         out_dict["text"] = preprocess_multimodal(out_dict["text"], tune_im_start=self.tune_im_start)
         out_dict["text"] = preprocess(out_dict["text"], self.tokenizer, has_image=True)
         out_dict["text"] = dict(
             input_ids=out_dict["text"]["input_ids"][0],
             labels=out_dict["text"]["labels"][0],
         )
+
+        # 边界条件防御与物理张量透传
         if idx >= len(self.img_list):
             out_dict["valid_image"] = False
+            # 对于纯文本或无效图像样本，物理先验必须严格置空
+            out_dict["tsm"] = None
+            out_dict["mask"] = None
         else:
             out_dict["valid_image"] = True
+            # 获取物理数据并显式挂载到输出字典中
+            tsm, mask = self.load_physics(idx)
+            out_dict["tsm"] = tsm
+            out_dict["mask"] = mask
 
         return out_dict
 
@@ -509,9 +565,99 @@ class InstructDatasetWithTaskId(InstructDataset):
         "FAST": 1.0,
     }
 
+    # 任务关键词映射到任务ID
+    TASK_KEYWORDS = {
+        "分类": [
+            "classify", "classification", "分类", "识别", "recognize", "distinguish",
+            "category", "label", "predict", "identify", "what type", "which class",
+            "land cover", "land use", "vegetation", "water", "building", "urban", "rural"
+        ],
+        "分割": [
+            "segment", "segmentation", "分割", "mask", "outline", "boundary", " delineate",
+            "edge detection", "semantic segmentation", "instance segmentation", "mask prediction",
+            "region", "area", "polygon", "mask image", "semantic mask", "cover type"
+        ],
+        "检测": [
+            "detect", "detection", "检测", "object detection", "find", "locate",
+            "target", "bbox", "bounding box", "instance", "object", "feature"
+        ],
+        "描述": [
+            "describe", "description", "描述", "explain", "caption", "summarize",
+            "what do you see", "describe the", "tell me about", "visual content", "scene"
+        ],
+        "生成": [
+            "generate", "generation", "生成", "create", "synthesize", "produce",
+            "create image", "synthetic", "artificial", "render", "generate map"
+        ]
+    }
+
+    # 任务ID映射
+    TASK_ID_MAPPING = {
+        "分类": 0,
+        "分割": 1,
+        "检测": 2,
+        "描述": 3,
+        "生成": 4,
+        "其他": 5
+    }
+
+    # 地物类别映射
+    CATEGORY_KEYWORDS = {
+        "水体": ["water", "river", "ocean", "lake", "pond", "sea", "flood", "wetland", "water body", "水域", "河流",
+                 "海洋", "湖泊"],
+        "植被": ["vegetation", "forest", "tree", "grass", "crop", "agriculture", "plant", "green", "vegetation cover",
+                 "植被", "森林", "农田", "草地"],
+        "建筑": ["building", "house", "urban", "city", "structure", "construction", "man-made", "建筑", "房屋", "城市",
+                 "人工"],
+        "道路": ["road", "highway", "street", "path", "transport", "infrastructure", "道路", "公路", "街道"],
+        "农田": ["farmland", "agriculture", "farm", "field", "crop", "种植", "农田", "耕地", "庄稼"],
+        "裸地": ["bare ground", "soil", "sand", "rock", "exposed", "ground", "bare", "裸地", "土壤", "岩石"],
+        "云层": ["cloud", "cloud cover", "cloudy", "overcast", "cloud shadow", "云", "云层", "多云"]
+    }
+
     def __init__(self, **kwargs):
         self.sample_weight = []
         super().__init__(**kwargs)
+        self.task_ids = []  # 存储每个样本的任务ID
+        self.category_ids = []  # 存储每个样本的地物类别ID
+
+    def detect_task_from_text(self, text: str) -> int:
+        """
+        根据输入文本检测任务类型
+        Args:
+            text: 输入文本
+        Returns:
+            task_id: 任务ID
+        """
+        text_lower = text.lower()
+
+        # 检查每个任务类型
+        for task_type, keywords in self.TASK_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in text_lower:
+                    return self.TASK_ID_MAPPING[task_type]
+
+        # 如果没有匹配到任务关键词，返回"其他"
+        return self.TASK_ID_MAPPING["其他"]
+
+    def detect_category_from_text(self, text: str) -> int:
+        """
+        根据输入文本检测地物类别
+        Args:
+            text: 输入文本
+        Returns:
+            category_id: 地物类别ID
+        """
+        text_lower = text.lower()
+
+        # 检查每个地物类别
+        for category, keywords in self.CATEGORY_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in text_lower:
+                    return list(self.CATEGORY_KEYWORDS.keys()).index(category)
+
+        # 如果没有匹配到地物类别，返回0（水体）
+        return 0
 
     def post_process(self):
         for i, item in enumerate(self.cap_list):
@@ -580,6 +726,20 @@ class InstructDatasetWithTaskId(InstructDataset):
                     else:
                         self.cap_list.append(item["conv"])
 
+                    # 检测任务ID和地物类别ID
+                    for conv_item in self.cap_list[-1]:
+                        if "Question" in conv_item:
+                            question = conv_item["Question"]
+                            task_id = self.detect_task_from_text(question)
+                            category_id = self.detect_category_from_text(question)
+                            self.task_ids.append(task_id)
+                            self.category_ids.append(category_id)
+                            break
+                    else:
+                        # 如果没有Question，默认使用"描述"任务和"水体"类别
+                        self.task_ids.append(self.TASK_ID_MAPPING["描述"])
+                        self.category_ids.append(0)
+
                     process_flag = False
                     for name, weight in self.WEIGHT_DICT.items():
                         if name in dataset_name:
@@ -589,6 +749,22 @@ class InstructDatasetWithTaskId(InstructDataset):
 
                     if not process_flag:
                         self.sample_weight.append(0.5)
+
+    def __getitem__(self, idx: int) -> Dict:
+        out_dict = super().__getitem__(idx)
+
+        # 添加task_id和category_id
+        if idx < len(self.task_ids):
+            out_dict["task_id"] = self.task_ids[idx]
+        else:
+            out_dict["task_id"] = self.TASK_ID_MAPPING["描述"]
+
+        if idx < len(self.category_ids):
+            out_dict["category_id"] = self.category_ids[idx]
+        else:
+            out_dict["category_id"] = 0
+
+        return out_dict
 
 
 def log_and_continue(exn):
@@ -660,11 +836,11 @@ class SharedEpoch:
 
 class detshuffle2(wds.PipelineStage):
     def __init__(
-        self,
-        bufsize=1000,
-        initial=100,
-        seed=0,
-        epoch=-1,
+            self,
+            bufsize=1000,
+            initial=100,
+            seed=0,
+            epoch=-1,
     ):
         self.bufsize = bufsize
         self.initial = initial
@@ -695,10 +871,10 @@ def byte_decode(x):
 
 
 def RS5MDataset(
-    root: Union[Path, str] = ".data/rsicd",
-    transform: T.Compose = None,
-    tokenizer: transformers.PreTrainedTokenizer = None,
-    **kwargs,
+        root: Union[Path, str] = ".data/rsicd",
+        transform: T.Compose = None,
+        tokenizer: transformers.PreTrainedTokenizer = None,
+        **kwargs,
 ):
     tune_im_start = kwargs.pop("tune_im_start", False)
     prompt_type = kwargs.pop("prompt_type", "llava_llama_2")
@@ -810,7 +986,7 @@ class DataCollatorForSupervisedDataset(object):
         if "rgb" in instances[0]:
             images = [instance["rgb"] for instance in instances]
             if not isinstance(images[0], Image.Image) and all(
-                x is not None and x.shape == images[0].shape for x in images
+                    x is not None and x.shape == images[0].shape for x in images
             ):
                 batch["rgb"] = torch.stack(images)
             else:
@@ -818,6 +994,30 @@ class DataCollatorForSupervisedDataset(object):
 
         if "valid_image" in instances[0]:
             batch["valid_image"] = torch.tensor([instance["valid_image"] for instance in instances])
+
+        if "tsm" in instances[0] and instances[0]["tsm"] is not None:
+            tsms = [instance["tsm"] for instance in instances if instance["tsm"] is not None]
+            masks = [instance["mask"] for instance in instances if instance["mask"] is not None]
+
+            # 只有当 batch 中存在有效物理数据时才拼接
+            if len(tsms) > 0:
+                batch["tsm"] = torch.stack(tsms).unsqueeze(1)  # [B, 1, H, W]
+                batch["mask"] = torch.stack(masks).unsqueeze(1)
+            else:
+                batch["tsm"] = None
+                batch["mask"] = None
+        else:
+            batch["tsm"] = None
+            batch["mask"] = None
+
+        # 添加task_ids和category_ids
+        if "task_ids" in instances[0]:
+            task_ids = [instance["task_id"] for instance in instances]
+            batch["task_ids"] = torch.tensor(task_ids, dtype=torch.long)
+
+        if "category_ids" in instances[0]:
+            category_ids = [instance["category_id"] for instance in instances]
+            batch["category_ids"] = torch.tensor(category_ids, dtype=torch.long)
 
         return batch
 
@@ -854,7 +1054,7 @@ class DataCollatorForVGSupervisedDataset(object):
 
         images = [instance[0] for instance in instances]
         if not isinstance(images[0], Image.Image) and all(
-            x is not None and x.shape == images[0].shape for x in images
+                x is not None and x.shape == images[0].shape for x in images
         ):
             images = torch.stack(images)
         else:
@@ -867,8 +1067,8 @@ class DataCollatorForVGSupervisedDataset(object):
 
 
 def preprocess_multimodal(
-    sources: List[Dict[str, str]],
-    tune_im_start: bool = False,
+        sources: List[Dict[str, str]],
+        tune_im_start: bool = False,
 ) -> List[Dict[str, str]]:
     if not isinstance(sources, list):
         sources = [sources]
@@ -894,9 +1094,9 @@ def preprocess_multimodal(
 
 
 def preprocess_llama_2(
-    sources,
-    tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False,
+        sources,
+        tokenizer: transformers.PreTrainedTokenizer,
+        has_image: bool = False,
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"Question": conv.roles[0], "Answer": conv.roles[1], "value": conv.roles[1]}
@@ -949,7 +1149,7 @@ def preprocess_llama_2(
             round_len = len(tokenizer_image_token(rou, tokenizer))
             instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 2
 
-            target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
+            target[cur_len: cur_len + instruction_len] = IGNORE_INDEX
 
             cur_len += round_len
         target[cur_len:] = IGNORE_INDEX
@@ -965,8 +1165,8 @@ def preprocess_llama_2(
 
 
 def preprocess_plain(
-    sources: Sequence[Dict],
-    tokenizer: transformers.PreTrainedTokenizer,
+        sources: Sequence[Dict],
+        tokenizer: transformers.PreTrainedTokenizer,
 ) -> Dict:
     # add end signal and concatenate together
     conversations = []
@@ -1041,7 +1241,7 @@ def preprocess_v1(sources, tokenizer: transformers.PreTrainedTokenizer, has_imag
                 round_len = len(tokenizer(rou).input_ids)
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 2
 
-            target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
+            target[cur_len: cur_len + instruction_len] = IGNORE_INDEX
 
             cur_len += round_len
         target[cur_len:] = IGNORE_INDEX
@@ -1061,9 +1261,9 @@ def preprocess_v1(sources, tokenizer: transformers.PreTrainedTokenizer, has_imag
 
 
 def preprocess(
-    sources: Sequence[str],
-    tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False,
+        sources: Sequence[str],
+        tokenizer: transformers.PreTrainedTokenizer,
+        has_image: bool = False,
 ) -> Dict:
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
         return preprocess_plain(sources, tokenizer)
