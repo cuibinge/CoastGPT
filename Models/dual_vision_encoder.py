@@ -14,23 +14,23 @@ except Exception as e:
     _open_clip_import_error = e
 
 
+
 class CrossFrequencyAttention(nn.Module):
     """
     跨频域交叉注意力对齐模块。
     数学逻辑：以 ViT (DINO) 提取的全局低频语义作为 Query，
     以 CNN (ConvNeXt) 提取的局部高频纹理作为 Key 和 Value，计算协方差矩阵。
     """
-
     def __init__(self, vit_dim, cnn_dim, num_heads=8):
         super().__init__()
         self.q_proj = nn.Linear(vit_dim, vit_dim)
         self.k_proj = nn.Linear(cnn_dim, vit_dim)
         self.v_proj = nn.Linear(cnn_dim, vit_dim)
-
+        
         self.attn = nn.MultiheadAttention(embed_dim=vit_dim, num_heads=num_heads, batch_first=True)
         self.norm1 = nn.LayerNorm(vit_dim)
         self.norm2 = nn.LayerNorm(vit_dim)
-
+        
         self.ffn = nn.Sequential(
             nn.Linear(vit_dim, vit_dim * 4),
             nn.GELU(),
@@ -49,38 +49,36 @@ class CrossFrequencyAttention(nn.Module):
 
         # 注意力计算：Q (宏观) 检索 K (微观)，提取 V (局部特征)
         attn_out, _ = self.attn(query=Q, key=K, value=V)
-
+        
         # 残差连接：保留原始低频拓扑的同时注入高频细节
         z_fused = self.norm1(z_vit + attn_out)
         out = self.norm2(z_fused + self.ffn(z_fused))
         return out
 
-
 class HeterogeneousFusionBlock(nn.Module):
     def __init__(self, cnn_dims, vit_dim):
         super().__init__()
         # 为 ConvNeXt 的 4 个 stage (F4, F8, F16, F32) 构建独立对齐空间
-        self.align_f4 = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=cnn_dims[0])
-        self.align_f8 = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=cnn_dims[1])
+        self.align_f4  = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=cnn_dims[0])
+        self.align_f8  = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=cnn_dims[1])
         self.align_f16 = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=cnn_dims[2])
         self.align_f32 = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=cnn_dims[3])
 
     def forward(self, vit_features, cnn_pyramid):
         c4, c8, c16, c32 = cnn_pyramid
-
+        
         # 展平 CNN 空间维度以进行矩阵乘法 [B, C, H, W] -> [B, H*W, C]
-        flat_c4 = c4.flatten(2).transpose(1, 2)
-        flat_c8 = c8.flatten(2).transpose(1, 2)
+        flat_c4  = c4.flatten(2).transpose(1, 2)
+        flat_c8  = c8.flatten(2).transpose(1, 2)
         flat_c16 = c16.flatten(2).transpose(1, 2)
         flat_c32 = c32.flatten(2).transpose(1, 2)
 
-        F4 = self.align_f4(vit_features, flat_c4)
-        F8 = self.align_f8(vit_features, flat_c8)
+        F4  = self.align_f4(vit_features, flat_c4)
+        F8  = self.align_f8(vit_features, flat_c8)
         F16 = self.align_f16(vit_features, flat_c16)
         F32 = self.align_f32(vit_features, flat_c32)
 
         return F4, F8, F16, F32
-
 
 class DualVisionEncoder(nn.Module):
     def __init__(self, config: ml_collections.ConfigDict):
@@ -105,8 +103,7 @@ class DualVisionEncoder(nn.Module):
         # Global encoder: DINOv3 ViT variants via timm, using provided checkpoint path
         self.global_encoder = None
         self._use_transformers_clip_vit = False
-        if self.global_ckpt_path is None or (
-                isinstance(self.global_ckpt_path, str) and len(self.global_ckpt_path) == 0):
+        if self.global_ckpt_path is None or (isinstance(self.global_ckpt_path, str) and len(self.global_ckpt_path) == 0):
             raise RuntimeError("DINOv3 ViT requires 'rgb_vision.global_ckpt_path' to point to pretrained weights")
         try:
             import timm
@@ -119,8 +116,7 @@ class DualVisionEncoder(nn.Module):
             self._enable_vit_rope(state)
             missing = self.global_encoder.load_state_dict(state, strict=False)
             if isinstance(missing, torch.nn.modules.module._IncompatibleKeys):
-                warnings.warn(
-                    f"Loaded DINOv3 ViT weights with missing: {missing.missing_keys}, unexpected: {missing.unexpected_keys}")
+                warnings.warn(f"Loaded DINOv3 ViT weights with missing: {missing.missing_keys}, unexpected: {missing.unexpected_keys}")
         except Exception as e:
             raise RuntimeError(f"Failed to initialize DINOv3 ViT via timm: {e}")
 
@@ -141,11 +137,9 @@ class DualVisionEncoder(nn.Module):
             except Exception as e:
                 raise RuntimeError(f"timm is required for DINO ConvNeXt local encoder: {e}")
             if self.local_name not in ["convnext_base", "convnext_large"]:
-                warnings.warn(
-                    "For DINO ConvNeXt checkpoints, set local_encoder_name to 'convnext_base' or 'convnext_large'. Using convnext_base by default.")
+                warnings.warn("For DINO ConvNeXt checkpoints, set local_encoder_name to 'convnext_base' or 'convnext_large'. Using convnext_base by default.")
                 self.local_name = "convnext_base"
-            self.local_encoder = timm.create_model(self.local_name, pretrained=False, features_only=True,
-                                                   out_indices=(0, 1, 2, 3))
+            self.local_encoder = timm.create_model(self.local_name, pretrained=False, features_only=True, out_indices=(0,1,2,3))
             local_ckpt = rgb_cfg.get("local_ckpt_path", None)
             if not local_ckpt:
                 raise RuntimeError("rgb_vision.local_ckpt_path must be set to your DINOv3 ConvNeXt checkpoint path")
@@ -155,8 +149,7 @@ class DualVisionEncoder(nn.Module):
             state = self._remap_dino_convnext_to_timm(state)
             missing = self.local_encoder.load_state_dict(state, strict=False)
             if isinstance(missing, torch.nn.modules.module._IncompatibleKeys):
-                warnings.warn(
-                    f"Loaded local ConvNeXt weights with missing: {missing.missing_keys}, unexpected: {missing.unexpected_keys}")
+                warnings.warn(f"Loaded local ConvNeXt weights with missing: {missing.missing_keys}, unexpected: {missing.unexpected_keys}")
         else:
             raise RuntimeError(f"Unknown local_source '{self.local_source}'. Expected 'openclip' or 'dino'.")
 
@@ -171,11 +164,11 @@ class DualVisionEncoder(nn.Module):
         # Projection heads (lazy init)
         self.local_proj = None
         self.fusion_proj = None
-
-        vit_dim = 1024  # DINOv3 Large 维度
-        cnn_dims = [128, 256, 512, 1024]  # ConvNeXt Large 维度
+    
+        vit_dim = 1024 # DINOv3 Large 维度
+        cnn_dims = [128,256,512,1024] # ConvNeXt Large 维度
         self.hetero_fusion = HeterogeneousFusionBlock(cnn_dims=cnn_dims, vit_dim=vit_dim)
-
+        
         # 最终投影至大模型的 alignment_dim (如 768 或 4096)
         self.final_proj = nn.Linear(vit_dim * 4, self.embedding_dim)
 
@@ -288,10 +281,9 @@ class DualVisionEncoder(nn.Module):
             seq_len = gh * gw + (1 if hasattr(self.global_encoder, 'cls_token') else 0)
 
             # zero out absolute pos_embed if present (we use RoPE)
-            if hasattr(self.global_encoder, 'pos_embed') and isinstance(self.global_encoder.pos_embed,
-                                                                        torch.nn.Parameter):
+            if hasattr(self.global_encoder, 'pos_embed') and isinstance(self.global_encoder.pos_embed, torch.nn.Parameter):
                 with torch.no_grad():
-                    pe = self.global_encoder.pos_embed
+                    pe=self.global_encoder.pos_embed
                     if pe.data.shape[1] >= seq_len:
                         pe.data.zero_()
 
@@ -317,7 +309,6 @@ class DualVisionEncoder(nn.Module):
                     sin = sin[:, :pair_dim]
                 cos = cos[None, None, :, :].to(xq.dtype)
                 sin = sin[None, None, :, :].to(xq.dtype)
-
                 def rope_on(x: torch.Tensor) -> torch.Tensor:
                     x_main = x[..., : 2 * pair_dim]
                     x_tail = x[..., 2 * pair_dim:]
@@ -328,7 +319,6 @@ class DualVisionEncoder(nn.Module):
                     out2 = x1 * sin + x2 * cos
                     out = torch.stack([out1, out2], dim=-1).view(*x_main.shape[:-2], 2 * pair_dim)
                     return torch.cat([out, x_tail], dim=-1)
-
                 return rope_on(xq), rope_on(xk)
 
             # Monkey-patch attention forward to inject RoPE
@@ -337,11 +327,9 @@ class DualVisionEncoder(nn.Module):
                     attn = getattr(blk, 'attn', None)
                     if attn is None or not hasattr(attn, 'forward'):
                         continue
-
                     def rope_forward(x, _attn=attn):
                         B, N, C = x.shape
-                        qkv = _attn.qkv(x).reshape(B, N, 3, _attn.num_heads, C // _attn.num_heads).permute(2, 0, 3, 1,
-                                                                                                           4)
+                        qkv = _attn.qkv(x).reshape(B, N, 3, _attn.num_heads, C // _attn.num_heads).permute(2, 0, 3, 1, 4)
                         q, k, v = qkv[0], qkv[1], qkv[2]
                         q, k = apply_rope(q, k)
                         attn_scores = (q @ k.transpose(-2, -1)) * _attn.scale
@@ -351,7 +339,6 @@ class DualVisionEncoder(nn.Module):
                         out = _attn.proj(out)
                         out = _attn.proj_drop(out) if hasattr(_attn, 'proj_drop') else out
                         return out
-
                     attn.forward = rope_forward
         except Exception as e:
             warnings.warn(f"Failed to enable RoPE: {e}")
@@ -426,8 +413,7 @@ class DualVisionEncoder(nn.Module):
                 gw = gh
             # Prepend cls if model defines it
             added_cls = False
-            if hasattr(self.global_encoder, 'cls_token') and isinstance(self.global_encoder.cls_token,
-                                                                        torch.nn.Parameter):
+            if hasattr(self.global_encoder, 'cls_token') and isinstance(self.global_encoder.cls_token, torch.nn.Parameter):
                 cls = self.global_encoder.cls_token.expand(x.shape[0], -1, -1)
                 x = torch.cat((cls, x), dim=1)
                 added_cls = True
@@ -526,53 +512,51 @@ class DualVisionEncoder(nn.Module):
         else:
             feats = self.local_encoder(pixel_values)
             return feats  # timm features_only list
-
     def encode(self, x: torch.Tensor):
         return self.encode_with_spatial(x)[0]
-
     def forward(self, x: Dict[str, torch.Tensor]):
         pixel_values = x["rgb"]
         return self.encode(pixel_values)
 
     def encode_with_spatial(self, x):
-        pixel_values = F.interpolate(x, size=self.input_size, mode="bilinear", align_corners=False)
-
+    pixel_values = F.interpolate(x, size=self.input_size, mode="bilinear", align_corners=False)
+    
     # 1. 提取全局低频特征
     g_grid = self._get_global_grid(pixel_values)  # [B, 1024, 14, 14]
-    z_vit = g_grid.flatten(2).transpose(1, 2)  # [B, 196, 1024]
-
+    z_vit = g_grid.flatten(2).transpose(1, 2)      # [B, 196, 1024]
+    
     # 2. 提取局部金字塔特征
     l_feats_raw = self._get_local_pyramid_raw(pixel_values)  # list of 4 tensors
-
+    
     # 3. 分别处理
     # stage1 (56x56) -> 交叉注意力 -> 196x1024
     flat_c4 = l_feats_raw[0].flatten(2).transpose(1, 2)  # [B, 3136, 128]
-    F4 = self.align_f4(z_vit, flat_c4)  # [B, 196, 1024]
-
+    F4 = self.align_f4(z_vit, flat_c4)                   # [B, 196, 1024]
+    
     # stage2 (28x28) 保留原始 token，不经过交叉注意力
     flat_c8 = l_feats_raw[1].flatten(2).transpose(1, 2)  # [B, 784, 256]
     # 投影到 3072 维
     if not hasattr(self, 'proj_stage2'):
         self.proj_stage2 = nn.Linear(256, 3072).to(flat_c8.device)
-    F8_raw = self.proj_stage2(flat_c8)  # [B, 784, 3072]
-
+    F8_raw = self.proj_stage2(flat_c8)                   # [B, 784, 3072]
+    
     # stage3 (14x14) -> 交叉注意力 -> 196x1024
     flat_c16 = l_feats_raw[2].flatten(2).transpose(1, 2)  # [B, 196, 512]
-    F16 = self.align_f16(z_vit, flat_c16)  # [B, 196, 1024]
-
+    F16 = self.align_f16(z_vit, flat_c16)                 # [B, 196, 1024]
+    
     # stage4 (7x7) -> 交叉注意力 -> 196x1024
     flat_c32 = l_feats_raw[3].flatten(2).transpose(1, 2)  # [B, 49, 1024]
-    F32 = self.align_f32(z_vit, flat_c32)  # [B, 196, 1024]
-
+    F32 = self.align_f32(z_vit, flat_c32)                 # [B, 196, 1024]
+    
     # 4. 特征维度拼接 stage1,3,4
     F_other = torch.cat([F4, F16, F32], dim=-1)  # [B, 196, 3072]
-
+    
     # 5. 序列维度拼接
     visual_tokens = torch.cat([F_other, F8_raw], dim=1)  # [B, 196+784=980, 3072]
-
+    
     # 6. 最终投影到 alignment_dim
     if not hasattr(self, 'final_proj'):
         self.final_proj = nn.Linear(3072, self.embedding_dim).to(visual_tokens.device)
     seq = self.final_proj(visual_tokens)  # [B, 980, embedding_dim]
-
+    
     return seq, g_grid, (F4, F8_raw, F16, F32)
