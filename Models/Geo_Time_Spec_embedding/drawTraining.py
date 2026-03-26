@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import argparse
 import os
 
+
 def plot_training_history(history_path):
     """
     Load and visualize training history data.
@@ -33,11 +34,11 @@ def plot_training_history(history_path):
     epochs = range(1, len(history['train_total_loss']) + 1)
 
     # --- 4. Plot loss curves ---
-    ax1.plot(epochs, history['train_total_loss'], 
+    ax1.plot(epochs, history['train_total_loss'],
              label='Training Total Loss', linewidth=2.0, marker='o', markersize=4)
-    ax1.plot(epochs, history['val_total_loss'], 
+    ax1.plot(epochs, history['val_total_loss'],
              label='Validation Total Loss', linewidth=2.0, linestyle='--', marker='s', markersize=4)
-    
+
     ax1.set_ylabel('Loss Value', fontsize=12)
     ax1.set_title('Training vs Validation Loss', fontsize=14)
     ax1.legend(loc='upper right', fontsize=10)
@@ -45,11 +46,11 @@ def plot_training_history(history_path):
     ax1.set_yscale('log')  # Use log scale for clearer loss trend
 
     # --- 5. Plot Lon/Lat MAE curves ---
-    ax2.plot(epochs, history['train_lonlat_mae'], 
+    ax2.plot(epochs, history['train_lonlat_mae'],
              label='Training Lon/Lat MAE', linewidth=2.0, marker='o', markersize=4)
-    ax2.plot(epochs, history['val_lonlat_mae'], 
+    ax2.plot(epochs, history['val_lonlat_mae'],
              label='Validation Lon/Lat MAE', linewidth=2.0, linestyle='--', marker='s', markersize=4)
-    
+
     ax2.set_xlabel('Training Epochs', fontsize=12)
     ax2.set_ylabel('Lon/Lat Mean Absolute Error (°)', fontsize=12)
     ax2.set_title('Geographic Prediction Accuracy', fontsize=14)
@@ -68,24 +69,25 @@ def plot_training_history(history_path):
 
     # --- 6. Adjust layout and save/display ---
     plt.tight_layout(rect=[0, 0, 1, 0.96])  # Reserve space for main title
-    
+
     # Save plot
     save_dir = os.path.dirname(history_path)
     save_path = os.path.join(save_dir, 'training_history_plot.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     print(f"Plot saved to: {save_path}")
-    
+
     # Display plot
     plt.show()
+
 
 if __name__ == '__main__':
     # Create command line argument parser
     parser = argparse.ArgumentParser(description='Visualize training history data.')
-    parser.add_argument('history_file', default='./clip_geo_models_20251110_093258/training_history.npy', 
+    parser.add_argument('history_file', default='./clip_geo_models_20251110_093258/training_history.npy',
                         type=str, help='Path to the training history .npy file')
-    
+
     # Parse arguments
     args = parser.parse_args()
-    
+
     # Call visualization function
     plot_training_history(args.history_file)
