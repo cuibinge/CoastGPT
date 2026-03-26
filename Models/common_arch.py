@@ -1,6 +1,4 @@
-from_pretrained
-collections
-import OrderedDict
+from_pretrained collections import OrderedDict
 from typing import Callable, List, Optional, Union, Dict
 
 import torch
@@ -94,17 +92,17 @@ class AttnPooler(nn.Module):
     """
 
     def __init__(
-            self,
-            num_query: int,
-            num_layers: int,
-            num_attention_heads: int,
-            encoder_hidden_size: int,
-            hidden_size: int,
-            output_size: int,
-            norm_layer: Optional[Callable[..., nn.Module]] = None,
-            checkpoint: bool = False,
-            stage_num: Union[List, int] = [64, 48, 32],  # [64, 48, 32]
-            split_part: List = [256, 256, 256],  # [256,256, 256]
+        self,
+        num_query: int,
+        num_layers: int,
+        num_attention_heads: int,
+        encoder_hidden_size: int,
+        hidden_size: int,
+        output_size: int,
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+        checkpoint: bool = False,
+        stage_num: Union[List, int] = [64, 48, 32],  # [64, 48, 32]
+        split_part: List = [256, 256, 256],  # [256,256, 256]
     ):
         super().__init__()
         self.checkpoint = checkpoint
@@ -136,8 +134,8 @@ class AttnPooler(nn.Module):
         self.out_proj = nn.Linear(hidden_size, output_size)
 
     def forward(
-            self,
-            image_embs: torch.Tensor,
+        self,
+        image_embs: torch.Tensor,
     ) -> torch.Tensor:
         if self.in_proj is not None:
             image_embs = self.in_proj(image_embs)
@@ -184,8 +182,8 @@ class AttnPooler(nn.Module):
         all_tokens = []
         spatial_attns = []
         for sub_token, sub_image in zip(
-                [stage1_query, stage2_query, stage3_query],
-                [stage1_image, stage2_image, stage3_image],
+            [stage1_query, stage2_query, stage3_query],
+            [stage1_image, stage2_image, stage3_image],
         ):
             q_len = sub_token.size(1)
             cat_embs = torch.cat([sub_token, sub_image], dim=1)
@@ -195,19 +193,19 @@ class AttnPooler(nn.Module):
 
             for layer in self.layers:
                 sub_token = layer(sub_token, cat_embs, cat_embs)
-
+            
             if not self.training and hasattr(self.layers[-1], "_last_attn_weights"):
                 # attn 形状: [B, q_len, q_len + img_len]
                 attn = self.layers[-1]._last_attn_weights
                 # 只保留对图像部分 (sub_image) 的注意力，并对 query 维度求平均
-                img_attn = attn[:, :, q_len:].mean(dim=1)  # -> [B, img_len]
+                img_attn = attn[:, :, q_len:].mean(dim=1) # -> [B, img_len]
                 spatial_attns.append(img_attn)
 
             sub_token = sub_token.permute(1, 0, 2)  # (L, B, D) -> (B, L, D)
             all_tokens.append(sub_token)
 
         if not self.training and len(spatial_attns) == 3:
-            full_spatial_attn = torch.cat(spatial_attns, dim=1)  # -> [B, L]
+            full_spatial_attn = torch.cat(spatial_attns, dim=1) # -> [B, L]
             self._last_spatial_attn = full_spatial_attn[0].cpu()
 
         query_tokens = torch.cat(all_tokens, dim=1)
@@ -230,7 +228,6 @@ class AttnPooler(nn.Module):
 
         # return out
 
-
 # 在 common_arch.py 中定义 RMSNorm (类似 Llama-2 实现)
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -240,31 +237,29 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         # 只缩放，不平移，保留特征显著性
-        norm_x = torch.mean(x ** 2, dim=-1, keepdim=True)
+        norm_x = torch.mean(x**2, dim=-1, keepdim=True)
         x_normed = x * torch.rsqrt(norm_x + self.eps)
         return self.weight * x_normed
-
 
 class MoEProjection(nn.Module):
     """
     任务感知的稀疏混合专家投影层 (Sparse MoE)
     每个 token 根据任务和图像特征选择 top-k 专家，专家独立处理被分配到的 token。
     """
-
     def __init__(
-            self,
-            num_experts: int,
-            num_query: int,
-            num_layers: int,
-            num_attention_heads: int,
-            encoder_hidden_size: int,
-            hidden_size: int,
-            output_size: int,
-            num_tasks: int = 3,
-            task_dim: int = 256,
-            norm_layer: Optional[Callable[..., nn.Module]] = None,
-            checkpoint: bool = False,
-            top_k: int = 2,
+        self,
+        num_experts: int,
+        num_query: int,
+        num_layers: int,
+        num_attention_heads: int,
+        encoder_hidden_size: int,
+        hidden_size: int,
+        output_size: int,
+        num_tasks: int = 3,
+        task_dim: int = 256,
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+        checkpoint: bool = False,
+        top_k: int = 2,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -316,18 +311,18 @@ class MoEProjection(nn.Module):
         B, L, C = image_embs.shape
 
         # --- 任务特征融合 ---
-        t_embs = self.task_embedding(task_ids)  # [B, task_dim]
-        t_embs_expanded = t_embs.unsqueeze(1).expand(-1, L, -1)  # [B, L, task_dim]
+        t_embs = self.task_embedding(task_ids)                     # [B, task_dim]
+        t_embs_expanded = t_embs.unsqueeze(1).expand(-1, L, -1)   # [B, L, task_dim]
         combined = torch.cat([image_embs, t_embs_expanded], dim=-1)  # [B, L, C+task_dim]
 
         # --- 门控计算 ---
         # 使用 float32 计算门控以提高稳定性
         gate_input = combined.float()
-        gate_logits = self.gate(self.gate_norm(gate_input))  # [B, L, num_experts]
+        gate_logits = self.gate(self.gate_norm(gate_input))        # [B, L, num_experts]
         gate_logits = torch.clamp(gate_logits, min=-15.0, max=15.0)  # 防止溢出
 
         # 计算 softmax 权重（用于辅助损失和最终加权）
-        gate_weights = torch.softmax(gate_logits, dim=-1)  # [B, L, E]
+        gate_weights = torch.softmax(gate_logits, dim=-1)          # [B, L, E]
 
         # --- 稀疏路由：选择 top-k 专家 ---
         top_weights, top_indices = torch.topk(gate_weights, self.top_k, dim=-1)  # [B, L, k], [B, L, k]
@@ -356,8 +351,7 @@ class MoEProjection(nn.Module):
         }
 
         # --- 初始化输出累加器 ---
-        final_output = torch.zeros(B, self.num_query, self.output_size, device=image_embs.device,
-                                   dtype=image_embs.dtype)
+        final_output = torch.zeros(B, self.num_query, self.output_size, device=image_embs.device, dtype=image_embs.dtype)
 
         # --- 对于每个专家，收集被分配到的 token 并处理 ---
         for expert_id in range(self.num_experts):
@@ -405,12 +399,12 @@ class MoEProjection(nn.Module):
         b, l, c = image_embs.shape
         # --- A. 获取并融合任务上下文 (Task Context Fusion) ---
         # 1. 获取当前 Batch 的任务特征 [B, task_dim]
-        t_embs = self.task_embedding(task_ids)
-
+        t_embs = self.task_embedding(task_ids) 
+        
         # 2. 在空间维度 L 上进行广播 (Broadcast)，让每个 Patch 都感知到任务
         # t_embs_expanded 形状: [B, L, task_dim]
         t_embs_expanded = t_embs.unsqueeze(1).expand(-1, l, -1)
-
+        
         # 3. 拼接图像特征与任务特征 (Channel-wise Concatenation)
         # combined_features 形状: [B, L, c + task_dim]
         combined_features = torch.cat([image_embs, t_embs_expanded], dim=-1)
@@ -425,10 +419,10 @@ class MoEProjection(nn.Module):
         # --- 最终归一化和增益 ---
         final_output = self.final_norm(final_output) * self.output_gain
         # 计算 Token 级别的权重分配
-        token_weights = torch.softmax(token_logits, dim=-1)  # [B, L, E]
+        token_weights = torch.softmax(token_logits, dim=-1) # [B, L, E]
         if not self.training:
             self._cached_routing_weights = token_weights[0].detach().cpu()
-
+        
         return final_output
 
     def get_gate_stats(self) -> Dict[str, torch.Tensor]:
@@ -528,14 +522,14 @@ class LayerNorm(nn.LayerNorm):
 
 class ResidualAttentionBlock(nn.Module):
     def __init__(
-            self,
-            d_model: int,
-            n_head: int,
-            mlp_ratio: float = 4.0,
-            ls_init_value: float = None,
-            act_layer: Callable = nn.GELU,
-            norm_layer: Callable = LayerNorm,
-            is_cross_attention: bool = False,
+        self,
+        d_model: int,
+        n_head: int,
+        mlp_ratio: float = 4.0,
+        ls_init_value: float = None,
+        act_layer: Callable = nn.GELU,
+        norm_layer: Callable = LayerNorm,
+        is_cross_attention: bool = False,
     ):
         super().__init__()
 
@@ -567,11 +561,11 @@ class ResidualAttentionBlock(nn.Module):
         )
 
     def attention(
-            self,
-            q_x: torch.Tensor,
-            k_x: Optional[torch.Tensor] = None,
-            v_x: Optional[torch.Tensor] = None,
-            attn_mask: Optional[torch.Tensor] = None,
+        self,
+        q_x: torch.Tensor,
+        k_x: Optional[torch.Tensor] = None,
+        v_x: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ):
         k_x = k_x if k_x is not None else q_x
         v_x = v_x if v_x is not None else q_x
@@ -581,18 +575,18 @@ class ResidualAttentionBlock(nn.Module):
         attn_out, attn_weights = self.attn(
             q_x, k_x, v_x, need_weights=need_weights, attn_mask=attn_mask
         )
-
+        
         if need_weights:
             # attn_weights 形状: [Batch, Target_Seq_Len, Source_Seq_Len]
             self._last_attn_weights = attn_weights.detach()
         return attn_out
 
     def forward(
-            self,
-            q_x: torch.Tensor,
-            k_x: Optional[torch.Tensor] = None,
-            v_x: Optional[torch.Tensor] = None,
-            attn_mask: Optional[torch.Tensor] = None,
+        self,
+        q_x: torch.Tensor,
+        k_x: Optional[torch.Tensor] = None,
+        v_x: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
     ):
         k_x = (
             self.ln_1_kv(k_x) if hasattr(self, "ln_1_kv") and k_x is not None else None
