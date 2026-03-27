@@ -123,10 +123,19 @@ class AttnPooler(nn.Module):
 
         self.out_proj = nn.Linear(hidden_size, output_size)
 
-    def forward(self, image_embs: torch.Tensor) -> torch.Tensor:
-        # 这里的 image_embs 在 T-MoE 阶段实际上是联合特征 Z_tilde (视觉特征 + 物理提示)
+    def forward(
+            self,
+            image_embs: torch.Tensor,
+            physical_queries: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        image_embs: [B, L, C] key/value 序列 (通常为视觉+物理提示拼接后的 Z_tilde)
+        physical_queries: [B, L_p, C] 可选的物理提示查询，与可学习查询一起参与注意力
+        """
         if self.in_proj is not None:
             image_embs = self.in_proj(image_embs)
+            if physical_queries is not None:
+                physical_queries = self.in_proj(physical_queries)
 
         query_tokens = self.query.expand(image_embs.size(0), -1, -1)
 
@@ -161,15 +170,34 @@ class AttnPooler(nn.Module):
                 split_sizes = sizes
 
         stage1_image, stage2_image, stage3_image = torch.split(image_embs, split_sizes, dim=1)
+        if physical_queries is not None:
+            Lp = physical_queries.size(1)
+            # 按照视觉分段比例切分物理查询；避免空段
+            if L > 0:
+                phy_sizes = [max(1, int(round(Lp * s / L))) for s in split_sizes]
+                diff_phy = Lp - sum(phy_sizes)
+                phy_sizes[-1] += diff_phy
+            else:
+                phy_sizes = [Lp // 3, Lp // 3, Lp - 2 * (Lp // 3)]
+            stage1_phy, stage2_phy, stage3_phy = torch.split(physical_queries, phy_sizes, dim=1)
+        else:
+            stage1_phy = stage2_phy = stage3_phy = None
 
         all_tokens = []
         spatial_attns = []
-        for sub_token, sub_image in zip(
+        for sub_token, sub_image, sub_phy in zip(
                 [stage1_query, stage2_query, stage3_query],
                 [stage1_image, stage2_image, stage3_image],
+                [stage1_phy, stage2_phy, stage3_phy],
         ):
-            q_len = sub_token.size(1)
-            cat_embs = torch.cat([sub_token, sub_image], dim=1)
+            if sub_phy is not None:
+                # 让物理提示也作为查询参与专家内部注意力
+                sub_token = torch.cat([sub_token, sub_phy], dim=1)
+            # key/value 仅由图像特征和物理序列组成，避免查询看到自身
+            kv_parts = [sub_image]
+            if sub_phy is not None:
+                kv_parts.append(sub_phy)
+            cat_embs = torch.cat(kv_parts, dim=1)
             cat_embs = cat_embs.permute(1, 0, 2)
             sub_token = sub_token.permute(1, 0, 2)
 
@@ -178,7 +206,8 @@ class AttnPooler(nn.Module):
 
             if not self.training and hasattr(self.layers[-1], "_last_attn_weights"):
                 attn = self.layers[-1]._last_attn_weights
-                img_attn = attn[:, :, q_len:].mean(dim=1)
+                img_len = sub_image.size(1)
+                img_attn = attn[:, :, :img_len].mean(dim=1)
                 spatial_attns.append(img_attn)
 
             sub_token = sub_token.permute(1, 0, 2)
@@ -308,12 +337,18 @@ class MoEProjection(nn.Module):
         self.element_embedding = nn.Embedding(num_elements, task_dim)
 
         # 3. 双驱动门控网络 (全局视觉特征 + 任务特征 + 要素特征 + 物理先验)
-        combined_dim = encoder_hidden_size + task_dim + task_dim
+        # 为门控对齐维度：将视觉全局和物理池化都投影到 task_dim
+        self.gate_img_proj = nn.Linear(encoder_hidden_size, task_dim)
+        combined_dim = task_dim + task_dim + task_dim
         if self.include_physical_prompt:
             combined_dim += task_dim
             self.physical_gate_proj = nn.Linear(encoder_hidden_size, task_dim)
+            # 上下文感知的物理提示池化：单查询自注意力
+            self.physical_pool_query = nn.Parameter(torch.zeros(1, 1, encoder_hidden_size))
+            nn.init.trunc_normal_(self.physical_pool_query, std=0.02)
         else:
             self.physical_gate_proj = None
+            self.physical_pool_query = None
         self.gate_norm = nn.LayerNorm(combined_dim)
         self.gate = nn.Linear(combined_dim, num_experts)
 
@@ -352,8 +387,9 @@ class MoEProjection(nn.Module):
         # ==========================================
         # 1. 任务与要素双驱动的动态门控计算 (Sequence-level Routing)
         # ==========================================
-        # 获取宏观全局图像上下文 z_bar_visual
+        # 获取宏观全局图像上下文并对齐到 task_dim
         img_global = image_embs.mean(dim=1)  # [B, C]
+        img_gate = self.gate_img_proj(img_global)  # [B, task_dim]
 
         # 获取任务和要素上下文 h_task, h_element
         t_embs = self.task_embedding(task_ids)  # [B, task_dim]
@@ -362,15 +398,22 @@ class MoEProjection(nn.Module):
         if self.include_physical_prompt:
             if physical_prompts is not None:
                 physical_prompts = physical_prompts.to(image_embs.dtype)
-                phy_global = physical_prompts.mean(dim=1)
-                phy_gate = self.physical_gate_proj(phy_global)
+                # 上下文感知池化：单查询自注意力
+                q = self.physical_pool_query.expand(physical_prompts.size(0), -1, -1)  # [B,1,C]
+                attn_scores = torch.matmul(q, physical_prompts.transpose(1, 2)) / (physical_prompts.size(-1) ** 0.5)  # [B,1,L_p]
+                attn_weights = torch.softmax(attn_scores, dim=-1)
+                phy_pooled = torch.matmul(attn_weights, physical_prompts).squeeze(1)  # [B, C]
+                phy_gate = self.physical_gate_proj(phy_pooled)
+                phy_query = physical_prompts
             else:
                 phy_gate = torch.zeros_like(t_embs)
+                phy_query = None
         else:
             phy_gate = None
+            phy_query = None
 
         # 拼接用于联合门控评估 [z_bar_visual; h_task; h_element; h_phy]
-        gate_parts = [img_global, t_embs, e_embs]
+        gate_parts = [img_gate, t_embs, e_embs]
         if self.include_physical_prompt and phy_gate is not None:
             gate_parts.append(phy_gate)
         gate_input = torch.cat(gate_parts, dim=-1).float()
@@ -434,7 +477,7 @@ class MoEProjection(nn.Module):
                 selected_z_tilde = z_tilde[mask]  # [num_selected, L_v + L_p, C]
 
                 # AttnPooler 处理包含物理属性的长序列
-                expert_out = self.experts[e_id](selected_z_tilde)  # [num_selected, num_query, output_size]
+                expert_out = self.experts[e_id](selected_z_tilde, physical_queries=phy_query[mask] if phy_query is not None else None)  # [num_selected, num_query, output_size]
 
                 # 加权融合
                 selected_weights = expert_weight[mask].unsqueeze(1).unsqueeze(2)  # [num_selected, 1, 1]
