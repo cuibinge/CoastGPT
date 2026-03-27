@@ -1,4 +1,4 @@
-from_pretrained collections import OrderedDict
+from collections import OrderedDict
 from typing import Callable, List, Optional, Union, Dict
 
 import torch
@@ -51,7 +51,6 @@ class RgbProjHead(TextProjHead):
             model.proj.load_state_dict(new_ckpt)
             del new_ckpt
         del ckpt
-
         return model
 
 
@@ -79,30 +78,21 @@ class LinearProjection(nn.Module):
 
 class AttnPooler(nn.Module):
     """
-    Attention Pooler
-
-    Args:
-        hidden_size: hidden size of the model
-        num_layers: number of layers
-        num_attention_heads: number of attention heads
-        encoder_hidden_size: hidden size of the encoder
-        num_query: number of query vectors
-        norm_layer: normalization layer
-        output_size: output size of the model
+    Attention Pooler (Expert 序列压缩专家)
     """
 
     def __init__(
-        self,
-        num_query: int,
-        num_layers: int,
-        num_attention_heads: int,
-        encoder_hidden_size: int,
-        hidden_size: int,
-        output_size: int,
-        norm_layer: Optional[Callable[..., nn.Module]] = None,
-        checkpoint: bool = False,
-        stage_num: Union[List, int] = [64, 48, 32],  # [64, 48, 32]
-        split_part: List = [256, 256, 256],  # [256,256, 256]
+            self,
+            num_query: int,
+            num_layers: int,
+            num_attention_heads: int,
+            encoder_hidden_size: int,
+            hidden_size: int,
+            output_size: int,
+            norm_layer: Optional[Callable[..., nn.Module]] = None,
+            checkpoint: bool = False,
+            stage_num: Union[List, int] = [64, 48, 32],
+            split_part: List = [256, 256, 256],
     ):
         super().__init__()
         self.checkpoint = checkpoint
@@ -124,7 +114,7 @@ class AttnPooler(nn.Module):
                     d_model=hidden_size,
                     n_head=num_attention_heads,
                     is_cross_attention=True,
-                    ls_init_value=1e-1,  # 🌟 关键：极小的初始化值防止能量爆炸
+                    ls_init_value=1e-1,
                     norm_layer=norm_layer,
                 )
                 for _ in range(num_layers)
@@ -133,10 +123,8 @@ class AttnPooler(nn.Module):
 
         self.out_proj = nn.Linear(hidden_size, output_size)
 
-    def forward(
-        self,
-        image_embs: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(self, image_embs: torch.Tensor) -> torch.Tensor:
+        # 这里的 image_embs 在 T-MoE 阶段实际上是联合特征 Z_tilde (视觉特征 + 物理提示)
         if self.in_proj is not None:
             image_embs = self.in_proj(image_embs)
 
@@ -157,78 +145,54 @@ class AttnPooler(nn.Module):
             )
             stage_query_sizes = list(self.stage_num)
 
-        # Robust image split: if preset split_part doesn't match sequence length, derive sizes proportionally to query splits
+        # 动态切分，兼容拼接了物理特征后长度 L 变长的情况
         L = image_embs.size(1)
         preset_sum = sum(self.split_part) if isinstance(self.split_part, (list, tuple)) else None
         if isinstance(self.split_part, (list, tuple)) and preset_sum == L:
             split_sizes = list(self.split_part)
         else:
             base = sum(stage_query_sizes)
-            # Avoid division by zero
             if base == 0:
                 split_sizes = [L // 3, L // 3, L - 2 * (L // 3)]
             else:
-                # Proportional allocation, ensure exact sum to L
                 sizes = [int(round(L * s / base)) for s in stage_query_sizes]
                 diff = L - sum(sizes)
-                # Adjust last bucket to absorb rounding difference
                 sizes[-1] += diff
                 split_sizes = sizes
 
-        stage1_image, stage2_image, stage3_image = torch.split(
-            image_embs, split_sizes, dim=1
-        )
+        stage1_image, stage2_image, stage3_image = torch.split(image_embs, split_sizes, dim=1)
 
         all_tokens = []
         spatial_attns = []
         for sub_token, sub_image in zip(
-            [stage1_query, stage2_query, stage3_query],
-            [stage1_image, stage2_image, stage3_image],
+                [stage1_query, stage2_query, stage3_query],
+                [stage1_image, stage2_image, stage3_image],
         ):
             q_len = sub_token.size(1)
             cat_embs = torch.cat([sub_token, sub_image], dim=1)
-            # cat_embs = sub_image
-            cat_embs = cat_embs.permute(1, 0, 2)  # (B, L, D) -> (L, B, D)
-            sub_token = sub_token.permute(1, 0, 2)  # (B, L, D) -> (L, B, D)
+            cat_embs = cat_embs.permute(1, 0, 2)
+            sub_token = sub_token.permute(1, 0, 2)
 
             for layer in self.layers:
                 sub_token = layer(sub_token, cat_embs, cat_embs)
-            
+
             if not self.training and hasattr(self.layers[-1], "_last_attn_weights"):
-                # attn 形状: [B, q_len, q_len + img_len]
                 attn = self.layers[-1]._last_attn_weights
-                # 只保留对图像部分 (sub_image) 的注意力，并对 query 维度求平均
-                img_attn = attn[:, :, q_len:].mean(dim=1) # -> [B, img_len]
+                img_attn = attn[:, :, q_len:].mean(dim=1)
                 spatial_attns.append(img_attn)
 
-            sub_token = sub_token.permute(1, 0, 2)  # (L, B, D) -> (B, L, D)
+            sub_token = sub_token.permute(1, 0, 2)
             all_tokens.append(sub_token)
 
         if not self.training and len(spatial_attns) == 3:
-            full_spatial_attn = torch.cat(spatial_attns, dim=1) # -> [B, L]
+            full_spatial_attn = torch.cat(spatial_attns, dim=1)
             self._last_spatial_attn = full_spatial_attn[0].cpu()
 
         query_tokens = torch.cat(all_tokens, dim=1)
         out = self.out_proj(query_tokens)
         return out
 
-        # cat_embs = torch.cat([query_tokens, image_embs], dim=1)
 
-        # cat_embs = cat_embs.permute(1, 0, 2)  # (B, L, D) -> (L, B, D)
-        # query_tokens = query_tokens.permute(1, 0, 2)  # (B, L, D) -> (L, B, D)
-
-        # for layer in self.layers:
-        #     if self.checkpoint and not torch.jit.is_scripting():
-        #         query_tokens = checkpoint(layer, query_tokens, cat_embs, cat_embs)
-        #     else:
-        #         query_tokens = layer(query_tokens, cat_embs, cat_embs)
-
-        # query_tokens = query_tokens.permute(1, 0, 2)  # (L, B, D) -> (B, L, D)
-        # out = self.out_proj(query_tokens)
-
-        # return out
-
-# 在 common_arch.py 中定义 RMSNorm (类似 Llama-2 实现)
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
@@ -236,40 +200,46 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        # 只缩放，不平移，保留特征显著性
-        norm_x = torch.mean(x**2, dim=-1, keepdim=True)
+        norm_x = torch.mean(x ** 2, dim=-1, keepdim=True)
         x_normed = x * torch.rsqrt(norm_x + self.eps)
         return self.weight * x_normed
 
+
+# =========================================================================
+# 核心重构：任务与要素双驱动、物理先验复用的稀疏混合专家投影层 (T-MoE)
+# =========================================================================
 class MoEProjection(nn.Module):
     """
-    任务感知的稀疏混合专家投影层 (Sparse MoE)
-    每个 token 根据任务和图像特征选择 top-k 专家，专家独立处理被分配到的 token。
+    对应论文 2.2 节：
+    2.2.1 任务与要素双驱动的动态门控路由
+    2.2.2 物理先验复用与联合特征投影
     """
+
     def __init__(
-        self,
-        num_experts: int,
-        num_query: int,
-        num_layers: int,
-        num_attention_heads: int,
-        encoder_hidden_size: int,
-        hidden_size: int,
-        output_size: int,
-        num_tasks: int = 3,
-        task_dim: int = 256,
-        norm_layer: Optional[Callable[..., nn.Module]] = None,
-        checkpoint: bool = False,
-        top_k: int = 2,
+            self,
+            num_experts: int,
+            num_query: int,
+            num_layers: int,
+            num_attention_heads: int,
+            encoder_hidden_size: int,
+            hidden_size: int,
+            output_size: int,
+            num_tasks: int = 5,  # 任务种类 (如分类、问答等)
+            num_elements: int = 10,  # 要素种类 (如船只、波浪、云等)
+            task_dim: int = 256,
+            norm_layer: Optional[Callable[..., nn.Module]] = None,
+            checkpoint: bool = False,
+            top_k: int = 2,
     ):
         super().__init__()
         self.num_experts = num_experts
-        self.top_k = min(top_k, num_experts)  # 确保不超过专家数
-        self.num_tasks = num_tasks
+        self.top_k = min(top_k, num_experts)
         self.checkpoint = checkpoint
         self.num_query = num_query
         self.output_size = output_size
+        self.encoder_hidden_size = encoder_hidden_size
 
-        # 1. 专家列表
+        # 1. 专家组：基于交叉注意力的序列压缩器 (AttnPooler)
         self.experts = nn.ModuleList([
             AttnPooler(
                 num_query=num_query,
@@ -283,157 +253,137 @@ class MoEProjection(nn.Module):
             ) for _ in range(num_experts)
         ])
 
-        # 2. 任务嵌入
+        # 2. 任务与要素嵌入表 (对应 h_task, h_element)
         self.task_embedding = nn.Embedding(num_tasks, task_dim)
+        self.element_embedding = nn.Embedding(num_elements, task_dim)
 
-        # 3. 联合门控网络
-        combined_dim = encoder_hidden_size + task_dim
+        # 3. 双驱动门控网络 (全局视觉特征 + 任务特征 + 要素特征)
+        combined_dim = encoder_hidden_size + task_dim + task_dim
         self.gate_norm = nn.LayerNorm(combined_dim)
         self.gate = nn.Linear(combined_dim, num_experts)
 
-        # 4. 输出增益和归一化
+        # 4. 稳定性输出增益和归一化
         self.output_gain = nn.Parameter(torch.ones(output_size) * 0.3)
         self.final_norm = RMSNorm(output_size)
 
-        # 5. 辅助损失系数（可调节）
+        # 5. 辅助损失系数 (负载均衡)
         self.aux_balance_coef = 1.0
         self.aux_entropy_coef = 0.00001
         self.aux_zloss_coef = 0.00001
-
-        # 用于缓存统计信息
         self._gate_stats = {}
 
-    def forward(self, image_embs: torch.Tensor, task_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+            self,
+            image_embs: torch.Tensor,
+            physical_prompts: torch.Tensor,
+            task_ids: torch.Tensor,
+            element_ids: torch.Tensor
+    ) -> torch.Tensor:
         """
-        image_embs: [B, L, C] 视觉特征序列
-        task_ids: [B] 任务ID
+        image_embs: [B, L_v, C] 多尺度视觉特征序列 (Z_visual)
+        physical_prompts: [B, L_p, C] 物理先验提示序列 (H_prior)
+        task_ids: [B] 任务意图 ID
+        element_ids: [B] 具体要素 ID
         """
-        B, L, C = image_embs.shape
+        B, L_v, C = image_embs.shape
 
-        # --- 任务特征融合 ---
-        t_embs = self.task_embedding(task_ids)                     # [B, task_dim]
-        t_embs_expanded = t_embs.unsqueeze(1).expand(-1, L, -1)   # [B, L, task_dim]
-        combined = torch.cat([image_embs, t_embs_expanded], dim=-1)  # [B, L, C+task_dim]
+        # ==========================================
+        # 1. 任务与要素双驱动的动态门控计算 (Sequence-level Routing)
+        # ==========================================
+        # 获取宏观全局图像上下文 z_bar_visual
+        img_global = image_embs.mean(dim=1)  # [B, C]
 
-        # --- 门控计算 ---
-        # 使用 float32 计算门控以提高稳定性
-        gate_input = combined.float()
-        gate_logits = self.gate(self.gate_norm(gate_input))        # [B, L, num_experts]
-        gate_logits = torch.clamp(gate_logits, min=-15.0, max=15.0)  # 防止溢出
+        # 获取任务和要素上下文 h_task, h_element
+        t_embs = self.task_embedding(task_ids)  # [B, task_dim]
+        e_embs = self.element_embedding(element_ids)  # [B, task_dim]
 
-        # 计算 softmax 权重（用于辅助损失和最终加权）
-        gate_weights = torch.softmax(gate_logits, dim=-1)          # [B, L, E]
+        # 拼接用于联合门控评估 [z_bar_visual; h_task; h_element]
+        gate_input = torch.cat([img_global, t_embs, e_embs], dim=-1).float()
 
-        # --- 稀疏路由：选择 top-k 专家 ---
-        top_weights, top_indices = torch.topk(gate_weights, self.top_k, dim=-1)  # [B, L, k], [B, L, k]
+        # 计算专家倾向性
+        gate_logits = self.gate(self.gate_norm(gate_input))  # [B, num_experts]
+        gate_logits = torch.clamp(gate_logits, min=-15.0, max=15.0)
+        gate_weights = torch.softmax(gate_logits, dim=-1)  # [B, num_experts]
 
-        # --- 计算辅助损失统计（所有 token 参与，不梯度传递）---
-        with torch.no_grad():
-            # importance: 每个专家的平均权重（所有 token 上的 softmax 权重）
-            importance = gate_weights.view(-1, self.num_experts).mean(dim=0)  # [E]
+        # 选取 Top-K 专家
+        top_weights, top_indices = torch.topk(gate_weights, self.top_k, dim=-1)  # [B, k]
 
-            # load: 每个专家被选为 top-1 的频率（用于负载均衡）
-            top1_indices = top_indices[..., 0]  # [B, L]
-            load = torch.zeros(self.num_experts, device=image_embs.device, dtype=torch.float32)
-            for i in range(self.num_experts):
-                load[i] = (top1_indices == i).float().mean()
+        # 权重重归一化
+        top_weights = top_weights / (top_weights.sum(dim=-1, keepdim=True) + 1e-9)
 
-            # 熵和 z-loss
-            probs = gate_weights.float()
-            entropy = -torch.mean(torch.sum(probs * torch.log(probs + 1e-6), dim=-1))
-            zloss = torch.mean(torch.logsumexp(gate_logits.float(), dim=-1) ** 2)
+        # 记录辅助损失状态
+        if self.training:
+            with torch.no_grad():
+                importance = gate_weights.mean(dim=0)
+                top1_indices = top_indices[:, 0]
+                load = torch.zeros(self.num_experts, device=image_embs.device, dtype=torch.float32)
+                for i in range(self.num_experts):
+                    load[i] = (top1_indices == i).float().mean()
 
-        self._gate_stats = {
-            "importance": importance,
-            "load": load,
-            "entropy": entropy,
-            "zloss": zloss,
-        }
+                entropy = -torch.mean(torch.sum(gate_weights * torch.log(gate_weights + 1e-6), dim=-1))
+                zloss = torch.mean(torch.logsumexp(gate_logits.float(), dim=-1) ** 2)
 
-        # --- 初始化输出累加器 ---
-        final_output = torch.zeros(B, self.num_query, self.output_size, device=image_embs.device, dtype=image_embs.dtype)
+            self._gate_stats = {
+                "importance": importance,
+                "load": load,
+                "entropy": entropy,
+                "zloss": zloss,
+            }
 
-        # --- 对于每个专家，收集被分配到的 token 并处理 ---
-        for expert_id in range(self.num_experts):
-            # 找出哪些 token 选择了当前专家（在 top-k 中）
-            mask = (top_indices == expert_id)  # [B, L, k] -> 但需要沿着 k 维度检查，所以用 any
-            # 更高效：生成 token 级别的选择掩码
-            # 我们遍历所有 token，但为了向量化，可以构建一个索引列表
-            # 方法：将 top_indices 展开，构建 (batch, token) -> expert 的映射
-            # 我们使用 torch.where 来收集所有选中当前专家的 token 索引
+        # ==========================================
+        # 2. 物理先验复用与联合特征构建 (Physical Prior Reuse)
+        # ==========================================
+        # 沿着序列维度拼接视觉特征与物理提示: Z_tilde = Concat(Z_visual, H_prior)
+        if physical_prompts is not None:
+            # physical_prompts shape expected to be [B, L_p, C]
+            z_tilde = torch.cat([image_embs, physical_prompts], dim=1)  # [B, L_v + L_p, C]
+        else:
+            z_tilde = image_embs
 
-            # 生成所有 token 的坐标
-            batch_idx = torch.arange(B, device=image_embs.device).view(-1, 1).expand(B, L).reshape(-1)
-            token_idx = torch.arange(L, device=image_embs.device).view(1, -1).expand(B, L).reshape(-1)
-            # 对应的 top-k 专家和权重
-            expert_ids = top_indices.reshape(-1, self.top_k)  # [B*L, k]
-            expert_weights = top_weights.reshape(-1, self.top_k)  # [B*L, k]
+        # ==========================================
+        # 3. 专家分发与投影重采样 (Dispatch & Combine)
+        # ==========================================
+        final_output = torch.zeros(B, self.num_query, self.output_size, device=image_embs.device,
+                                   dtype=image_embs.dtype)
 
-            # 找到当前专家被选中的位置
-            selected = (expert_ids == expert_id)  # [B*L, k]
-            if not selected.any():
-                continue
+        for i in range(self.top_k):
+            expert_idx = top_indices[:, i]  # [B]
+            expert_weight = top_weights[:, i]  # [B]
 
-            # 获取对应的 batch 和 token 索引，以及权重
-            row_indices, col_indices = torch.where(selected)  # row 是展开后的 token 索引，col 是 k 维度
-            # 对应的原始 batch 和 token
-            b = batch_idx[row_indices]
-            t = token_idx[row_indices]
-            w = expert_weights[row_indices, col_indices]  # 对应权重
+            for e_id in range(self.num_experts):
+                mask = (expert_idx == e_id)  # 布尔掩码 [B]
+                if not mask.any():
+                    continue
 
-            # 收集被选中的 token 特征
-            selected_features = image_embs[b, t]  # [num_selected, C]
+                # 提取指派给当前专家的 "物理联合序列 Z_tilde"
+                selected_z_tilde = z_tilde[mask]  # [num_selected, L_v + L_p, C]
 
-            expert_input = torch.zeros(B, L, C, device=image_embs.device, dtype=image_embs.dtype)
-            expert_input[b, t] = selected_features
+                # AttnPooler 处理包含物理属性的长序列
+                expert_out = self.experts[e_id](selected_z_tilde)  # [num_selected, num_query, output_size]
 
-            # 前向专家
-            expert_out = self.experts[expert_id](expert_input)  # [B, num_query, output_size]
-            if selected.any():
-                avg_weight = w.mean()
-            else:
-                avg_weight = 0.0
+                # 加权融合
+                selected_weights = expert_weight[mask].unsqueeze(1).unsqueeze(2)  # [num_selected, 1, 1]
+                weighted_out = expert_out * selected_weights
 
-            final_output += expert_out * avg_weight
+                final_output[mask] += weighted_out
 
-        b, l, c = image_embs.shape
-        # --- A. 获取并融合任务上下文 (Task Context Fusion) ---
-        # 1. 获取当前 Batch 的任务特征 [B, task_dim]
-        t_embs = self.task_embedding(task_ids) 
-        
-        # 2. 在空间维度 L 上进行广播 (Broadcast)，让每个 Patch 都感知到任务
-        # t_embs_expanded 形状: [B, L, task_dim]
-        t_embs_expanded = t_embs.unsqueeze(1).expand(-1, l, -1)
-        
-        # 3. 拼接图像特征与任务特征 (Channel-wise Concatenation)
-        # combined_features 形状: [B, L, c + task_dim]
-        combined_features = torch.cat([image_embs, t_embs_expanded], dim=-1)
-
-        # --- B. 计算任务与空间联合门控权重 ---
-        x_fp32 = combined_features.float()
-        self.gate_norm.to(torch.float32)
-        self.gate.to(torch.float32)
-        # token_logits 形状: [B, L, num_experts]
-        token_logits = self.gate(self.gate_norm(x_fp32))
-        token_logits = torch.clamp(token_logits, min=-15.0, max=15.0)
-        # --- 最终归一化和增益 ---
+        # ==========================================
+        # 4. 特征对齐与约束输出
+        # ==========================================
         final_output = self.final_norm(final_output) * self.output_gain
-        # 计算 Token 级别的权重分配
-        token_weights = torch.softmax(token_logits, dim=-1) # [B, L, E]
-        if not self.training:
-            self._cached_routing_weights = token_weights[0].detach().cpu()
-        
+
         return final_output
 
     def get_gate_stats(self) -> Dict[str, torch.Tensor]:
         return self._gate_stats
 
     def get_aux_loss(self) -> torch.Tensor:
-        """计算辅助损失：负载均衡损失 + 可选熵损失 + z-loss"""
+        """计算负载均衡损失，确保各个专家被均匀激活"""
+        if not self.training or not self._gate_stats:
+            return torch.tensor(0.0, device=self.gate.weight.device)
+
         imp = self._gate_stats.get("importance")
         load = self._gate_stats.get("load")
-        if imp is None or load is None:
-            return torch.tensor(0.0, device=self.gate.weight.device)
 
         balance_loss = self.num_experts * torch.sum(imp * load)
         entropy_loss = self._gate_stats.get("entropy", 0.0)
@@ -442,24 +392,20 @@ class MoEProjection(nn.Module):
         total = (self.aux_balance_coef * balance_loss +
                  self.aux_entropy_coef * entropy_loss +
                  self.aux_zloss_coef * zloss)
+
         return total.to(self.gate.weight.dtype)
 
-    def set_aux_coefficients(self, balance=1.0, entropy=0.00001, zloss=0.00001):
-        self.aux_balance_coef = balance
-        self.aux_entropy_coef = entropy
-        self.aux_zloss_coef = zloss
 
+# ---------------------------------------------------------
+# 以下底层依赖保持你的原版不动，用于保障模型计算不出错
+# ---------------------------------------------------------
 
 class PatchDropout(nn.Module):
-    """
-    https://arxiv.org/abs/2212.00794
-    """
-
     def __init__(self, prob, exclude_first_token=True):
         super().__init__()
         assert 0 <= prob < 1.0
         self.prob = prob
-        self.exclude_first_token = exclude_first_token  # exclude CLS token
+        self.exclude_first_token = exclude_first_token
 
     def forward(self, x):
         if not self.training or self.prob == 0.0:
@@ -501,8 +447,6 @@ class LayerScale(nn.Module):
 
 
 class LayerNormFp32(nn.LayerNorm):
-    """Subclass torch's LayerNorm to handle fp16 (by casting to float32 and back)."""
-
     def forward(self, x: torch.Tensor):
         orig_type = x.dtype
         x = F.layer_norm(
@@ -512,8 +456,6 @@ class LayerNormFp32(nn.LayerNorm):
 
 
 class LayerNorm(nn.LayerNorm):
-    """Subclass torch's LayerNorm (with cast back to input dtype)."""
-
     def forward(self, x: torch.Tensor):
         orig_type = x.dtype
         x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
@@ -522,14 +464,14 @@ class LayerNorm(nn.LayerNorm):
 
 class ResidualAttentionBlock(nn.Module):
     def __init__(
-        self,
-        d_model: int,
-        n_head: int,
-        mlp_ratio: float = 4.0,
-        ls_init_value: float = None,
-        act_layer: Callable = nn.GELU,
-        norm_layer: Callable = LayerNorm,
-        is_cross_attention: bool = False,
+            self,
+            d_model: int,
+            n_head: int,
+            mlp_ratio: float = 4.0,
+            ls_init_value: float = None,
+            act_layer: Callable = nn.GELU,
+            norm_layer: Callable = LayerNorm,
+            is_cross_attention: bool = False,
     ):
         super().__init__()
 
@@ -561,11 +503,11 @@ class ResidualAttentionBlock(nn.Module):
         )
 
     def attention(
-        self,
-        q_x: torch.Tensor,
-        k_x: Optional[torch.Tensor] = None,
-        v_x: Optional[torch.Tensor] = None,
-        attn_mask: Optional[torch.Tensor] = None,
+            self,
+            q_x: torch.Tensor,
+            k_x: Optional[torch.Tensor] = None,
+            v_x: Optional[torch.Tensor] = None,
+            attn_mask: Optional[torch.Tensor] = None,
     ):
         k_x = k_x if k_x is not None else q_x
         v_x = v_x if v_x is not None else q_x
@@ -575,18 +517,17 @@ class ResidualAttentionBlock(nn.Module):
         attn_out, attn_weights = self.attn(
             q_x, k_x, v_x, need_weights=need_weights, attn_mask=attn_mask
         )
-        
+
         if need_weights:
-            # attn_weights 形状: [Batch, Target_Seq_Len, Source_Seq_Len]
             self._last_attn_weights = attn_weights.detach()
         return attn_out
 
     def forward(
-        self,
-        q_x: torch.Tensor,
-        k_x: Optional[torch.Tensor] = None,
-        v_x: Optional[torch.Tensor] = None,
-        attn_mask: Optional[torch.Tensor] = None,
+            self,
+            q_x: torch.Tensor,
+            k_x: Optional[torch.Tensor] = None,
+            v_x: Optional[torch.Tensor] = None,
+            attn_mask: Optional[torch.Tensor] = None,
     ):
         k_x = (
             self.ln_1_kv(k_x) if hasattr(self, "ln_1_kv") and k_x is not None else None
