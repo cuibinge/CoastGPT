@@ -166,6 +166,15 @@ class CoastGPT(nn.Module):
             image_seq = self.vision(data)
             fused_spatial, pyramid_raw = None, None
 
+        # 物理提示文本 -> 连续嵌入（若存在）
+        if "physical_prompt_ids" in data and data["physical_prompt_ids"] is not None:
+            try:
+                emb_layer = self.language.model.get_input_embeddings()
+            except Exception:
+                emb_layer = None
+            if emb_layer is not None:
+                data["physical_prompt_embs"] = emb_layer(data["physical_prompt_ids"])
+
         # 多模态嵌入处理
         multimodal_embedding = self.multimodal(data, image_embedding=image_seq)
 
