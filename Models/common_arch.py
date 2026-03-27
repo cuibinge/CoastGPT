@@ -205,6 +205,54 @@ class RMSNorm(nn.Module):
         return self.weight * x_normed
 
 
+class PhysicalPromptEncoder(nn.Module):
+    """
+    将物理属性提示 (波段、GSD、时间等) 编码为可与视觉 token 拼接的序列。
+    """
+
+    def __init__(
+            self,
+            in_channels: int = 1,
+            embed_dim: int = 768,
+            pool_scales: Union[List[int], tuple] = (1, 2, 4),
+    ):
+        super().__init__()
+        self.pool_scales = list(pool_scales) if pool_scales is not None else [1]
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=1)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(
+            self,
+            tsm: Optional[torch.Tensor],
+            mask: Optional[torch.Tensor] = None
+    ) -> Optional[torch.Tensor]:
+        if tsm is None:
+            return None
+
+        # squeeze potential extra dimension from dataloader collate
+        if tsm.dim() == 5:
+            tsm = tsm.squeeze(1)
+        if tsm.dim() == 3:
+            tsm = tsm.unsqueeze(1)
+
+        if mask is not None:
+            if mask.dim() == 5:
+                mask = mask.squeeze(1)
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(1)
+            tsm = tsm * mask
+
+        prompts = []
+        for s in self.pool_scales:
+            pooled = F.adaptive_avg_pool2d(tsm, output_size=(s, s))
+            tokens = self.proj(pooled).flatten(2).transpose(1, 2)
+            prompts.append(self.norm(tokens))
+
+        if len(prompts) == 0:
+            return None
+        return torch.cat(prompts, dim=1)
+
+
 # =========================================================================
 # 核心重构：任务与要素双驱动、物理先验复用的稀疏混合专家投影层 (T-MoE)
 # =========================================================================
@@ -227,6 +275,7 @@ class MoEProjection(nn.Module):
             num_tasks: int = 5,  # 任务种类 (如分类、问答等)
             num_elements: int = 10,  # 要素种类 (如船只、波浪、云等)
             task_dim: int = 256,
+            include_physical_prompt: bool = True,
             norm_layer: Optional[Callable[..., nn.Module]] = None,
             checkpoint: bool = False,
             top_k: int = 2,
@@ -238,6 +287,7 @@ class MoEProjection(nn.Module):
         self.num_query = num_query
         self.output_size = output_size
         self.encoder_hidden_size = encoder_hidden_size
+        self.include_physical_prompt = include_physical_prompt
 
         # 1. 专家组：基于交叉注意力的序列压缩器 (AttnPooler)
         self.experts = nn.ModuleList([
@@ -257,8 +307,13 @@ class MoEProjection(nn.Module):
         self.task_embedding = nn.Embedding(num_tasks, task_dim)
         self.element_embedding = nn.Embedding(num_elements, task_dim)
 
-        # 3. 双驱动门控网络 (全局视觉特征 + 任务特征 + 要素特征)
+        # 3. 双驱动门控网络 (全局视觉特征 + 任务特征 + 要素特征 + 物理先验)
         combined_dim = encoder_hidden_size + task_dim + task_dim
+        if self.include_physical_prompt:
+            combined_dim += task_dim
+            self.physical_gate_proj = nn.Linear(encoder_hidden_size, task_dim)
+        else:
+            self.physical_gate_proj = None
         self.gate_norm = nn.LayerNorm(combined_dim)
         self.gate = nn.Linear(combined_dim, num_experts)
 
@@ -275,9 +330,9 @@ class MoEProjection(nn.Module):
     def forward(
             self,
             image_embs: torch.Tensor,
-            physical_prompts: torch.Tensor,
-            task_ids: torch.Tensor,
-            element_ids: torch.Tensor
+            physical_prompts: Optional[torch.Tensor] = None,
+            task_ids: Optional[torch.Tensor] = None,
+            element_ids: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         image_embs: [B, L_v, C] 多尺度视觉特征序列 (Z_visual)
@@ -285,7 +340,14 @@ class MoEProjection(nn.Module):
         task_ids: [B] 任务意图 ID
         element_ids: [B] 具体要素 ID
         """
+        if isinstance(image_embs, (list, tuple)):
+            image_embs = torch.cat(image_embs, dim=1)
         B, L_v, C = image_embs.shape
+
+        if task_ids is None:
+            task_ids = torch.zeros(B, dtype=torch.long, device=image_embs.device)
+        if element_ids is None:
+            element_ids = torch.zeros(B, dtype=torch.long, device=image_embs.device)
 
         # ==========================================
         # 1. 任务与要素双驱动的动态门控计算 (Sequence-level Routing)
@@ -297,8 +359,21 @@ class MoEProjection(nn.Module):
         t_embs = self.task_embedding(task_ids)  # [B, task_dim]
         e_embs = self.element_embedding(element_ids)  # [B, task_dim]
 
-        # 拼接用于联合门控评估 [z_bar_visual; h_task; h_element]
-        gate_input = torch.cat([img_global, t_embs, e_embs], dim=-1).float()
+        if self.include_physical_prompt:
+            if physical_prompts is not None:
+                physical_prompts = physical_prompts.to(image_embs.dtype)
+                phy_global = physical_prompts.mean(dim=1)
+                phy_gate = self.physical_gate_proj(phy_global)
+            else:
+                phy_gate = torch.zeros_like(t_embs)
+        else:
+            phy_gate = None
+
+        # 拼接用于联合门控评估 [z_bar_visual; h_task; h_element; h_phy]
+        gate_parts = [img_global, t_embs, e_embs]
+        if self.include_physical_prompt and phy_gate is not None:
+            gate_parts.append(phy_gate)
+        gate_input = torch.cat(gate_parts, dim=-1).float()
 
         # 计算专家倾向性
         gate_logits = self.gate(self.gate_norm(gate_input))  # [B, num_experts]
