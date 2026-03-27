@@ -52,6 +52,14 @@ class EmbeddingModel(nn.Module):
             device: torch.device,
             dtype: torch.dtype
     ) -> Optional[torch.Tensor]:
+        # 1) 优先使用已计算好的连续物理提示（例如由 LLM embedding 得到）
+        if "physical_prompt_embs" in data and data["physical_prompt_embs"] is not None:
+            embs = data["physical_prompt_embs"]
+            if torch.is_tensor(embs):
+                return embs.to(device=device, dtype=dtype)
+            return None
+
+        # 2) 退化回原有的 TSM 物理图像提示
         if not self.use_physical_prompt:
             return None
         tsm = data.get("tsm", None)
