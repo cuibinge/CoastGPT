@@ -764,6 +764,10 @@ class InstructDatasetWithTaskId(InstructDataset):
         else:
             out_dict["category_id"] = 0
 
+        # 物理先验文本，供 collate/tokenizer 使用；默认空串避免缺键
+        if "physical_prompt" not in out_dict:
+            out_dict["physical_prompt"] = ""
+
         return out_dict
 
 
@@ -1018,6 +1022,20 @@ class DataCollatorForSupervisedDataset(object):
         if "category_ids" in instances[0]:
             category_ids = [instance["category_id"] for instance in instances]
             batch["category_ids"] = torch.tensor(category_ids, dtype=torch.long)
+
+        # 物理提示文本 -> token ids（在 collate 中统一 pad）
+        if "physical_prompt" in instances[0]:
+            phys_texts = [instance.get("physical_prompt", "") for instance in instances]
+            phys_tokens = self.tokenizer(
+                phys_texts,
+                padding="max_length",
+                truncation=True,
+                max_length=getattr(self.tokenizer, "model_max_length", 32),
+                return_tensors="pt",
+            )
+            batch["physical_prompt_ids"] = phys_tokens.input_ids
+        else:
+            batch["physical_prompt_ids"] = None
 
         return batch
 
@@ -1294,3 +1312,7 @@ def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX
             return torch.tensor(input_ids, dtype=torch.long)
         raise ValueError(f"Unsupported tensor type: {return_tensors}")
     return input_ids
+try:
+    from .constants import TASK2ID, ELEMENT2ID
+except Exception:
+    TASK2ID, ELEMENT2ID = {}, {}
