@@ -3,6 +3,8 @@
 """
 
 import json
+import sys
+from pathlib import Path
 import logging
 import os
 import re
@@ -12,11 +14,18 @@ from typing import Dict, List
 import ml_collections.config_dict
 import numpy as np
 import torch
+import wandb
 import torch.backends.cudnn as cudnn  # CUDA优化
 import torch.distributed as dist  # 分布式训练支持
 import wandb  # 实验跟踪工具
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from Trainer import init_distributed
 from Trainer.utils import ConfigArgumentParser, setup_logger, str2bool
+from Dataset.build_loader import build_zero_shot_loader
+from Dataset.conversation import default_conversation
 # 从自定义数据加载器构建函数导入
 from Dataset.build_loader import build_zero_shot_loader
 # 从对话模板导入默认对话设置
@@ -52,11 +61,11 @@ CLS_TEMPLATE = [lambda c: f"[CLS] Choose the best categories describe the image 
 def find_index_of_max_similar_substring(given_string, string_list):
     """
     在字符串列表中找到与给定字符串最相似的字符串索引
-    
+
     参数:
         given_string: 待比较的字符串
         string_list: 字符串列表
-        
+
     返回:
         max_index: 最相似字符串的索引
     """
@@ -80,11 +89,11 @@ def find_index_of_max_similar_substring(given_string, string_list):
 def classname_2_idx(preds: List[str], classes_to_idx: Dict[str, int]):
     """
     将预测的类别名称转换为对应的索引
-    
+
     参数:
         preds: 预测的类别名称列表
         classes_to_idx: 类别名称到索引的映射字典
-        
+
     返回:
         results: 对应的索引列表
     """
@@ -105,7 +114,7 @@ def classname_2_idx(preds: List[str], classes_to_idx: Dict[str, int]):
 def parse_option():
     """
     解析命令行参数和配置文件
-    
+
     返回:
         config: 配置对象
     """
@@ -243,16 +252,16 @@ def main(config: ml_collections.ConfigDict):
     # 重复输入以匹配批次大小
     input_ids = input_ids.repeat(config.batch_size, 1)
     model.eval()
-    
+
     # 开始推理
     with torch.no_grad():
         preds = []  # 存储预测结果
         trues = []  # 存储真实标签
-        
+
         # 使用进度条遍历数据加载器
         for image, target in tqdm(data_loader_train, unit_scale=config.batch_size, desc="Evaluating"):
             image = image.to(dtype).to(device)
-            
+
             # 处理最后一个批次可能的大小不匹配问题
             if input_ids.shape[0] != image.shape[0]:
                 input_ids = input_ids[: image.shape[0]]
