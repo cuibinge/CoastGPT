@@ -3,7 +3,7 @@
 ### Classification
 
 ```python
-python main_cls.py \
+python eval_cls.py \
      -c configs/inference.yaml \             # config file
      --model-path ${PathToCheckpoint}.pt \   # path to checkpoint end with .pt
      --data-path ${ImageFolder} \            # path to classification image folder
@@ -24,7 +24,7 @@ https://pan.baidu.com/s/1NTqtBH5a0GqWD0VAslkG-g 提取码: i46e
 
 ```python
 ## Inference: Generate a prediction result JSON file
-python main_vqa_infer.py \
+python eval_vqa.py \
      -c Configs/inference.yaml \              # config file
      --model-path ${PathToCheckpoint}.pt \    # path to checkpoint end with .pt
      --data-path ${Image} \                   # path to image folder
@@ -52,7 +52,7 @@ https://pan.baidu.com/s/1jrNjjN_3zWDbaWE5WcxcWA 提取码: y2rq
 
 ```python
 ## Inference: Generate a prediction result JSON file
-python main_vg_infer.py \
+python eval_vg.py \
      -c Configs/inference.yaml \              # config file
      --model-path ${PathToCheckpoint}.pt \    # path to checkpoint end with .pt
      --data-path ${ImageFolder} \             # path to image folder
