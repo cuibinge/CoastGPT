@@ -18,6 +18,9 @@ class EmbeddingModel(nn.Module):
 
         moe_cfg = getattr(config, "moe_proj", ml_collections.ConfigDict())
         phy_cfg = getattr(config, "physics", ml_collections.ConfigDict())
+        text_embed_dim = int(getattr(config.text, "hidden_size", getattr(config, "alignment_dim", 768)))
+        alignment_dim = int(getattr(config, "alignment_dim", 768))
+        physical_prompt_embed_dims = sorted({alignment_dim, text_embed_dim})
 
         pool_scales = phy_cfg.get("prompt_pool_sizes", [1, 2, 4])
         if hasattr(pool_scales, "to_list"):
@@ -37,13 +40,15 @@ class EmbeddingModel(nn.Module):
             encoder_hidden_size=getattr(config, "alignment_dim", 768),
             hidden_size=getattr(config, "alignment_dim", 768),
             output_size=config.text.hidden_size,
-            num_tasks=int(moe_cfg.get("num_tasks", 3)),
-            num_elements=int(moe_cfg.get("num_elements", phy_cfg.get("num_elements", 10))),
             task_dim=int(moe_cfg.get("task_dim", 256)),
+            text_embed_dim=text_embed_dim,
+            physical_prompt_embed_dims=physical_prompt_embed_dims,
             include_physical_prompt=bool(moe_cfg.get("include_physical_prompt", True)),
             norm_layer=norm_layer,
             checkpoint=getattr(config, "use_checkpoint", False),
             top_k=int(moe_cfg.get("top_k", 2)),
+            routing_strategy=str(moe_cfg.get("routing_strategy", "joint")),
+            task_expert_ratio=float(moe_cfg.get("task_expert_ratio", 0.5)),
         )
 
     def _build_physical_prompts(
@@ -78,50 +83,62 @@ class EmbeddingModel(nn.Module):
         return prompts
 
     def forward(self, data: Dict, image_embedding: torch.Tensor):
-        batch_size = image_embedding.shape[0]
         device = image_embedding.device
-
-        task_ids = data.get("task_ids", None)
-        if task_ids is None:
-            task_ids = torch.zeros(batch_size, dtype=torch.long, device=device)
+        task_text_embs = data.get("task_text_embs", None)
+        if task_text_embs is not None and torch.is_tensor(task_text_embs):
+            task_text_embs = task_text_embs.to(device=device, dtype=image_embedding.dtype)
         else:
-            task_ids = task_ids.to(device)
+            task_text_embs = None
 
-        element_ids = data.get("category_ids", None)
-        if element_ids is None:
-            element_ids = torch.zeros(batch_size, dtype=torch.long, device=device)
+        element_text_embs = data.get("element_text_embs", None)
+        if element_text_embs is not None and torch.is_tensor(element_text_embs):
+            element_text_embs = element_text_embs.to(device=device, dtype=image_embedding.dtype)
         else:
-            element_ids = element_ids.to(device)
+            element_text_embs = None
+        task_text_mask = data.get("task_text_attention_mask", None)
+        if task_text_mask is not None and torch.is_tensor(task_text_mask):
+            task_text_mask = task_text_mask.to(device=device)
+        else:
+            task_text_mask = None
+        element_text_mask = data.get("element_text_attention_mask", None)
+        if element_text_mask is not None and torch.is_tensor(element_text_mask):
+            element_text_mask = element_text_mask.to(device=device)
+        else:
+            element_text_mask = None
 
         physical_prompts = self._build_physical_prompts(data, device=device, dtype=image_embedding.dtype)
+        physical_prompt_mask = data.get("physical_prompt_attention_mask", None)
+        if physical_prompt_mask is not None and torch.is_tensor(physical_prompt_mask):
+            physical_prompt_mask = physical_prompt_mask.to(device=device)
+        else:
+            physical_prompt_mask = None
 
         return self.projection(
             image_embs=image_embedding,
             physical_prompts=physical_prompts,
-            task_ids=task_ids,
-            element_ids=element_ids,
+            task_text_embs=task_text_embs,
+            element_text_embs=element_text_embs,
+            physical_prompt_mask=physical_prompt_mask,
+            task_text_mask=task_text_mask,
+            element_text_mask=element_text_mask,
         )
 
     def encode_test(
             self,
             image_embedding: torch.Tensor,
-            task_ids: Optional[torch.Tensor] = None,
-            element_ids: Optional[torch.Tensor] = None,
+            task_text_embs: Optional[torch.Tensor] = None,
+            element_text_embs: Optional[torch.Tensor] = None,
     ):
-        if task_ids is None:
-            batch_size = image_embedding.shape[0]
-            task_ids = torch.zeros(batch_size, dtype=torch.long, device=image_embedding.device)
-        else:
-            task_ids = task_ids.to(image_embedding.device)
-
-        if element_ids is not None:
-            element_ids = element_ids.to(image_embedding.device)
+        if task_text_embs is not None:
+            task_text_embs = task_text_embs.to(image_embedding.device, dtype=image_embedding.dtype)
+        if element_text_embs is not None:
+            element_text_embs = element_text_embs.to(image_embedding.device, dtype=image_embedding.dtype)
 
         return self.projection(
             image_embs=image_embedding,
             physical_prompts=None,
-            task_ids=task_ids,
-            element_ids=element_ids,
+            task_text_embs=task_text_embs,
+            element_text_embs=element_text_embs,
         )
 
     def get_aux_loss(self) -> torch.Tensor:

@@ -295,57 +295,65 @@ class AquacultureSegMOE(nn.Module):
 
         # 门控网络（专家数动态）
         self.gate = GatingNetwork(ch_in, num_experts=len(self.experts))
+        router_hid = max(32, ch_in // 2)
+        self.task_text_router = nn.Sequential(
+            nn.LazyLinear(router_hid),
+            nn.GELU(),
+            nn.Linear(router_hid, len(self.experts)),
+        )
+        self.element_text_router = nn.Sequential(
+            nn.LazyLinear(router_hid),
+            nn.GELU(),
+            nn.Linear(router_hid, len(self.experts)),
+        )
 
-    def forward(self, x: torch.Tensor, input_size: Tuple[int, int], modal_inputs: Optional[Dict[str, torch.Tensor]] = None, context: Optional[Dict[str, Any]] = None, task_ids: Optional[torch.Tensor] = None, category_ids: Optional[torch.Tensor] = None):
+    @staticmethod
+    def _pool_text_embeddings(text_embs: Optional[torch.Tensor], text_mask: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
+        if text_embs is None:
+            return None
+        if text_embs.dim() == 2:
+            return text_embs
+        if text_mask is not None:
+            valid_mask = text_mask.to(device=text_embs.device).bool()
+        else:
+            valid_mask = text_embs.abs().sum(dim=-1) > 0
+        denom = valid_mask.sum(dim=1, keepdim=True).clamp_min(1).to(text_embs.dtype)
+        pooled = (text_embs * valid_mask.unsqueeze(-1).to(text_embs.dtype)).sum(dim=1) / denom
+        return pooled
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        input_size: Tuple[int, int],
+        modal_inputs: Optional[Dict[str, torch.Tensor]] = None,
+        context: Optional[Dict[str, Any]] = None,
+        task_text_embs: Optional[torch.Tensor] = None,
+        element_text_embs: Optional[torch.Tensor] = None,
+        task_text_mask: Optional[torch.Tensor] = None,
+        element_text_mask: Optional[torch.Tensor] = None,
+    ):
         # x: [B,C,h,w]
         # 1) 模态门融合（若提供）
         if self.modality_gate is not None:
             x = self.modality_gate(x, modal_inputs=modal_inputs, context=context)
         # 2) 共享 SPP 预筛选（若启用）
         x_shared = self.spp_filter(x) if self.spp_filter is not None else x
-        # 3) 门控权重（基于共享特征和任务/地物信息）
-        if task_ids is not None:
-            # 使用任务ID和地物ID来动态调整专家选择
-            batch_size = x.shape[0]
-            # 创建任务感知的门控权重
-            task_gate = torch.zeros_like(x_shared)
-
-            # 根据任务类型调整专家权重
-            for b in range(batch_size):
-                task = task_ids[b].item()
-                category = category_ids[b].item() if category_ids is not None else 0
-
-                # 任务特定的专家增强
-                if task == 0:  # 分类任务
-                    # 增强光谱专家的权重
-                    if self.spectral_adapter is not None:
-                        task_gate[b] += 0.3
-                elif task == 1:  # 分割任务
-                    # 增强形状和上下文专家的权重
-                    if hasattr(self, 'experts') and len(self.experts) > 2:
-                        task_gate[b, 2] += 0.2  # ShapeExpert
-                        if len(self.experts) > 3:
-                            task_gate[b, 3] += 0.2  # ContextExpert
-                elif task == 2:  # 检测任务
-                    # 增强纹理专家的权重
-                    if self.texture_adapter is not None:
-                        task_gate[b] += 0.3
-
-                # 地物特定的专家增强
-                if category == 0:  # 水体
-                    if self.spectral_adapter is not None:
-                        task_gate[b] += 0.2
-                elif category == 1:  # 植被
-                    if self.texture_adapter is not None:
-                        task_gate[b] += 0.2
-
-            # 门控网络与任务门融合
-            base_weights, gate_logits = self.gate(x_shared)  # [B,E,h,w]
-            weights = base_weights + task_gate
-            # 归一化权重
-            weights = torch.softmax(weights, dim=1, dtype=torch.float32)
-        else:
-            weights, gate_logits = self.gate(x_shared)  # [B,E,h,w]
+        # 3) 门控权重：纯文本语义路由（不使用离散 ID）
+        _, gate_logits = self.gate(x_shared)  # [B,E,h,w]
+        semantic_bias = None
+        task_bias = None
+        element_bias = None
+        task_vec = self._pool_text_embeddings(task_text_embs, text_mask=task_text_mask)
+        element_vec = self._pool_text_embeddings(element_text_embs, text_mask=element_text_mask)
+        if task_vec is not None:
+            task_bias = self.task_text_router(task_vec)
+            semantic_bias = task_bias
+        if element_vec is not None:
+            element_bias = self.element_text_router(element_vec)
+            semantic_bias = element_bias if semantic_bias is None else (semantic_bias + element_bias)
+        if semantic_bias is not None:
+            gate_logits = gate_logits + semantic_bias.unsqueeze(-1).unsqueeze(-1).to(gate_logits.dtype)
+        weights = torch.softmax(gate_logits, dim=1, dtype=torch.float32)
         # 推理时可选 Top-K 硬路由：选择前 k 个专家并归一化权重
         if (not self.training) and self.top_k and self.top_k > 0 and self.hard_topk_inference:
             E = weights.shape[1]
@@ -379,6 +387,12 @@ class AquacultureSegMOE(nn.Module):
         if (h, w) != (H, W):
             fused = F.interpolate(fused, size=(H, W), mode="bilinear", align_corners=False)
         out = {"logits": fused, "gate_logits": gate_logits}
+        if semantic_bias is not None:
+            out["semantic_bias_mean"] = semantic_bias.mean()
+        if task_bias is not None:
+            out["task_bias_norm"] = task_bias.norm(dim=-1).mean()
+        if element_bias is not None:
+            out["element_bias_norm"] = element_bias.norm(dim=-1).mean()
         # 训练阶段：附加路由正则，帮助负载均衡与稳定（可选）
         if self.training:
             # 熵正则：鼓励分布不过于尖锐或塌缩

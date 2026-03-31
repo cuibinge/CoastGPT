@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 import torch_npu
+import warnings
 
 
 class TextProjHead(nn.Module):
@@ -301,13 +302,15 @@ class MoEProjection(nn.Module):
             encoder_hidden_size: int,
             hidden_size: int,
             output_size: int,
-            num_tasks: int = 5,  # 任务种类 (如分类、问答等)
-            num_elements: int = 10,  # 要素种类 (如船只、波浪、云等)
             task_dim: int = 256,
+            text_embed_dim: Optional[int] = None,
+            physical_prompt_embed_dims: Optional[List[int]] = None,
             include_physical_prompt: bool = True,
             norm_layer: Optional[Callable[..., nn.Module]] = None,
             checkpoint: bool = False,
             top_k: int = 2,
+            routing_strategy: str = "joint",
+            task_expert_ratio: float = 0.5,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -317,6 +320,9 @@ class MoEProjection(nn.Module):
         self.output_size = output_size
         self.encoder_hidden_size = encoder_hidden_size
         self.include_physical_prompt = include_physical_prompt
+        self.routing_strategy = str(routing_strategy).lower()
+        self.task_expert_ratio = float(task_expert_ratio)
+        self.text_embed_dim = int(text_embed_dim) if text_embed_dim is not None else int(encoder_hidden_size)
 
         # 1. 专家组：基于交叉注意力的序列压缩器 (AttnPooler)
         self.experts = nn.ModuleList([
@@ -332,9 +338,19 @@ class MoEProjection(nn.Module):
             ) for _ in range(num_experts)
         ])
 
-        # 2. 任务与要素嵌入表 (对应 h_task, h_element)
-        self.task_embedding = nn.Embedding(num_tasks, task_dim)
-        self.element_embedding = nn.Embedding(num_elements, task_dim)
+        # 2. 任务与要素文本语义池化（彻底替代离散 ID 嵌入）
+        self.task_text_query = nn.Parameter(torch.zeros(1, 1, encoder_hidden_size))
+        self.element_text_query = nn.Parameter(torch.zeros(1, 1, encoder_hidden_size))
+        nn.init.trunc_normal_(self.task_text_query, std=0.02)
+        nn.init.trunc_normal_(self.element_text_query, std=0.02)
+        if self.text_embed_dim != encoder_hidden_size:
+            self.task_text_in_proj = nn.Linear(self.text_embed_dim, encoder_hidden_size)
+            self.element_text_in_proj = nn.Linear(self.text_embed_dim, encoder_hidden_size)
+        else:
+            self.task_text_in_proj = nn.Identity()
+            self.element_text_in_proj = nn.Identity()
+        self.task_text_proj = nn.Linear(encoder_hidden_size, task_dim)
+        self.element_text_proj = nn.Linear(encoder_hidden_size, task_dim)
 
         # 3. 双驱动门控网络 (全局视觉特征 + 任务特征 + 要素特征 + 物理先验)
         # 为门控对齐维度：将视觉全局和物理池化都投影到 task_dim
@@ -343,14 +359,44 @@ class MoEProjection(nn.Module):
         if self.include_physical_prompt:
             combined_dim += task_dim
             self.physical_gate_proj = nn.Linear(encoder_hidden_size, task_dim)
+            supported_phy_dims = set(physical_prompt_embed_dims or [])
+            supported_phy_dims.add(encoder_hidden_size)
+            self.supported_physical_dims = sorted({int(d) for d in supported_phy_dims if d is not None})
+            self.physical_in_proj = nn.ModuleDict()
+            for d in self.supported_physical_dims:
+                if d != encoder_hidden_size:
+                    self.physical_in_proj[str(d)] = nn.Linear(d, encoder_hidden_size)
             # 上下文感知的物理提示池化：单查询自注意力
             self.physical_pool_query = nn.Parameter(torch.zeros(1, 1, encoder_hidden_size))
             nn.init.trunc_normal_(self.physical_pool_query, std=0.02)
         else:
             self.physical_gate_proj = None
+            self.physical_in_proj = None
+            self.supported_physical_dims = []
             self.physical_pool_query = None
         self.gate_norm = nn.LayerNorm(combined_dim)
         self.gate = nn.Linear(combined_dim, num_experts)
+
+        # 可选：两段式路由（前半专家偏任务，后半专家偏要素）
+        self.task_expert_count = 0
+        self.element_expert_count = 0
+        self.task_gate = None
+        self.task_gate_norm = None
+        self.element_gate = None
+        self.element_gate_norm = None
+        if self.routing_strategy in ("two_stage", "task_then_element"):
+            if num_experts < 2:
+                warnings.warn("two_stage routing requires num_experts >= 2, fallback to joint routing.")
+                self.routing_strategy = "joint"
+            else:
+                self.task_expert_count = max(1, min(num_experts - 1, int(round(num_experts * self.task_expert_ratio))))
+                self.element_expert_count = num_experts - self.task_expert_count
+                task_gate_dim = task_dim + task_dim + (task_dim if self.include_physical_prompt else 0)
+                element_gate_dim = task_dim + task_dim + (task_dim if self.include_physical_prompt else 0)
+                self.task_gate_norm = nn.LayerNorm(task_gate_dim)
+                self.task_gate = nn.Linear(task_gate_dim, self.task_expert_count)
+                self.element_gate_norm = nn.LayerNorm(element_gate_dim)
+                self.element_gate = nn.Linear(element_gate_dim, self.element_expert_count)
 
         # 4. 稳定性输出增益和归一化
         self.output_gain = nn.Parameter(torch.ones(output_size) * 0.3)
@@ -362,27 +408,77 @@ class MoEProjection(nn.Module):
         self.aux_zloss_coef = 0.00001
         self._gate_stats = {}
 
+    def _pool_semantic_text(
+            self,
+            text_embs: Optional[torch.Tensor],
+            text_mask: Optional[torch.Tensor],
+            in_proj: nn.Module,
+            query: torch.Tensor,
+            proj: nn.Linear,
+            target_batch: int,
+            dtype: torch.dtype,
+            device: torch.device,
+    ) -> torch.Tensor:
+        if text_embs is None:
+            return torch.zeros(target_batch, proj.out_features, device=device, dtype=dtype)
+        if text_embs.size(0) != target_batch:
+            raise ValueError(f"text_embs batch ({text_embs.size(0)}) != image batch ({target_batch})")
+        text_embs = in_proj(text_embs).to(device=device, dtype=dtype)
+        if text_mask is not None:
+            text_mask = text_mask.to(device=device).bool()
+        if text_embs.dim() == 2:
+            pooled = text_embs
+        else:
+            q = query.expand(text_embs.size(0), -1, -1)  # [B,1,C]
+            scores = torch.matmul(q, text_embs.transpose(1, 2)) / (text_embs.size(-1) ** 0.5)
+            if text_mask is not None:
+                if text_mask.dim() == 1:
+                    text_mask = text_mask.unsqueeze(0).expand(text_embs.size(0), -1)
+                if text_mask.dim() != 2:
+                    raise ValueError("text_mask must be [B, L] for sequence text embeddings")
+                if text_mask.size(1) != text_embs.size(1):
+                    raise ValueError(
+                        f"text_mask length ({text_mask.size(1)}) != text_embs length ({text_embs.size(1)})"
+                    )
+                scores = scores.masked_fill(~text_mask.unsqueeze(1), -1e4)
+            weights = torch.softmax(scores, dim=-1)
+            if text_mask is not None:
+                weights = weights * text_mask.unsqueeze(1).to(weights.dtype)
+                weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            pooled = torch.matmul(weights, text_embs).squeeze(1)  # [B,C]
+        return proj(pooled.to(dtype=dtype, device=device))
+
+    def _project_physical_prompts(self, physical_prompts: torch.Tensor) -> torch.Tensor:
+        if physical_prompts.size(-1) == self.encoder_hidden_size:
+            return physical_prompts
+        key = str(int(physical_prompts.size(-1)))
+        if self.physical_in_proj is None or key not in self.physical_in_proj:
+            raise ValueError(
+                f"Unsupported physical prompt dim {physical_prompts.size(-1)}; "
+                f"supported dims: {self.supported_physical_dims}"
+            )
+        return self.physical_in_proj[key](physical_prompts)
+
     def forward(
             self,
             image_embs: torch.Tensor,
             physical_prompts: Optional[torch.Tensor] = None,
-            task_ids: Optional[torch.Tensor] = None,
-            element_ids: Optional[torch.Tensor] = None
+            task_text_embs: Optional[torch.Tensor] = None,
+            element_text_embs: Optional[torch.Tensor] = None,
+            physical_prompt_mask: Optional[torch.Tensor] = None,
+            task_text_mask: Optional[torch.Tensor] = None,
+            element_text_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         image_embs: [B, L_v, C] 多尺度视觉特征序列 (Z_visual)
         physical_prompts: [B, L_p, C] 物理先验提示序列 (H_prior)
-        task_ids: [B] 任务意图 ID
-        element_ids: [B] 具体要素 ID
+        task_text_embs: [B, L_t, C] 任务文本 embedding（Tokenizer + LLM Embedding）
+        element_text_embs: [B, L_e, C] 要素文本 embedding（Tokenizer + LLM Embedding）
+        *_mask: [B, L] 有效 token 掩码（用于避免 padding 稀释语义）
         """
         if isinstance(image_embs, (list, tuple)):
             image_embs = torch.cat(image_embs, dim=1)
         B, L_v, C = image_embs.shape
-
-        if task_ids is None:
-            task_ids = torch.zeros(B, dtype=torch.long, device=image_embs.device)
-        if element_ids is None:
-            element_ids = torch.zeros(B, dtype=torch.long, device=image_embs.device)
 
         # ==========================================
         # 1. 任务与要素双驱动的动态门控计算 (Sequence-level Routing)
@@ -391,17 +487,52 @@ class MoEProjection(nn.Module):
         img_global = image_embs.mean(dim=1)  # [B, C]
         img_gate = self.gate_img_proj(img_global)  # [B, task_dim]
 
-        # 获取任务和要素上下文 h_task, h_element
-        t_embs = self.task_embedding(task_ids)  # [B, task_dim]
-        e_embs = self.element_embedding(element_ids)  # [B, task_dim]
+        # 从任务/要素文本 embedding 中提取语义上下文 h_task, h_element
+        t_embs = self._pool_semantic_text(
+            text_embs=task_text_embs,
+            text_mask=task_text_mask,
+            in_proj=self.task_text_in_proj,
+            query=self.task_text_query,
+            proj=self.task_text_proj,
+            target_batch=B,
+            dtype=image_embs.dtype,
+            device=image_embs.device,
+        )
+        e_embs = self._pool_semantic_text(
+            text_embs=element_text_embs,
+            text_mask=element_text_mask,
+            in_proj=self.element_text_in_proj,
+            query=self.element_text_query,
+            proj=self.element_text_proj,
+            target_batch=B,
+            dtype=image_embs.dtype,
+            device=image_embs.device,
+        )
 
         if self.include_physical_prompt:
             if physical_prompts is not None:
-                physical_prompts = physical_prompts.to(image_embs.dtype)
+                physical_prompts = self._project_physical_prompts(physical_prompts).to(
+                    device=image_embs.device,
+                    dtype=image_embs.dtype,
+                )
                 # 上下文感知池化：单查询自注意力
                 q = self.physical_pool_query.expand(physical_prompts.size(0), -1, -1)  # [B,1,C]
                 attn_scores = torch.matmul(q, physical_prompts.transpose(1, 2)) / (physical_prompts.size(-1) ** 0.5)  # [B,1,L_p]
+                if physical_prompt_mask is not None:
+                    pm = physical_prompt_mask.to(device=image_embs.device).bool()
+                    if pm.dim() == 1:
+                        pm = pm.unsqueeze(0).expand(physical_prompts.size(0), -1)
+                    if pm.dim() != 2:
+                        raise ValueError("physical_prompt_mask must be [B, L_p]")
+                    if pm.size(1) != physical_prompts.size(1):
+                        raise ValueError(
+                            f"physical_prompt_mask length ({pm.size(1)}) != physical_prompts length ({physical_prompts.size(1)})"
+                        )
+                    attn_scores = attn_scores.masked_fill(~pm.unsqueeze(1), -1e4)
                 attn_weights = torch.softmax(attn_scores, dim=-1)
+                if physical_prompt_mask is not None:
+                    attn_weights = attn_weights * pm.unsqueeze(1).to(attn_weights.dtype)
+                    attn_weights = attn_weights / attn_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
                 phy_pooled = torch.matmul(attn_weights, physical_prompts).squeeze(1)  # [B, C]
                 phy_gate = self.physical_gate_proj(phy_pooled)
                 phy_query = physical_prompts
@@ -419,7 +550,27 @@ class MoEProjection(nn.Module):
         gate_input = torch.cat(gate_parts, dim=-1).float()
 
         # 计算专家倾向性
-        gate_logits = self.gate(self.gate_norm(gate_input))  # [B, num_experts]
+        if self.routing_strategy in ("two_stage", "task_then_element") and self.task_gate is not None:
+            task_parts = [img_gate, t_embs]
+            elem_parts = [img_gate, e_embs]
+            if self.include_physical_prompt and phy_gate is not None:
+                task_parts.append(phy_gate)
+                elem_parts.append(phy_gate)
+            task_input = torch.cat(task_parts, dim=-1).float()
+            elem_input = torch.cat(elem_parts, dim=-1).float()
+
+            task_logits = self.task_gate(self.task_gate_norm(task_input))
+            elem_logits = self.element_gate(self.element_gate_norm(elem_input))
+            gate_logits = torch.full(
+                (B, self.num_experts),
+                fill_value=-1e4,
+                device=image_embs.device,
+                dtype=task_logits.dtype,
+            )
+            gate_logits[:, :self.task_expert_count] = task_logits
+            gate_logits[:, self.task_expert_count:] = elem_logits
+        else:
+            gate_logits = self.gate(self.gate_norm(gate_input))  # [B, num_experts]
         gate_logits = torch.clamp(gate_logits, min=-15.0, max=15.0)
         gate_weights = torch.softmax(gate_logits, dim=-1)  # [B, num_experts]
 
@@ -447,6 +598,11 @@ class MoEProjection(nn.Module):
                 "entropy": entropy,
                 "zloss": zloss,
             }
+            if self.routing_strategy in ("two_stage", "task_then_element") and self.task_expert_count > 0:
+                task_mass = gate_weights[:, :self.task_expert_count].sum(dim=-1).mean()
+                element_mass = gate_weights[:, self.task_expert_count:].sum(dim=-1).mean()
+                self._gate_stats["task_branch_mass"] = task_mass
+                self._gate_stats["element_branch_mass"] = element_mass
 
         # ==========================================
         # 2. 物理先验复用与联合特征构建 (Physical Prior Reuse)
@@ -478,6 +634,9 @@ class MoEProjection(nn.Module):
 
                 # AttnPooler 处理包含物理属性的长序列
                 expert_out = self.experts[e_id](selected_z_tilde, physical_queries=phy_query[mask] if phy_query is not None else None)  # [num_selected, num_query, output_size]
+                # 专家内部可拼接物理查询，输出长度可能 > num_query；仅保留可学习查询对应的前 num_query 个 token
+                if expert_out.size(1) != self.num_query:
+                    expert_out = expert_out[:, : self.num_query, :]
 
                 # 加权融合
                 selected_weights = expert_weight[mask].unsqueeze(1).unsqueeze(2)  # [num_selected, 1, 1]

@@ -12,7 +12,6 @@ from .build_transform import build_cls_transform, build_vlp_transform
 from .cap_dataset import (
     CaptionDatasetVQA,
     DataCollatorForSupervisedDataset,
-    InstructDataset,
     InstructDatasetWithTaskId,
     RS5MDataset,
 )
@@ -96,20 +95,13 @@ def build_vlp_loader(
                 root=config.data_path, transform=transform, **kwargs
             )
     elif is_train and config.stage >= 2:
-        if not config.weight_sample:
-            dataset = InstructDataset(
-                root=config.data_path,
-                transform=transform,
-                crop_size=config.transform.input_size[0],
-                **kwargs,
-            )
-        else:
-            dataset = InstructDatasetWithTaskId(
-                root=config.data_path,
-                transform=transform,
-                crop_size=config.transform.input_size[0],
-                **kwargs,
-            )
+        dataset = InstructDatasetWithTaskId(
+            root=config.data_path,
+            transform=transform,
+            crop_size=config.transform.input_size[0],
+            **kwargs,
+        )
+        if config.weight_sample:
             from torch.utils.data import WeightedRandomSampler
             from .utils import DistributedSamplerWrapper
 
@@ -127,6 +119,8 @@ def build_vlp_loader(
                 collate_fn=DataCollatorForSupervisedDataset(
                     tokenizer=kwargs["tokenizer"],
                     physical_prompt_max_len=int(getattr(config, "physical_prompt_max_len", 64)),
+                    task_text_max_len=int(getattr(config, "task_text_max_len", 16)),
+                    element_text_max_len=int(getattr(config, "element_text_max_len", 16)),
                 ),
             )
             return loader
@@ -142,6 +136,8 @@ def build_vlp_loader(
                         collation_fn=DataCollatorForSupervisedDataset(
                             tokenizer=kwargs["tokenizer"],
                             physical_prompt_max_len=int(getattr(config, "physical_prompt_max_len", 64)),
+                            task_text_max_len=int(getattr(config, "task_text_max_len", 16)),
+                            element_text_max_len=int(getattr(config, "element_text_max_len", 16)),
                         ),
                     )
                 ]
@@ -187,6 +183,8 @@ def build_vlp_loader(
             collate_fn=DataCollatorForSupervisedDataset(
                 tokenizer=kwargs["tokenizer"],
                 physical_prompt_max_len=int(getattr(config, "physical_prompt_max_len", 64)),
+                task_text_max_len=int(getattr(config, "task_text_max_len", 16)),
+                element_text_max_len=int(getattr(config, "element_text_max_len", 16)),
             ),
         )
         logger.info(f"Build dataloader: Epoch length = {len(dataloader)}")

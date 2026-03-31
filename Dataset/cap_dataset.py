@@ -599,6 +599,7 @@ class InstructDatasetWithTaskId(InstructDataset):
         "海上钻井平台": ["海上钻井平台", "offshore platform", "oil rig"],
         "滩涂": ["滩涂", "tidal flat", "mudflat"],
         "红树林湿地": ["红树林", "mangrove", "mangrove wetland"],
+        "土地覆盖": ["土地覆盖", "land cover", "land-use", "land use", "lc", "lulc"],
     }
 
     PHYSICAL_FIELD_ALIASES = {
@@ -612,6 +613,8 @@ class InstructDatasetWithTaskId(InstructDataset):
         self.sample_weight = []
         self.task_ids = []       # 存储每个样本的任务ID
         self.category_ids = []   # 存储每个样本的地物类别ID（复用为 element_id）
+        self.task_texts = []     # 存储每个样本任务文本
+        self.element_texts = []  # 存储每个样本要素文本
         self.sample_phys_meta = []
         super().__init__(**kwargs)
 
@@ -703,6 +706,38 @@ class InstructDatasetWithTaskId(InstructDataset):
     def _default_element_id() -> int:
         return ELEMENT2ID.get("无", 0)
 
+    @staticmethod
+    def _default_task_text() -> str:
+        return "描述"
+
+    @staticmethod
+    def _default_element_text() -> str:
+        return "无"
+
+    def detect_task_text_from_text(self, text: str) -> str:
+        text_lower = text.lower()
+        for task_name in TASK2ID.keys():
+            if task_name.lower() in text_lower:
+                return task_name
+        for task_type, keywords in self.TASK_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in text_lower:
+                    return task_type
+        return self._default_task_text()
+
+    def detect_element_text_from_text(self, text: str) -> str:
+        text_lower = text.lower()
+        for element_name in ELEMENT2ID.keys():
+            if element_name == "无":
+                continue
+            if element_name.lower() in text_lower:
+                return element_name
+        for category, keywords in self.ELEMENT_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in text_lower:
+                    return category
+        return self._default_element_text()
+
     def detect_task_from_text(self, text: str) -> int:
         """
         根据输入文本检测任务类型
@@ -711,20 +746,8 @@ class InstructDatasetWithTaskId(InstructDataset):
         Returns:
             task_id: 任务ID
         """
-        text_lower = text.lower()
-
-        for task_name, task_id in TASK2ID.items():
-            if task_name.lower() in text_lower:
-                return task_id
-
-        # 检查每个任务类型关键词
-        for task_type, keywords in self.TASK_KEYWORDS.items():
-            for keyword in keywords:
-                if keyword in text_lower:
-                    return TASK2ID.get(task_type, self._default_task_id())
-
-        # 如果没有匹配到任务关键词，返回默认描述任务
-        return self._default_task_id()
+        task_text = self.detect_task_text_from_text(text)
+        return TASK2ID.get(task_text, self._default_task_id())
 
     def detect_category_from_text(self, text: str) -> int:
         """
@@ -734,22 +757,8 @@ class InstructDatasetWithTaskId(InstructDataset):
         Returns:
             category_id: 地物类别ID
         """
-        text_lower = text.lower()
-
-        for element_name, element_id in ELEMENT2ID.items():
-            if element_name == "无":
-                continue
-            if element_name.lower() in text_lower:
-                return element_id
-
-        # 检查每个地物类别关键词
-        for category, keywords in self.ELEMENT_KEYWORDS.items():
-            for keyword in keywords:
-                if keyword in text_lower:
-                    return ELEMENT2ID.get(category, self._default_element_id())
-
-        # 如果没有匹配到地物类别，返回0（无）
-        return self._default_element_id()
+        element_text = self.detect_element_text_from_text(text)
+        return ELEMENT2ID.get(element_text, self._default_element_id())
 
     def post_process(self):
         for i, item in enumerate(self.cap_list):
@@ -781,8 +790,12 @@ class InstructDatasetWithTaskId(InstructDataset):
                     ]
                     self.cap_list.append(conv)
                     self.sample_weight.append(self.WEIGHT_DICT["geosignal"])
-                    self.task_ids.append(self.detect_task_from_text(question))
-                    self.category_ids.append(self.detect_category_from_text(question))
+                    task_text = self.detect_task_text_from_text(question)
+                    element_text = self.detect_element_text_from_text(question)
+                    self.task_texts.append(task_text)
+                    self.element_texts.append(element_text)
+                    self.task_ids.append(TASK2ID.get(task_text, self._default_task_id()))
+                    self.category_ids.append(ELEMENT2ID.get(element_text, self._default_element_id()))
                     self.sample_phys_meta.append(
                         {
                             "dataset": "geosignal",
@@ -837,13 +850,17 @@ class InstructDatasetWithTaskId(InstructDataset):
                     for conv_item in conv_items:
                         if "Question" in conv_item:
                             question = conv_item["Question"]
-                            task_id = self.detect_task_from_text(question)
-                            category_id = self.detect_category_from_text(question)
-                            self.task_ids.append(task_id)
-                            self.category_ids.append(category_id)
+                            task_text = self.detect_task_text_from_text(question)
+                            element_text = self.detect_element_text_from_text(question)
+                            self.task_texts.append(task_text)
+                            self.element_texts.append(element_text)
+                            self.task_ids.append(TASK2ID.get(task_text, self._default_task_id()))
+                            self.category_ids.append(ELEMENT2ID.get(element_text, self._default_element_id()))
                             break
                     else:
                         # 如果没有Question，默认使用"描述"任务和"无"类别
+                        self.task_texts.append(self._default_task_text())
+                        self.element_texts.append(self._default_element_text())
                         self.task_ids.append(self._default_task_id())
                         self.category_ids.append(self._default_element_id())
 
@@ -872,6 +889,9 @@ class InstructDatasetWithTaskId(InstructDataset):
             out_dict["category_id"] = self.category_ids[idx]
         else:
             out_dict["category_id"] = self._default_element_id()
+
+        out_dict["task_text"] = self.task_texts[idx] if idx < len(self.task_texts) else self._default_task_text()
+        out_dict["element_text"] = self.element_texts[idx] if idx < len(self.element_texts) else self._default_element_text()
 
         meta = self.sample_phys_meta[idx] if idx < len(self.sample_phys_meta) else None
         out_dict["physical_prompt"] = self._build_physical_prompt(meta)
@@ -1078,13 +1098,15 @@ class DataCollatorForSupervisedDataset(object):
 
     tokenizer: transformers.PreTrainedTokenizer
     physical_prompt_max_len: int = 64
+    task_text_max_len: int = 16
+    element_text_max_len: int = 16
 
-    def _resolve_phys_max_len(self) -> int:
-        tokenizer_max_len = getattr(self.tokenizer, "model_max_length", self.physical_prompt_max_len)
+    def _resolve_max_len(self, target_len: int) -> int:
+        tokenizer_max_len = getattr(self.tokenizer, "model_max_length", target_len)
         if not isinstance(tokenizer_max_len, int) or tokenizer_max_len <= 0:
-            tokenizer_max_len = self.physical_prompt_max_len
+            tokenizer_max_len = target_len
         tokenizer_max_len = min(tokenizer_max_len, 4096)
-        return max(1, min(int(self.physical_prompt_max_len), int(tokenizer_max_len)))
+        return max(1, min(int(target_len), int(tokenizer_max_len)))
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple(
@@ -1115,20 +1137,36 @@ class DataCollatorForSupervisedDataset(object):
         if "valid_image" in instances[0]:
             batch["valid_image"] = torch.tensor([instance["valid_image"] for instance in instances])
 
-        if "tsm" in instances[0] and instances[0]["tsm"] is not None:
-            tsms = [instance["tsm"] for instance in instances if instance["tsm"] is not None]
-            masks = [instance["mask"] for instance in instances if instance["mask"] is not None]
-
-            # 只有当 batch 中存在有效物理数据时才拼接
-            if len(tsms) > 0:
-                batch["tsm"] = torch.stack(tsms).unsqueeze(1)  # [B, 1, H, W]
-                batch["mask"] = torch.stack(masks).unsqueeze(1)
+        if "tsm" in instances[0]:
+            tsm_items = [instance.get("tsm", None) for instance in instances]
+            mask_items = [instance.get("mask", None) for instance in instances]
+            ref_tsm = next((x for x in tsm_items if torch.is_tensor(x)), None)
+            if ref_tsm is not None:
+                batch_tsm = []
+                batch_mask = []
+                valid_physics = []
+                for tsm_i, mask_i in zip(tsm_items, mask_items):
+                    if torch.is_tensor(tsm_i):
+                        cur_tsm = tsm_i
+                        cur_mask = mask_i if torch.is_tensor(mask_i) else torch.ones_like(tsm_i)
+                        valid_physics.append(True)
+                    else:
+                        cur_tsm = torch.zeros_like(ref_tsm)
+                        cur_mask = torch.zeros_like(ref_tsm)
+                        valid_physics.append(False)
+                    batch_tsm.append(cur_tsm)
+                    batch_mask.append(cur_mask)
+                batch["tsm"] = torch.stack(batch_tsm).unsqueeze(1)   # [B,1,H,W]
+                batch["mask"] = torch.stack(batch_mask).unsqueeze(1)  # [B,1,H,W]
+                batch["valid_physics"] = torch.tensor(valid_physics, dtype=torch.bool)
             else:
                 batch["tsm"] = None
                 batch["mask"] = None
+                batch["valid_physics"] = torch.zeros(len(instances), dtype=torch.bool)
         else:
             batch["tsm"] = None
             batch["mask"] = None
+            batch["valid_physics"] = torch.zeros(len(instances), dtype=torch.bool)
 
         # 添加task_ids和category_ids
         if "task_id" in instances[0]:
@@ -1142,7 +1180,7 @@ class DataCollatorForSupervisedDataset(object):
         # 物理提示文本 -> token ids（在 collate 中统一 pad）
         if "physical_prompt" in instances[0]:
             phys_texts = [instance.get("physical_prompt", "") for instance in instances]
-            phys_max_len = self._resolve_phys_max_len()
+            phys_max_len = self._resolve_max_len(self.physical_prompt_max_len)
             phys_tokens = self.tokenizer(
                 phys_texts,
                 padding="max_length",
@@ -1155,6 +1193,36 @@ class DataCollatorForSupervisedDataset(object):
         else:
             batch["physical_prompt_ids"] = None
             batch["physical_prompt_attention_mask"] = None
+
+        if "task_text" in instances[0]:
+            task_texts = [instance.get("task_text", "描述") for instance in instances]
+            task_tokens = self.tokenizer(
+                task_texts,
+                padding="max_length",
+                truncation=True,
+                max_length=self._resolve_max_len(self.task_text_max_len),
+                return_tensors="pt",
+            )
+            batch["task_text_ids"] = task_tokens.input_ids
+            batch["task_text_attention_mask"] = task_tokens.attention_mask
+        else:
+            batch["task_text_ids"] = None
+            batch["task_text_attention_mask"] = None
+
+        if "element_text" in instances[0]:
+            element_texts = [instance.get("element_text", "无") for instance in instances]
+            element_tokens = self.tokenizer(
+                element_texts,
+                padding="max_length",
+                truncation=True,
+                max_length=self._resolve_max_len(self.element_text_max_len),
+                return_tensors="pt",
+            )
+            batch["element_text_ids"] = element_tokens.input_ids
+            batch["element_text_attention_mask"] = element_tokens.attention_mask
+        else:
+            batch["element_text_ids"] = None
+            batch["element_text_attention_mask"] = None
 
         return batch
 

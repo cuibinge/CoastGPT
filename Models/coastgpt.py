@@ -161,17 +161,31 @@ class CoastGPT(nn.Module):
 
         # 物理提示文本 -> 连续嵌入（若存在）
         physical_prompt_embs = None
-        if "physical_prompt_ids" in data and data["physical_prompt_ids"] is not None:
-            try:
-                emb_layer = self.language.model.get_input_embeddings()
-            except Exception:
-                emb_layer = None
-            if emb_layer is not None:
+        task_text_embs = None
+        element_text_embs = None
+        try:
+            emb_layer = self.language.model.get_input_embeddings()
+        except Exception:
+            emb_layer = None
+        if emb_layer is not None:
+            if "physical_prompt_ids" in data and data["physical_prompt_ids"] is not None:
                 physical_prompt_embs = emb_layer(data["physical_prompt_ids"])
                 if "physical_prompt_attention_mask" in data and data["physical_prompt_attention_mask"] is not None:
                     phy_mask = data["physical_prompt_attention_mask"].to(physical_prompt_embs.device)
                     physical_prompt_embs = physical_prompt_embs * phy_mask.unsqueeze(-1).to(physical_prompt_embs.dtype)
                 data["physical_prompt_embs"] = physical_prompt_embs
+            if "task_text_ids" in data and data["task_text_ids"] is not None:
+                task_text_embs = emb_layer(data["task_text_ids"])
+                if "task_text_attention_mask" in data and data["task_text_attention_mask"] is not None:
+                    task_mask = data["task_text_attention_mask"].to(task_text_embs.device)
+                    task_text_embs = task_text_embs * task_mask.unsqueeze(-1).to(task_text_embs.dtype)
+                data["task_text_embs"] = task_text_embs
+            if "element_text_ids" in data and data["element_text_ids"] is not None:
+                element_text_embs = emb_layer(data["element_text_ids"])
+                if "element_text_attention_mask" in data and data["element_text_attention_mask"] is not None:
+                    element_mask = data["element_text_attention_mask"].to(element_text_embs.device)
+                    element_text_embs = element_text_embs * element_mask.unsqueeze(-1).to(element_text_embs.dtype)
+                data["element_text_embs"] = element_text_embs
 
         # 通过视觉模型处理图像
         if isinstance(self.vision, DualVisionEncoder):
@@ -367,20 +381,28 @@ class CoastGPT(nn.Module):
             modal_inputs = data.get("modal_inputs", None)
             context_flags = {"cloudy": bool(data.get("cloudy", False))}
 
-            # 获取task_ids和category_ids
-            task_ids = data.get("task_ids", None)
-            category_ids = data.get("category_ids", None)
+            # 纯文本语义路由输入
+            task_text_embs = data.get("task_text_embs", None)
+            element_text_embs = data.get("element_text_embs", None)
+            task_text_mask = data.get("task_text_attention_mask", None)
+            element_text_mask = data.get("element_text_attention_mask", None)
 
             seg_out = self.seg_head(
                 fused_spatial,
                 input_size=(H, W),
                 modal_inputs=modal_inputs,
                 context=context_flags,
-                task_ids=task_ids,
-                category_ids=category_ids
+                task_text_embs=task_text_embs,
+                element_text_embs=element_text_embs,
+                task_text_mask=task_text_mask,
+                element_text_mask=element_text_mask,
             )
             seg_logits = seg_out["logits"]
             out.update({"seg_logits": seg_logits})
+            if "task_bias_norm" in seg_out:
+                out["seg_task_bias_norm"] = seg_out["task_bias_norm"]
+            if "element_bias_norm" in seg_out:
+                out["seg_element_bias_norm"] = seg_out["element_bias_norm"]
             # 门控统计信息（空间加权平均）
             if self.seg_log_gate_stats and "gate_logits" in seg_out:
                 gate_logits = seg_out["gate_logits"]  # [B,E,h,w]
