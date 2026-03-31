@@ -159,21 +159,31 @@ class CoastGPT(nn.Module):
         out = dict()
         total_loss = 0.0
 
-        # 通过视觉模型处理图像
-        if self.physics_enabled and isinstance(self.vision, DualVisionEncoder):
-            image_seq, fused_spatial, pyramid_raw = self.vision.encode_with_spatial(data["rgb"])
-        else:
-            image_seq = self.vision(data)
-            fused_spatial, pyramid_raw = None, None
-
         # 物理提示文本 -> 连续嵌入（若存在）
+        physical_prompt_embs = None
         if "physical_prompt_ids" in data and data["physical_prompt_ids"] is not None:
             try:
                 emb_layer = self.language.model.get_input_embeddings()
             except Exception:
                 emb_layer = None
             if emb_layer is not None:
-                data["physical_prompt_embs"] = emb_layer(data["physical_prompt_ids"])
+                physical_prompt_embs = emb_layer(data["physical_prompt_ids"])
+                if "physical_prompt_attention_mask" in data and data["physical_prompt_attention_mask"] is not None:
+                    phy_mask = data["physical_prompt_attention_mask"].to(physical_prompt_embs.device)
+                    physical_prompt_embs = physical_prompt_embs * phy_mask.unsqueeze(-1).to(physical_prompt_embs.dtype)
+                data["physical_prompt_embs"] = physical_prompt_embs
+
+        # 通过视觉模型处理图像
+        if isinstance(self.vision, DualVisionEncoder):
+            image_seq, fused_spatial, pyramid_raw = self.vision.encode_with_spatial(
+                data["rgb"], physical_prompt_embs=physical_prompt_embs
+            )
+            if hasattr(self.vision, "get_alignment_stats"):
+                for k, v in self.vision.get_alignment_stats().items():
+                    out[f"vision_{k}"] = v
+        else:
+            image_seq = self.vision(data)
+            fused_spatial, pyramid_raw = None, None
 
         # 多模态嵌入处理
         multimodal_embedding = self.multimodal(data, image_embedding=image_seq)
