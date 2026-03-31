@@ -125,7 +125,8 @@ def build_vlp_loader(
                 pin_memory=True,
                 drop_last=True,
                 collate_fn=DataCollatorForSupervisedDataset(
-                    tokenizer=kwargs["tokenizer"]
+                    tokenizer=kwargs["tokenizer"],
+                    physical_prompt_max_len=int(getattr(config, "physical_prompt_max_len", 64)),
                 ),
             )
             return loader
@@ -139,7 +140,8 @@ def build_vlp_loader(
                         config.batch_size,
                         partial=False,
                         collation_fn=DataCollatorForSupervisedDataset(
-                            tokenizer=kwargs["tokenizer"]
+                            tokenizer=kwargs["tokenizer"],
+                            physical_prompt_max_len=int(getattr(config, "physical_prompt_max_len", 64)),
                         ),
                     )
                 ]
@@ -182,7 +184,10 @@ def build_vlp_loader(
             config,
             dataset,
             is_train=is_train,
-            collate_fn=DataCollatorForSupervisedDataset(tokenizer=kwargs["tokenizer"]),
+            collate_fn=DataCollatorForSupervisedDataset(
+                tokenizer=kwargs["tokenizer"],
+                physical_prompt_max_len=int(getattr(config, "physical_prompt_max_len", 64)),
+            ),
         )
         logger.info(f"Build dataloader: Epoch length = {len(dataloader)}")
         return dataloader
