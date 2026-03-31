@@ -34,6 +34,7 @@ from Models import (
     IMAGE_TOKEN_INDEX,
 )
 from . import conversation as conversation_lib
+from .constants import ELEMENT2ID, TASK2ID
 import torch_npu
 
 _SHARD_SHUFFLE_SIZE = 2000
@@ -565,61 +566,142 @@ class InstructDatasetWithTaskId(InstructDataset):
         "FAST": 1.0,
     }
 
-    # 任务关键词映射到任务ID
+    # 任务关键词映射到统一任务名（再由 TASK2ID 转为 ID）
     TASK_KEYWORDS = {
-        "分类": [
+        "场景分类": [
             "classify", "classification", "分类", "识别", "recognize", "distinguish",
-            "category", "label", "predict", "identify", "what type", "which class",
-            "land cover", "land use", "vegetation", "water", "building", "urban", "rural"
+            "category", "label", "predict", "identify", "what type", "which class"
         ],
-        "分割": [
-            "segment", "segmentation", "分割", "mask", "outline", "boundary", " delineate",
-            "edge detection", "semantic segmentation", "instance segmentation", "mask prediction",
-            "region", "area", "polygon", "mask image", "semantic mask", "cover type"
+        "视觉问答": [
+            "question", "answer", "问答", "vqa", "qa", "why", "how", "what", "where", "when"
         ],
-        "检测": [
-            "detect", "detection", "检测", "object detection", "find", "locate",
-            "target", "bbox", "bounding box", "instance", "object", "feature"
+        "视觉定位": [
+            "locate", "location", "定位", "position", "where is", "bbox", "bounding box", "坐标"
         ],
         "描述": [
             "describe", "description", "描述", "explain", "caption", "summarize",
             "what do you see", "describe the", "tell me about", "visual content", "scene"
         ],
-        "生成": [
-            "generate", "generation", "生成", "create", "synthesize", "produce",
-            "create image", "synthetic", "artificial", "render", "generate map"
+        "要素提取": [
+            "extract", "extraction", "要素提取", "segment", "segmentation", "mask",
+            "detect", "detection", "object", "target", "feature", "element"
         ]
     }
 
-    # 任务ID映射
-    TASK_ID_MAPPING = {
-        "分类": 0,
-        "分割": 1,
-        "检测": 2,
-        "描述": 3,
-        "生成": 4,
-        "其他": 5
+    # 统一要素关键词映射到 ELEMENT2ID 的标准 key
+    ELEMENT_KEYWORDS = {
+        "网箱养殖区": ["网箱", "cage", "cage-culture", "cage farming", "aquaculture cage"],
+        "筏式养殖区": ["筏式", "raft", "raft-culture", "raft farming"],
+        "赤潮": ["赤潮", "red tide", "algal bloom"],
+        "浒苔": ["浒苔", "green tide", "ulva", "macroalgae"],
+        "海岸线": ["海岸线", "coastline", "shoreline"],
+        "风力发电机": ["风力发电机", "wind turbine", "windmill"],
+        "海上钻井平台": ["海上钻井平台", "offshore platform", "oil rig"],
+        "滩涂": ["滩涂", "tidal flat", "mudflat"],
+        "红树林湿地": ["红树林", "mangrove", "mangrove wetland"],
     }
 
-    # 地物类别映射
-    CATEGORY_KEYWORDS = {
-        "水体": ["water", "river", "ocean", "lake", "pond", "sea", "flood", "wetland", "water body", "水域", "河流",
-                 "海洋", "湖泊"],
-        "植被": ["vegetation", "forest", "tree", "grass", "crop", "agriculture", "plant", "green", "vegetation cover",
-                 "植被", "森林", "农田", "草地"],
-        "建筑": ["building", "house", "urban", "city", "structure", "construction", "man-made", "建筑", "房屋", "城市",
-                 "人工"],
-        "道路": ["road", "highway", "street", "path", "transport", "infrastructure", "道路", "公路", "街道"],
-        "农田": ["farmland", "agriculture", "farm", "field", "crop", "种植", "农田", "耕地", "庄稼"],
-        "裸地": ["bare ground", "soil", "sand", "rock", "exposed", "ground", "bare", "裸地", "土壤", "岩石"],
-        "云层": ["cloud", "cloud cover", "cloudy", "overcast", "cloud shadow", "云", "云层", "多云"]
+    PHYSICAL_FIELD_ALIASES = {
+        "sensor": ["sensor", "platform", "satellite", "instrument", "sat", "source"],
+        "gsd": ["gsd", "ground_sample_distance", "ground_sampling_distance", "spatial_resolution", "resolution", "pixel_size"],
+        "band": ["band", "bands", "channel", "channels", "spectral", "spectrum", "modality"],
+        "time": ["time", "timestamp", "date", "acquisition_time", "acquisition_date", "datetime"],
     }
 
     def __init__(self, **kwargs):
         self.sample_weight = []
+        self.task_ids = []       # 存储每个样本的任务ID
+        self.category_ids = []   # 存储每个样本的地物类别ID（复用为 element_id）
+        self.sample_phys_meta = []
         super().__init__(**kwargs)
-        self.task_ids = []  # 存储每个样本的任务ID
-        self.category_ids = []  # 存储每个样本的地物类别ID
+
+    @staticmethod
+    def _to_text(value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (list, tuple)):
+            parts = [str(v).strip() for v in value if str(v).strip()]
+            return ", ".join(parts)
+        if isinstance(value, dict):
+            parts = [f"{k}:{v}" for k, v in value.items() if v is not None and str(v).strip()]
+            return ", ".join(parts)
+        return str(value).strip()
+
+    def _deep_lookup(self, data, aliases: List[str]) -> str:
+        alias_set = {a.lower() for a in aliases}
+        queue = [data]
+        while queue:
+            cur = queue.pop(0)
+            if isinstance(cur, dict):
+                for k, v in cur.items():
+                    k_lower = str(k).lower()
+                    if k_lower in alias_set:
+                        text = self._to_text(v)
+                        if text:
+                            return text
+                    if isinstance(v, (dict, list, tuple)):
+                        queue.append(v)
+            elif isinstance(cur, (list, tuple)):
+                for v in cur:
+                    if isinstance(v, (dict, list, tuple)):
+                        queue.append(v)
+        return ""
+
+    @staticmethod
+    def _guess_sensor_from_path(img_path: Path) -> str:
+        path_lower = str(img_path).lower()
+        rules = [
+            ("sentinel", "Sentinel"),
+            ("landsat", "Landsat"),
+            ("gaofen", "GF"),
+            ("worldview", "WorldView"),
+            ("planet", "Planet"),
+            ("jl1", "JL-1"),
+            ("jilin", "JL-1"),
+        ]
+        for key, value in rules:
+            if key in path_lower:
+                return value
+        return ""
+
+    def _extract_physical_meta(self, item: Dict, dataset_name: str, img_path: Path) -> Dict[str, str]:
+        meta = {"dataset": dataset_name}
+        for field, aliases in self.PHYSICAL_FIELD_ALIASES.items():
+            meta[field] = self._deep_lookup(item, aliases)
+        if not meta["sensor"]:
+            meta["sensor"] = self._guess_sensor_from_path(img_path)
+        return meta
+
+    @staticmethod
+    def _normalize_time_str(time_str: str) -> str:
+        if not time_str:
+            return ""
+        return time_str.replace("T", " ").replace("Z", "").strip()
+
+    def _build_physical_prompt(self, meta: Dict[str, str]) -> str:
+        if meta is None:
+            return ""
+        parts = []
+        if meta.get("dataset"):
+            parts.append(f"[Dataset: {meta['dataset']}]")
+        if meta.get("sensor"):
+            parts.append(f"[Sensor: {meta['sensor']}]")
+        if meta.get("gsd"):
+            parts.append(f"[GSD: {meta['gsd']}]")
+        if meta.get("band"):
+            parts.append(f"[Band: {meta['band']}]")
+        norm_time = self._normalize_time_str(meta.get("time", ""))
+        if norm_time:
+            parts.append(f"[Time: {norm_time}]")
+        return " ".join(parts)
+
+    @staticmethod
+    def _default_task_id() -> int:
+        return TASK2ID.get("描述", 0)
+
+    @staticmethod
+    def _default_element_id() -> int:
+        return ELEMENT2ID.get("无", 0)
 
     def detect_task_from_text(self, text: str) -> int:
         """
@@ -631,14 +713,18 @@ class InstructDatasetWithTaskId(InstructDataset):
         """
         text_lower = text.lower()
 
-        # 检查每个任务类型
+        for task_name, task_id in TASK2ID.items():
+            if task_name.lower() in text_lower:
+                return task_id
+
+        # 检查每个任务类型关键词
         for task_type, keywords in self.TASK_KEYWORDS.items():
             for keyword in keywords:
                 if keyword in text_lower:
-                    return self.TASK_ID_MAPPING[task_type]
+                    return TASK2ID.get(task_type, self._default_task_id())
 
-        # 如果没有匹配到任务关键词，返回"其他"
-        return self.TASK_ID_MAPPING["其他"]
+        # 如果没有匹配到任务关键词，返回默认描述任务
+        return self._default_task_id()
 
     def detect_category_from_text(self, text: str) -> int:
         """
@@ -650,14 +736,20 @@ class InstructDatasetWithTaskId(InstructDataset):
         """
         text_lower = text.lower()
 
-        # 检查每个地物类别
-        for category, keywords in self.CATEGORY_KEYWORDS.items():
+        for element_name, element_id in ELEMENT2ID.items():
+            if element_name == "无":
+                continue
+            if element_name.lower() in text_lower:
+                return element_id
+
+        # 检查每个地物类别关键词
+        for category, keywords in self.ELEMENT_KEYWORDS.items():
             for keyword in keywords:
                 if keyword in text_lower:
-                    return list(self.CATEGORY_KEYWORDS.keys()).index(category)
+                    return ELEMENT2ID.get(category, self._default_element_id())
 
-        # 如果没有匹配到地物类别，返回0（水体）
-        return 0
+        # 如果没有匹配到地物类别，返回0（无）
+        return self._default_element_id()
 
     def post_process(self):
         for i, item in enumerate(self.cap_list):
@@ -680,14 +772,26 @@ class InstructDatasetWithTaskId(InstructDataset):
                 with open(dir, "rb") as f:
                     data = json.load(f)
                 for item in data:
+                    question = item.get("instruction", "") + item.get("input", "")
                     conv = [
                         {
-                            "Question": item["instruction"] + item["input"],
+                            "Question": question,
                             "Answer": item["output"],
                         }
                     ]
                     self.cap_list.append(conv)
                     self.sample_weight.append(self.WEIGHT_DICT["geosignal"])
+                    self.task_ids.append(self.detect_task_from_text(question))
+                    self.category_ids.append(self.detect_category_from_text(question))
+                    self.sample_phys_meta.append(
+                        {
+                            "dataset": "geosignal",
+                            "sensor": "",
+                            "gsd": "",
+                            "band": "",
+                            "time": "",
+                        }
+                    )
 
     def load_dataset(self):
         for i in range(len(self.img_dir)):
@@ -727,7 +831,10 @@ class InstructDatasetWithTaskId(InstructDataset):
                         self.cap_list.append(item["conv"])
 
                     # 检测任务ID和地物类别ID
-                    for conv_item in self.cap_list[-1]:
+                    conv_items = self.cap_list[-1]
+                    if isinstance(conv_items, Dict):
+                        conv_items = [conv_items]
+                    for conv_item in conv_items:
                         if "Question" in conv_item:
                             question = conv_item["Question"]
                             task_id = self.detect_task_from_text(question)
@@ -736,9 +843,11 @@ class InstructDatasetWithTaskId(InstructDataset):
                             self.category_ids.append(category_id)
                             break
                     else:
-                        # 如果没有Question，默认使用"描述"任务和"水体"类别
-                        self.task_ids.append(self.TASK_ID_MAPPING["描述"])
-                        self.category_ids.append(0)
+                        # 如果没有Question，默认使用"描述"任务和"无"类别
+                        self.task_ids.append(self._default_task_id())
+                        self.category_ids.append(self._default_element_id())
+
+                    self.sample_phys_meta.append(self._extract_physical_meta(item, dataset_name, img_path))
 
                     process_flag = False
                     for name, weight in self.WEIGHT_DICT.items():
@@ -757,16 +866,15 @@ class InstructDatasetWithTaskId(InstructDataset):
         if idx < len(self.task_ids):
             out_dict["task_id"] = self.task_ids[idx]
         else:
-            out_dict["task_id"] = self.TASK_ID_MAPPING["描述"]
+            out_dict["task_id"] = self._default_task_id()
 
         if idx < len(self.category_ids):
             out_dict["category_id"] = self.category_ids[idx]
         else:
-            out_dict["category_id"] = 0
+            out_dict["category_id"] = self._default_element_id()
 
-        # 物理先验文本，供 collate/tokenizer 使用；默认空串避免缺键
-        if "physical_prompt" not in out_dict:
-            out_dict["physical_prompt"] = ""
+        meta = self.sample_phys_meta[idx] if idx < len(self.sample_phys_meta) else None
+        out_dict["physical_prompt"] = self._build_physical_prompt(meta)
 
         return out_dict
 
@@ -969,6 +1077,14 @@ class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
 
     tokenizer: transformers.PreTrainedTokenizer
+    physical_prompt_max_len: int = 64
+
+    def _resolve_phys_max_len(self) -> int:
+        tokenizer_max_len = getattr(self.tokenizer, "model_max_length", self.physical_prompt_max_len)
+        if not isinstance(tokenizer_max_len, int) or tokenizer_max_len <= 0:
+            tokenizer_max_len = self.physical_prompt_max_len
+        tokenizer_max_len = min(tokenizer_max_len, 4096)
+        return max(1, min(int(self.physical_prompt_max_len), int(tokenizer_max_len)))
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple(
@@ -1015,27 +1131,30 @@ class DataCollatorForSupervisedDataset(object):
             batch["mask"] = None
 
         # 添加task_ids和category_ids
-        if "task_ids" in instances[0]:
+        if "task_id" in instances[0]:
             task_ids = [instance["task_id"] for instance in instances]
             batch["task_ids"] = torch.tensor(task_ids, dtype=torch.long)
 
-        if "category_ids" in instances[0]:
+        if "category_id" in instances[0]:
             category_ids = [instance["category_id"] for instance in instances]
             batch["category_ids"] = torch.tensor(category_ids, dtype=torch.long)
 
         # 物理提示文本 -> token ids（在 collate 中统一 pad）
         if "physical_prompt" in instances[0]:
             phys_texts = [instance.get("physical_prompt", "") for instance in instances]
+            phys_max_len = self._resolve_phys_max_len()
             phys_tokens = self.tokenizer(
                 phys_texts,
                 padding="max_length",
                 truncation=True,
-                max_length=getattr(self.tokenizer, "model_max_length", 32),
+                max_length=phys_max_len,
                 return_tensors="pt",
             )
             batch["physical_prompt_ids"] = phys_tokens.input_ids
+            batch["physical_prompt_attention_mask"] = phys_tokens.attention_mask
         else:
             batch["physical_prompt_ids"] = None
+            batch["physical_prompt_attention_mask"] = None
 
         return batch
 
@@ -1312,7 +1431,3 @@ def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX
             return torch.tensor(input_ids, dtype=torch.long)
         raise ValueError(f"Unsupported tensor type: {return_tensors}")
     return input_ids
-try:
-    from .constants import TASK2ID, ELEMENT2ID
-except Exception:
-    TASK2ID, ELEMENT2ID = {}, {}
