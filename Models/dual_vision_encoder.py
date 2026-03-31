@@ -1,5 +1,5 @@
 import math
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 import ml_collections
 import torch
@@ -59,26 +59,109 @@ class HeterogeneousFusionBlock(nn.Module):
     def __init__(self, cnn_dims, vit_dim):
         super().__init__()
         # 为 ConvNeXt 的 4 个 stage (F4, F8, F16, F32) 构建独立对齐空间
-        self.align_f4  = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=cnn_dims[0])
-        self.align_f8  = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=cnn_dims[1])
-        self.align_f16 = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=cnn_dims[2])
-        self.align_f32 = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=cnn_dims[3])
+        self.align_f4  = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=vit_dim)
+        self.align_f8  = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=vit_dim)
+        self.align_f16 = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=vit_dim)
+        self.align_f32 = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=vit_dim)
 
-    def forward(self, vit_features, cnn_pyramid):
-        c4, c8, c16, c32 = cnn_pyramid
+        # 逐尺度 1x1 对齐 + LN，减少分布漂移
+        self.pre_align_f4  = nn.Sequential(nn.Linear(cnn_dims[0], vit_dim), nn.LayerNorm(vit_dim))
+        self.pre_align_f8  = nn.Sequential(nn.Linear(cnn_dims[1], vit_dim), nn.LayerNorm(vit_dim))
+        self.pre_align_f16 = nn.Sequential(nn.Linear(cnn_dims[2], vit_dim), nn.LayerNorm(vit_dim))
+        self.pre_align_f32 = nn.Sequential(nn.Linear(cnn_dims[3], vit_dim), nn.LayerNorm(vit_dim))
+
+        # 融合 gating 参数（可学习权重）
+        self.fusion_logits = nn.Parameter(torch.zeros(4))
+
+        # 融合后归一化与 MLP 残差
+        self.fusion_ln = nn.LayerNorm(vit_dim * 4)
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(vit_dim * 4, vit_dim * 4),
+            nn.GELU(),
+            nn.Linear(vit_dim * 4, vit_dim * 4),
+        )
+
+    def forward(self, vit_features, cnn_tokens: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]):
+        c4_tok, c8_tok, c16_tok, c32_tok = cnn_tokens
         
-        # 展平 CNN 空间维度以进行矩阵乘法 [B, C, H, W] -> [B, H*W, C]
-        flat_c4  = c4.flatten(2).transpose(1, 2)
-        flat_c8  = c8.flatten(2).transpose(1, 2)
-        flat_c16 = c16.flatten(2).transpose(1, 2)
-        flat_c32 = c32.flatten(2).transpose(1, 2)
+        # 输入为展平 token: [B, N, C]
+        flat_c4  = self.pre_align_f4(c4_tok)
+        flat_c8  = self.pre_align_f8(c8_tok)
+        flat_c16 = self.pre_align_f16(c16_tok)
+        flat_c32 = self.pre_align_f32(c32_tok)
 
         F4  = self.align_f4(vit_features, flat_c4)
         F8  = self.align_f8(vit_features, flat_c8)
         F16 = self.align_f16(vit_features, flat_c16)
         F32 = self.align_f32(vit_features, flat_c32)
 
-        return F4, F8, F16, F32
+        # gated fusion (可学习 softmax 权重)
+        weights = torch.softmax(self.fusion_logits, dim=0)  # [4]
+        F4_g  = F4  * weights[0]
+        F8_g  = F8  * weights[1]
+        F16_g = F16 * weights[2]
+        F32_g = F32 * weights[3]
+
+        # 按尺度维度拼接，保留细节
+        fused = torch.cat([F4_g, F8_g, F16_g, F32_g], dim=-1)
+        fused = fused + self.fusion_mlp(self.fusion_ln(fused))
+        self._last_fusion_weights = weights.detach()
+        return fused
+
+
+class PhysicalGuidedAlign(nn.Module):
+    """Use physical prompt tokens to re-align fused visual tokens."""
+
+    def __init__(self, dim: int, num_heads: int = 8, max_phys_tokens: int = 64):
+        super().__init__()
+        self.dim = dim
+        self.max_phys_tokens = max_phys_tokens
+        self.phys_proj = None
+        self.q_norm = nn.LayerNorm(dim)
+        self.kv_norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
+        self.gate = nn.Sequential(
+            nn.LayerNorm(dim * 2),
+            nn.Linear(dim * 2, dim),
+            nn.GELU(),
+            nn.Linear(dim, 1),
+        )
+        self._last_stats = {}
+
+    def _project_phys(self, x: torch.Tensor) -> torch.Tensor:
+        if x.size(-1) == self.dim:
+            return x
+        if self.phys_proj is None:
+            self.phys_proj = nn.Linear(x.size(-1), self.dim).to(device=x.device, dtype=x.dtype)
+        else:
+            self.phys_proj = self.phys_proj.to(device=x.device, dtype=x.dtype)
+        return self.phys_proj(x)
+
+    def forward(self, visual_tokens: torch.Tensor, physical_tokens: Optional[torch.Tensor]) -> torch.Tensor:
+        if physical_tokens is None:
+            return visual_tokens
+        if physical_tokens.numel() == 0:
+            return visual_tokens
+
+        physical_tokens = self._project_phys(physical_tokens)
+        if physical_tokens.size(1) > self.max_phys_tokens:
+            physical_tokens = physical_tokens[:, : self.max_phys_tokens, :]
+
+        q = self.q_norm(physical_tokens)
+        kv = self.kv_norm(visual_tokens)
+        attn_out, attn_w = self.attn(query=q, key=kv, value=kv)
+
+        phys_summary = attn_out.mean(dim=1, keepdim=True).expand(-1, visual_tokens.size(1), -1)
+        gate = torch.sigmoid(self.gate(torch.cat([visual_tokens, phys_summary], dim=-1)))
+        out = visual_tokens + gate * phys_summary
+
+        with torch.no_grad():
+            entropy = -(attn_w.clamp_min(1e-8) * attn_w.clamp_min(1e-8).log()).sum(dim=-1).mean()
+            self._last_stats = {
+                "phys_align_entropy": entropy.detach(),
+                "phys_align_gate_mean": gate.mean().detach(),
+            }
+        return out
 
 class DualVisionEncoder(nn.Module):
     def __init__(self, config: ml_collections.ConfigDict):
@@ -164,13 +247,45 @@ class DualVisionEncoder(nn.Module):
         # Projection heads (lazy init)
         self.local_proj = None
         self.fusion_proj = None
-    
-        vit_dim = 1024 # DINOv3 Large 维度
-        cnn_dims = [128,256,512,1024] # ConvNeXt Large 维度
-        self.hetero_fusion = HeterogeneousFusionBlock(cnn_dims=cnn_dims, vit_dim=vit_dim)
-        
-        # 最终投影至大模型的 alignment_dim (如 768 或 4096)
-        self.final_proj = nn.Linear(vit_dim * 4, self.embedding_dim)
+
+        self.physical_align_heads = int(rgb_cfg.get("physical_align_heads", 8))
+        self.physical_align_max_tokens = int(rgb_cfg.get("physical_align_max_tokens", 64))
+        self.vit_dim_cfg = int(rgb_cfg.get("vit_dim", 0)) or None
+        cnn_dims_cfg = rgb_cfg.get("cnn_dims", None)
+        self.cnn_dims_cfg = [int(v) for v in cnn_dims_cfg] if cnn_dims_cfg else None
+
+        self.hetero_fusion = None
+        self.physical_guided_align = None
+        self.final_proj = None
+        self._fusion_vit_dim = None
+        self._fusion_cnn_dims = None
+
+        vit_dim_guess = self.vit_dim_cfg or self._infer_global_dim()
+        cnn_dims_guess = self.cnn_dims_cfg or self._infer_local_dims()
+        if vit_dim_guess is not None and cnn_dims_guess is not None and len(cnn_dims_guess) >= 4:
+            self._build_alignment_modules(
+                vit_dim=vit_dim_guess,
+                cnn_dims=cnn_dims_guess[:4],
+                device=next(self.global_encoder.parameters()).device,
+                dtype=next(self.global_encoder.parameters()).dtype,
+            )
+
+    def _add_2d_sincos_pos_embed(self, x: torch.Tensor, h: int, w: int):
+        """x: [B, H*W, C] add 2D sine-cos position."""
+        device, dtype = x.device, x.dtype
+        c = x.shape[-1]
+        y, x_coord = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device), indexing='ij')
+        omega = torch.arange(c // 4, device=device, dtype=dtype) / (c // 4)
+        omega = 1. / (10000 ** (omega / (c // 4)))
+        y = y.reshape(-1, 1) * omega
+        x_coord = x_coord.reshape(-1, 1) * omega
+        pos = torch.cat([torch.sin(y), torch.cos(y), torch.sin(x_coord), torch.cos(x_coord)], dim=1)  # [H*W, C]
+        if pos.shape[1] < c:
+            pad = torch.zeros((pos.shape[0], c - pos.shape[1]), device=device, dtype=dtype)
+            pos = torch.cat([pos, pad], dim=1)
+        pos = pos[:, :c]
+        x = x + pos.unsqueeze(0)
+        return x
 
     def _map_dino_name(self, name: str) -> str:
         mapping = {
@@ -342,6 +457,82 @@ class DualVisionEncoder(nn.Module):
                     attn.forward = rope_forward
         except Exception as e:
             warnings.warn(f"Failed to enable RoPE: {e}")
+
+    def _infer_global_dim(self) -> Optional[int]:
+        for attr in ("num_features", "embed_dim", "hidden_dim"):
+            value = getattr(self.global_encoder, attr, None)
+            if isinstance(value, int) and value > 0:
+                return value
+        return None
+
+    def _infer_local_dims(self) -> Optional[list]:
+        if self.local_source == "dino":
+            feature_info = getattr(self.local_encoder, "feature_info", None)
+            if feature_info is not None and hasattr(feature_info, "channels"):
+                channels = feature_info.channels()
+                if channels:
+                    return [int(c) for c in channels[:4]]
+        local_dim = getattr(self.local_encoder, "num_features", None)
+        if isinstance(local_dim, int) and local_dim > 0:
+            return [local_dim, local_dim, local_dim, local_dim]
+        return None
+
+    def _build_alignment_modules(self, vit_dim: int, cnn_dims: list, device: torch.device, dtype: torch.dtype) -> None:
+        vit_dim = int(vit_dim)
+        cnn_dims = [int(c) for c in cnn_dims[:4]]
+        if len(cnn_dims) < 4:
+            raise ValueError("cnn_dims must provide 4 stage dimensions")
+        fused_dim = vit_dim * 4
+
+        self.hetero_fusion = HeterogeneousFusionBlock(cnn_dims=cnn_dims, vit_dim=vit_dim).to(device=device, dtype=dtype)
+        self.physical_guided_align = PhysicalGuidedAlign(
+            dim=fused_dim,
+            num_heads=self.physical_align_heads,
+            max_phys_tokens=self.physical_align_max_tokens,
+        ).to(device=device, dtype=dtype)
+        self.final_proj = nn.Linear(fused_dim, self.embedding_dim).to(device=device, dtype=dtype)
+        self._fusion_vit_dim = vit_dim
+        self._fusion_cnn_dims = cnn_dims
+
+    def _ensure_alignment_modules(self, z_vit: torch.Tensor, l_feats_raw) -> None:
+        inferred_vit_dim = z_vit.shape[-1]
+        inferred_cnn_dims = [int(f.shape[1]) for f in l_feats_raw[:4]]
+        target_vit_dim = self.vit_dim_cfg or inferred_vit_dim
+        target_cnn_dims = self.cnn_dims_cfg or inferred_cnn_dims
+
+        if self.vit_dim_cfg is not None and self.vit_dim_cfg != inferred_vit_dim:
+            warnings.warn(
+                f"Configured rgb_vision.vit_dim={self.vit_dim_cfg} mismatches backbone output {inferred_vit_dim}; "
+                f"falling back to inferred dim."
+            )
+            target_vit_dim = inferred_vit_dim
+
+        if self.cnn_dims_cfg is not None and list(self.cnn_dims_cfg[:4]) != list(inferred_cnn_dims[:4]):
+            warnings.warn(
+                f"Configured rgb_vision.cnn_dims={self.cnn_dims_cfg[:4]} mismatches backbone output {inferred_cnn_dims[:4]}; "
+                f"falling back to inferred dims."
+            )
+            target_cnn_dims = inferred_cnn_dims
+
+        device = z_vit.device
+        dtype = z_vit.dtype
+        need_rebuild = self.hetero_fusion is None or self.final_proj is None or self.physical_guided_align is None
+        if not need_rebuild:
+            if self._fusion_vit_dim != target_vit_dim or self._fusion_cnn_dims != target_cnn_dims[:4]:
+                warnings.warn(
+                    f"Rebuilding fusion modules due to dim change: "
+                    f"vit {self._fusion_vit_dim}->{target_vit_dim}, "
+                    f"cnn {self._fusion_cnn_dims}->{target_cnn_dims[:4]}"
+                )
+                need_rebuild = True
+
+        if need_rebuild:
+            self._build_alignment_modules(target_vit_dim, target_cnn_dims, device=device, dtype=dtype)
+            return
+
+        self.hetero_fusion = self.hetero_fusion.to(device=device, dtype=dtype)
+        self.physical_guided_align = self.physical_guided_align.to(device=device, dtype=dtype)
+        self.final_proj = self.final_proj.to(device=device, dtype=dtype)
 
     def _ensure_fusion_proj(self, in_channels: int) -> None:
         if self.fusion_proj is None:
@@ -518,45 +709,50 @@ class DualVisionEncoder(nn.Module):
         pixel_values = x["rgb"]
         return self.encode(pixel_values)
 
-    def encode_with_spatial(self, x):
-    pixel_values = F.interpolate(x, size=self.input_size, mode="bilinear", align_corners=False)
-    
-    # 1. 提取全局低频特征
-    g_grid = self._get_global_grid(pixel_values)  # [B, 1024, 14, 14]
-    z_vit = g_grid.flatten(2).transpose(1, 2)      # [B, 196, 1024]
-    
-    # 2. 提取局部金字塔特征
-    l_feats_raw = self._get_local_pyramid_raw(pixel_values)  # list of 4 tensors
-    
-    # 3. 分别处理
-    # stage1 (56x56) -> 交叉注意力 -> 196x1024
-    flat_c4 = l_feats_raw[0].flatten(2).transpose(1, 2)  # [B, 3136, 128]
-    F4 = self.align_f4(z_vit, flat_c4)                   # [B, 196, 1024]
-    
-    # stage2 (28x28) 保留原始 token，不经过交叉注意力
-    flat_c8 = l_feats_raw[1].flatten(2).transpose(1, 2)  # [B, 784, 256]
-    # 投影到 3072 维
-    if not hasattr(self, 'proj_stage2'):
-        self.proj_stage2 = nn.Linear(256, 3072).to(flat_c8.device)
-    F8_raw = self.proj_stage2(flat_c8)                   # [B, 784, 3072]
-    
-    # stage3 (14x14) -> 交叉注意力 -> 196x1024
-    flat_c16 = l_feats_raw[2].flatten(2).transpose(1, 2)  # [B, 196, 512]
-    F16 = self.align_f16(z_vit, flat_c16)                 # [B, 196, 1024]
-    
-    # stage4 (7x7) -> 交叉注意力 -> 196x1024
-    flat_c32 = l_feats_raw[3].flatten(2).transpose(1, 2)  # [B, 49, 1024]
-    F32 = self.align_f32(z_vit, flat_c32)                 # [B, 196, 1024]
-    
-    # 4. 特征维度拼接 stage1,3,4
-    F_other = torch.cat([F4, F16, F32], dim=-1)  # [B, 196, 3072]
-    
-    # 5. 序列维度拼接
-    visual_tokens = torch.cat([F_other, F8_raw], dim=1)  # [B, 196+784=980, 3072]
-    
-    # 6. 最终投影到 alignment_dim
-    if not hasattr(self, 'final_proj'):
-        self.final_proj = nn.Linear(3072, self.embedding_dim).to(visual_tokens.device)
-    seq = self.final_proj(visual_tokens)  # [B, 980, embedding_dim]
-    
-    return seq, g_grid, (F4, F8_raw, F16, F32)
+    def encode_with_spatial(
+        self,
+        x: torch.Tensor,
+        physical_prompt_embs: Optional[torch.Tensor] = None,
+    ):
+        pixel_values = F.interpolate(x, size=self.input_size, mode="bilinear", align_corners=False)
+
+        # 1) 全局低频特征
+        g_grid = self._get_global_grid(pixel_values)  # [B, C, H, W]
+        z_vit = g_grid.flatten(2).transpose(1, 2)  # [B, N, C]
+
+        # 2) 局部金字塔特征（原始分辨率保留给 physics decoder）
+        l_feats_raw = self._get_local_pyramid_raw(pixel_values)
+        if len(l_feats_raw) == 3:
+            # openclip 分支仅 3 层时补一层低分辨率特征
+            l_feats_raw = list(l_feats_raw) + [F.avg_pool2d(l_feats_raw[-1], kernel_size=2, stride=2)]
+
+        self._ensure_alignment_modules(z_vit, l_feats_raw)
+
+        # 3) 每层展平 + 2D 位置编码
+        tokens = []
+        for feat in l_feats_raw[:4]:
+            b, c, h, w = feat.shape
+            tok = feat.flatten(2).transpose(1, 2)
+            tok = self._add_2d_sincos_pos_embed(tok, h=h, w=w)
+            tokens.append(tok)
+        flat_c4, flat_c8, flat_c16, flat_c32 = tokens
+
+        # 4) 异构跨频域融合
+        fused = self.hetero_fusion(z_vit, (flat_c4, flat_c8, flat_c16, flat_c32))
+
+        # 5) 物理提示引导对齐（轻量 cross-attn）
+        fused = self.physical_guided_align(fused, physical_prompt_embs)
+
+        # 6) 投影到 alignment_dim
+        seq = self.final_proj(fused)
+        return seq, g_grid, tuple(l_feats_raw[:4])
+
+    def get_alignment_stats(self) -> Dict[str, torch.Tensor]:
+        stats = {}
+        if self.hetero_fusion is not None and hasattr(self.hetero_fusion, "_last_fusion_weights"):
+            w = self.hetero_fusion._last_fusion_weights
+            for i, v in enumerate(w):
+                stats[f"fusion_scale_{i}_weight"] = v
+        if self.physical_guided_align is not None and hasattr(self.physical_guided_align, "_last_stats"):
+            stats.update(self.physical_guided_align._last_stats)
+        return stats
