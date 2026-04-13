@@ -139,6 +139,7 @@ def run() -> None:
         include_context=True,
         adapter_cfg={"enable": False},
         top_k=2,
+        text_embed_dim=64,
     )
     x = torch.randn(bsz, 32, 8, 8)
     seg_out = seg(

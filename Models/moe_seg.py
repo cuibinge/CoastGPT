@@ -237,6 +237,7 @@ class AquacultureSegMOE(nn.Module):
         top_k: int = 0,
         use_generic_experts: bool = False,
         hard_topk_inference: bool = True,
+        text_embed_dim: Optional[int] = None,
     ):
         super().__init__()
         self.num_classes = num_classes
@@ -296,13 +297,15 @@ class AquacultureSegMOE(nn.Module):
         # 门控网络（专家数动态）
         self.gate = GatingNetwork(ch_in, num_experts=len(self.experts))
         router_hid = max(32, ch_in // 2)
+        if text_embed_dim is not None:
+            text_embed_dim = int(text_embed_dim)
         self.task_text_router = nn.Sequential(
-            nn.LazyLinear(router_hid),
+            nn.Linear(text_embed_dim, router_hid) if text_embed_dim is not None else nn.LazyLinear(router_hid),
             nn.GELU(),
             nn.Linear(router_hid, len(self.experts)),
         )
         self.element_text_router = nn.Sequential(
-            nn.LazyLinear(router_hid),
+            nn.Linear(text_embed_dim, router_hid) if text_embed_dim is not None else nn.LazyLinear(router_hid),
             nn.GELU(),
             nn.Linear(router_hid, len(self.experts)),
         )

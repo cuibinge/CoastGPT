@@ -35,13 +35,39 @@ from Models import (
 )
 from . import conversation as conversation_lib
 from .constants import ELEMENT2ID, TASK2ID
-import torch_npu
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 _SHARD_SHUFFLE_SIZE = 2000
 _SHARD_SHUFFLE_INITIAL = 500
 _SAMPLE_SHUFFLE_SIZE = 5000
 _SAMPLE_SHUFFLE_INITIAL = 1000
 logger = logging.getLogger("train")
+_COORD_VALUE_PATTERN = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?")
+
+
+def quantize_normalized_coordinate_text(text: str, max_bin: int = 1000) -> str:
+    """Map normalized numeric coordinates in text to discrete <bin_i> tokens."""
+    if not isinstance(text, str):
+        return text
+    if "<bin_" in text:
+        return text
+
+    def _replace(match: re.Match) -> str:
+        raw = match.group(0)
+        try:
+            value = float(raw)
+        except Exception:
+            return raw
+        if value < 0.0 or value > 1.0:
+            return raw
+        bin_id = int(round(value * max_bin))
+        bin_id = max(0, min(max_bin, bin_id))
+        return f"<bin_{bin_id}>"
+
+    return _COORD_VALUE_PATTERN.sub(_replace, text)
 
 
 def valid_path(path: Union[Path, str]) -> bool:
@@ -387,6 +413,10 @@ class CaptionDatasetVQA(CaptionDataset):
     def __init__(self, tokenizer: transformers.PreTrainedTokenizer, **kwargs):
         self.tune_im_start = kwargs.pop("tune_im_start", False)
         prompt_type = kwargs.pop("prompt_type", "llava_llama_2")
+        # Stage-1 caption/VQA dataset does not use coordinate binning, but
+        # build_loader may pass this key from config; swallow it to avoid
+        # passing unknown kwargs into CaptionDataset.__init__.
+        kwargs.pop("coord_bins", None)
         conversation_lib.default_conversation = conversation_lib.conv_templates[prompt_type]
         self.tokenizer = tokenizer
 
@@ -432,8 +462,85 @@ class InstructDataset(CaptionDataset):
         conversation_lib.default_conversation = conversation_lib.conv_templates[prompt_type]
         self.tokenizer = tokenizer
         self.crop_size = crop_size
+        coord_bins_cfg = kwargs.pop("coord_bins", {})
+        if hasattr(coord_bins_cfg, "to_dict"):
+            coord_bins_cfg = coord_bins_cfg.to_dict()
+        self.coord_bins_enable = bool(coord_bins_cfg.get("enable", False))
+        self.coord_bins_max = int(coord_bins_cfg.get("max_bin", 1000))
+        if self.coord_bins_max < 1:
+            self.coord_bins_max = 1000
 
         super().__init__(**kwargs)
+
+    def _maybe_quantize_vg_answer(self, answer):
+        if not self.coord_bins_enable:
+            return answer
+        return quantize_normalized_coordinate_text(answer, self.coord_bins_max)
+
+    @staticmethod
+    def _resolve_image_path(img_dir: Path, item: Dict):
+        if "name" in item:
+            raw_name = str(item["name"])
+        else:
+            raw_name = item.get("filename", "")
+            if isinstance(raw_name, list):
+                raw_name = raw_name[0] if raw_name else ""
+            raw_name = str(raw_name)
+        if not raw_name:
+            return None
+
+        lower_name = raw_name.lower()
+        has_img_ext = lower_name.endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
+        candidates = [img_dir / raw_name]
+        if not has_img_ext:
+            for ext in (".png", ".jpg", ".jpeg", ".tif", ".tiff"):
+                candidates.append(img_dir / f"{raw_name}{ext}")
+
+        for candidate in candidates:
+            if valid_path(candidate):
+                return candidate
+        return None
+
+    @staticmethod
+    def _pick_caption_from_feature(feature: Dict) -> str:
+        props = feature.get("properties", {}) if isinstance(feature, dict) else {}
+        for key in ("caption1", "caption2", "caption3"):
+            value = props.get(key, "")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    @staticmethod
+    def _infer_element_hint(text: str) -> str:
+        text_lower = text.lower()
+        for kw in (
+            "coastline",
+            "shoreline",
+            "tidal flat",
+            "mudflat",
+            "mariculture",
+            "aquaculture",
+            "mangrove",
+            "wind turbine",
+        ):
+            if kw in text_lower:
+                return kw
+        return "coastline"
+
+    def _build_auto_conv_for_feature(self, feature: Dict, sample_idx: int):
+        answer = self._pick_caption_from_feature(feature)
+        if not answer:
+            return None
+        element_hint = self._infer_element_hint(answer)
+        if sample_idx % 2 == 0:
+            question = (
+                f"Describe the image and summarize key {element_hint} related coastal elements."
+            )
+        else:
+            question = (
+                f"Extract the {element_hint} related targets from the image and give a concise summary."
+            )
+        return [{"Question": question, "Answer": answer}]
 
     def post_process(self):
         new_cap_list = []
@@ -494,32 +601,40 @@ class InstructDataset(CaptionDataset):
 
             dataset_name = self.json_dir[i].stem
             for item in data:
+                conv_data = item.get("conv", None)
+                img_path = None
                 if dataset_name.endswith("RSVG"):
                     img_path = self.img_dir[i] / item["img"]
-                    item["conv"] = dict(Question=item["question"], Answer=item["answer"])
+                    conv_data = dict(
+                        Question=item["question"],
+                        Answer=self._maybe_quantize_vg_answer(item["answer"]),
+                    )
                 elif dataset_name.endswith("DIOR"):
                     img_path = self.img_dir[i] / (item["img"] + ".jpg")
-                    item["conv"] = dict(Question=item["question"], Answer=item["answer"])
+                    conv_data = dict(
+                        Question=item["question"],
+                        Answer=self._maybe_quantize_vg_answer(item["answer"]),
+                    )
                 elif "METERML" in dataset_name:
                     img_path = self.img_dir[i] / item["name"] / "naip.png"
                 elif "OSM" in dataset_name:
                     img_path = self.img_dir[i] / (item["filename"] + ".jpg")
                 else:
-                    if "name" in item.keys():
-                        img_path = self.img_dir[i] / item["name"]
-                    else:
-                        file_name = item["filename"]
-                        if isinstance(file_name, list):
-                            file_name = file_name[0]
-                        img_path = self.img_dir[i] / file_name
+                    img_path = self._resolve_image_path(self.img_dir[i], item)
+                    if conv_data is None:
+                        features = item.get("features", [])
+                        if isinstance(features, list) and len(features) > 0:
+                            conv_data = self._build_auto_conv_for_feature(
+                                features[0], len(self.cap_list)
+                            )
 
-                if valid_path(img_path):
+                if img_path is not None and valid_path(img_path) and conv_data is not None:
                     self.img_list.append(img_path)
-                    if isinstance(item["conv"], List) and len(item["conv"]) > 10:
-                        conv = random.sample(item["conv"], 10)
+                    if isinstance(conv_data, List) and len(conv_data) > 10:
+                        conv = random.sample(conv_data, 10)
                         self.cap_list.append(conv)
                     else:
-                        self.cap_list.append(item["conv"])
+                        self.cap_list.append(conv_data)
 
     def load_image(self, idx: int):
         if idx >= len(self.img_list):
@@ -603,10 +718,38 @@ class InstructDatasetWithTaskId(InstructDataset):
     }
 
     PHYSICAL_FIELD_ALIASES = {
-        "sensor": ["sensor", "platform", "satellite", "instrument", "sat", "source"],
-        "gsd": ["gsd", "ground_sample_distance", "ground_sampling_distance", "spatial_resolution", "resolution", "pixel_size"],
+        "sensor": [
+            "sensor",
+            "sensor_id",
+            "platform",
+            "satellite",
+            "satellite_id",
+            "instrument",
+            "sat",
+            "source",
+        ],
+        "gsd": [
+            "gsd",
+            "ground_sample_distance",
+            "ground_sample_distance_m",
+            "ground_sampling_distance",
+            "spatial_resolution",
+            "resolution",
+            "pixel_size",
+        ],
         "band": ["band", "bands", "channel", "channels", "spectral", "spectrum", "modality"],
-        "time": ["time", "timestamp", "date", "acquisition_time", "acquisition_date", "datetime"],
+        "time": [
+            "time",
+            "timestamp",
+            "date",
+            "acquisition_time",
+            "acquisition_date",
+            "datetime",
+            "datetime_local",
+            "temporal_info",
+            "solar_term",
+            "part_of_day",
+        ],
     }
 
     def __init__(self, **kwargs):
@@ -676,6 +819,65 @@ class InstructDatasetWithTaskId(InstructDataset):
         return meta
 
     @staticmethod
+    def _resolve_image_path(img_dir: Path, item: Dict):
+        if "name" in item:
+            raw_name = str(item["name"])
+        else:
+            raw_name = item.get("filename", "")
+            if isinstance(raw_name, list):
+                raw_name = raw_name[0] if raw_name else ""
+            raw_name = str(raw_name)
+        if not raw_name:
+            return None
+
+        lower_name = raw_name.lower()
+        has_img_ext = lower_name.endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
+        candidates = [img_dir / raw_name]
+        if not has_img_ext:
+            for ext in (".png", ".jpg", ".jpeg", ".tif", ".tiff"):
+                candidates.append(img_dir / f"{raw_name}{ext}")
+
+        for candidate in candidates:
+            if valid_path(candidate):
+                return candidate
+        return None
+
+    @staticmethod
+    def _pick_caption_from_feature(feature: Dict) -> str:
+        props = feature.get("properties", {}) if isinstance(feature, dict) else {}
+        for key in ("caption1", "caption2", "caption3"):
+            value = props.get(key, "")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _infer_element_hint(self, text: str) -> str:
+        text_lower = text.lower()
+        for _, keywords in self.ELEMENT_KEYWORDS.items():
+            for keyword in keywords:
+                kw = str(keyword).strip()
+                if not kw:
+                    continue
+                if kw.lower() in text_lower and any(ch.isalpha() for ch in kw):
+                    return kw
+        return "coastline"
+
+    def _build_auto_conv_for_feature(self, feature: Dict, sample_idx: int):
+        answer = self._pick_caption_from_feature(feature)
+        if not answer:
+            return None
+        element_hint = self._infer_element_hint(answer)
+        if sample_idx % 2 == 0:
+            question = (
+                f"Describe the image and summarize key {element_hint} related coastal elements."
+            )
+        else:
+            question = (
+                f"Extract the {element_hint} related targets from the image and give a concise summary."
+            )
+        return [{"Question": question, "Answer": answer}]
+
+    @staticmethod
     def _normalize_time_str(time_str: str) -> str:
         if not time_str:
             return ""
@@ -714,8 +916,74 @@ class InstructDatasetWithTaskId(InstructDataset):
     def _default_element_text() -> str:
         return "无"
 
+    @staticmethod
+    def _task_name_from_id(task_id: int) -> str:
+        for name, idx in TASK2ID.items():
+            if idx == task_id:
+                return name
+        return next(iter(TASK2ID.keys()))
+
+    @staticmethod
+    def _element_name_from_id(element_id: int) -> str:
+        for name, idx in ELEMENT2ID.items():
+            if idx == element_id:
+                return name
+        return next(iter(ELEMENT2ID.keys()))
+
+    @staticmethod
+    def _extract_free_element_text(text: str) -> str:
+        if not isinstance(text, str) or not text:
+            return ""
+        text_lower = re.sub(r"\[[a-z0-9_]+\]", " ", text.lower())
+        patterns = [
+            r"(?:find|locate|detect|identify|segment|extract)\s+(?:a|an|the)?\s*([a-z][a-z0-9 -]{2,64})",
+            r"(?:about|of|for)\s+(?:the|a|an)?\s*([a-z][a-z0-9 -]{2,64})",
+        ]
+        stop_terms = {
+            "image",
+            "scene",
+            "picture",
+            "photo",
+            "target",
+            "object",
+            "area",
+            "region",
+            "class",
+            "category",
+            "dimensions",
+            "following object",
+        }
+        for pattern in patterns:
+            match = re.search(pattern, text_lower)
+            if not match:
+                continue
+            candidate = match.group(1).strip(" .,;:!?\"'()[]{}")
+            candidate = re.split(r",|\.|;|\?|!|\band\b|\bwith\b|\bthat\b|\bwhich\b", candidate)[0].strip()
+            words = [w for w in candidate.split() if w]
+            if not words:
+                continue
+            candidate = " ".join(words[:4])
+            if candidate in stop_terms or len(candidate) < 3:
+                continue
+            return candidate
+        return ""
+
     def detect_task_text_from_text(self, text: str) -> str:
-        text_lower = text.lower()
+        text_lower = str(text).lower()
+        tag_to_task_id = [
+            ("[cls]", 0),
+            ("[vqa]", 1),
+            ("[qa]", 1),
+            ("[vg]", 2),
+            ("[loc]", 2),
+            ("[cap]", 3),
+            ("[caption]", 3),
+            ("[det]", 4),
+            ("[seg]", 4),
+        ]
+        for tag, task_id in tag_to_task_id:
+            if tag in text_lower:
+                return self._task_name_from_id(task_id)
         for task_name in TASK2ID.keys():
             if task_name.lower() in text_lower:
                 return task_name
@@ -726,7 +994,10 @@ class InstructDatasetWithTaskId(InstructDataset):
         return self._default_task_text()
 
     def detect_element_text_from_text(self, text: str) -> str:
-        text_lower = text.lower()
+        text_lower = str(text).lower()
+        if "[cls]" in text_lower:
+            # Stage-2 classification samples usually contain broad land-cover classes.
+            return self._element_name_from_id(10)
         for element_name in ELEMENT2ID.keys():
             if element_name == "无":
                 continue
@@ -736,6 +1007,9 @@ class InstructDatasetWithTaskId(InstructDataset):
             for keyword in keywords:
                 if keyword in text_lower:
                     return category
+        free_element = self._extract_free_element_text(text)
+        if free_element:
+            return free_element
         return self._default_element_text()
 
     def detect_task_from_text(self, text: str) -> int:
@@ -791,7 +1065,8 @@ class InstructDatasetWithTaskId(InstructDataset):
                     self.cap_list.append(conv)
                     self.sample_weight.append(self.WEIGHT_DICT["geosignal"])
                     task_text = self.detect_task_text_from_text(question)
-                    element_text = self.detect_element_text_from_text(question)
+                    detect_text = f"{question} {item.get('output', '')}"
+                    element_text = self.detect_element_text_from_text(detect_text)
                     self.task_texts.append(task_text)
                     self.element_texts.append(element_text)
                     self.task_ids.append(TASK2ID.get(task_text, self._default_task_id()))
@@ -816,32 +1091,41 @@ class InstructDatasetWithTaskId(InstructDataset):
 
             dataset_name = self.json_dir[i].stem
             for item in data:
+                conv_data = item.get("conv", None)
+                img_path = None
+
                 if dataset_name.endswith("RSVG"):
                     img_path = self.img_dir[i] / item["img"]
-                    item["conv"] = dict(Question=item["question"], Answer=item["answer"])
+                    conv_data = dict(
+                        Question=item["question"],
+                        Answer=self._maybe_quantize_vg_answer(item["answer"]),
+                    )
                 elif dataset_name.endswith("DIOR"):
                     img_path = self.img_dir[i] / (item["img"] + ".jpg")
-                    item["conv"] = dict(Question=item["question"], Answer=item["answer"])
+                    conv_data = dict(
+                        Question=item["question"],
+                        Answer=self._maybe_quantize_vg_answer(item["answer"]),
+                    )
                 elif "METERML" in dataset_name:
                     img_path = self.img_dir[i] / item["name"] / "naip.png"
                 elif "OSM" in dataset_name:
                     img_path = self.img_dir[i] / (item["filename"] + ".jpg")
                 else:
-                    if "name" in item.keys():
-                        img_path = self.img_dir[i] / item["name"]
-                    else:
-                        file_name = item["filename"]
-                        if isinstance(file_name, list):
-                            file_name = file_name[0]
-                        img_path = self.img_dir[i] / file_name
+                    img_path = self._resolve_image_path(self.img_dir[i], item)
+                    if conv_data is None:
+                        features = item.get("features", [])
+                        if isinstance(features, list) and len(features) > 0:
+                            conv_data = self._build_auto_conv_for_feature(
+                                features[0], len(self.cap_list)
+                            )
 
-                if valid_path(img_path):
+                if img_path is not None and valid_path(img_path) and conv_data is not None:
                     self.img_list.append(img_path)
-                    if isinstance(item["conv"], List) and len(item["conv"]) > 10:
-                        conv = random.sample(item["conv"], 10)
+                    if isinstance(conv_data, List) and len(conv_data) > 10:
+                        conv = random.sample(conv_data, 10)
                         self.cap_list.append(conv)
                     else:
-                        self.cap_list.append(item["conv"])
+                        self.cap_list.append(conv_data)
 
                     # 检测任务ID和地物类别ID
                     conv_items = self.cap_list[-1]
@@ -849,9 +1133,11 @@ class InstructDatasetWithTaskId(InstructDataset):
                         conv_items = [conv_items]
                     for conv_item in conv_items:
                         if "Question" in conv_item:
-                            question = conv_item["Question"]
+                            question = str(conv_item.get("Question", ""))
+                            answer = str(conv_item.get("Answer", conv_item.get("answer", "")))
+                            detect_text = f"{question} {answer}".strip()
                             task_text = self.detect_task_text_from_text(question)
-                            element_text = self.detect_element_text_from_text(question)
+                            element_text = self.detect_element_text_from_text(detect_text)
                             self.task_texts.append(task_text)
                             self.element_texts.append(element_text)
                             self.task_ids.append(TASK2ID.get(task_text, self._default_task_id()))
@@ -864,7 +1150,18 @@ class InstructDatasetWithTaskId(InstructDataset):
                         self.task_ids.append(self._default_task_id())
                         self.category_ids.append(self._default_element_id())
 
-                    self.sample_phys_meta.append(self._extract_physical_meta(item, dataset_name, img_path))
+                    meta_source = item
+                    features = item.get("features", [])
+                    if isinstance(features, list) and len(features) > 0:
+                        first_feature = features[0]
+                        if isinstance(first_feature, dict):
+                            props = first_feature.get("properties", {})
+                            if isinstance(props, dict):
+                                meta_source = dict(item)
+                                meta_source["properties"] = props
+                    self.sample_phys_meta.append(
+                        self._extract_physical_meta(meta_source, dataset_name, img_path)
+                    )
 
                     process_flag = False
                     for name, weight in self.WEIGHT_DICT.items():
@@ -911,7 +1208,7 @@ def group_by_keys_nothrow(data, keys=base_plus_ext, lcase=True, suffixes=None, h
     :param keys: function that splits the key into key and extension (base_plus_ext)
     :param lcase: convert suffixes to lower case (Default value = True)
     """
-    rrent_sample = None
+    current_sample = None
     for filesample in data:
         assert isinstance(filesample, dict)
         fname, value = filesample["fname"], filesample["data"]

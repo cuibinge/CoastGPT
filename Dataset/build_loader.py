@@ -86,6 +86,8 @@ def build_vlp_loader(
     # 构建VLP数据变换，传递通道数信息
     transform = build_vlp_transform(config, is_train=is_train, num_channels=num_channels)
     logger.info(f"Evaluate data transform:\n{transform}")
+    if hasattr(config, "coord_bins") and "coord_bins" not in kwargs:
+        kwargs["coord_bins"] = config.coord_bins
 
     if is_train and config.stage == 1:
         if "RS5M" in config.data_path:

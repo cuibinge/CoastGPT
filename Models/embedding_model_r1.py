@@ -4,7 +4,10 @@ import torch.nn as nn
 from typing import Dict, Optional
 
 from .common_arch import LayerNorm, LayerNormFp32, MoEProjection, PhysicalPromptEncoder
-import torch_npu  # noqa: F401
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 
 class EmbeddingModel(nn.Module):
@@ -49,6 +52,14 @@ class EmbeddingModel(nn.Module):
             top_k=int(moe_cfg.get("top_k", 2)),
             routing_strategy=str(moe_cfg.get("routing_strategy", "joint")),
             task_expert_ratio=float(moe_cfg.get("task_expert_ratio", 0.5)),
+            aux_balance_coef=float(moe_cfg.get("aux_balance_coef", 1.0)),
+            aux_entropy_coef=float(moe_cfg.get("aux_entropy_coef", 1e-5)),
+            aux_zloss_coef=float(moe_cfg.get("aux_zloss_coef", 1e-5)),
+            aux_task_route_coef=float(moe_cfg.get("aux_task_route_coef", 0.05)),
+            aux_element_route_coef=float(moe_cfg.get("aux_element_route_coef", 0.05)),
+            aux_task_element_orth_coef=float(moe_cfg.get("aux_task_element_orth_coef", 0.01)),
+            route_effect_margin=float(moe_cfg.get("route_effect_margin", 0.05)),
+            route_supervision_temperature=float(moe_cfg.get("route_supervision_temperature", 1.0)),
         )
 
     def _build_physical_prompts(
@@ -149,4 +160,9 @@ class EmbeddingModel(nn.Module):
     def get_gate_stats(self) -> Dict[str, torch.Tensor]:
         if hasattr(self.projection, "get_gate_stats"):
             return self.projection.get_gate_stats()
+        return {}
+
+    def get_last_routing(self) -> Dict[str, object]:
+        if hasattr(self.projection, "get_last_routing"):
+            return self.projection.get_last_routing()
         return {}

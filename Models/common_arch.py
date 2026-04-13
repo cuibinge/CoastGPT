@@ -5,8 +5,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-import torch_npu
 import warnings
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 
 class TextProjHead(nn.Module):
@@ -150,10 +153,16 @@ class AttnPooler(nn.Module):
                 self.num_query // self.stage_num,
             ]
         else:
-            stage1_query, stage2_query, stage3_query = torch.split(
-                query_tokens, self.stage_num, dim=1
-            )
             stage_query_sizes = list(self.stage_num)
+            if len(stage_query_sizes) != 3:
+                raise ValueError(f"stage_num must have 3 parts, got: {stage_query_sizes}")
+            if sum(stage_query_sizes) != self.num_query:
+                # Keep training robust when num_query changes from default 144.
+                even = self.num_query // 3
+                stage_query_sizes = [even, even, self.num_query - 2 * even]
+            stage1_query, stage2_query, stage3_query = torch.split(
+                query_tokens, stage_query_sizes, dim=1
+            )
 
         # 动态切分，兼容拼接了物理特征后长度 L 变长的情况
         L = image_embs.size(1)
@@ -311,6 +320,14 @@ class MoEProjection(nn.Module):
             top_k: int = 2,
             routing_strategy: str = "joint",
             task_expert_ratio: float = 0.5,
+            aux_balance_coef: float = 1.0,
+            aux_entropy_coef: float = 1e-5,
+            aux_zloss_coef: float = 1e-5,
+            aux_task_route_coef: float = 0.05,
+            aux_element_route_coef: float = 0.05,
+            aux_task_element_orth_coef: float = 0.01,
+            route_effect_margin: float = 0.05,
+            route_supervision_temperature: float = 1.0,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -402,11 +419,19 @@ class MoEProjection(nn.Module):
         self.output_gain = nn.Parameter(torch.ones(output_size) * 0.3)
         self.final_norm = RMSNorm(output_size)
 
-        # 5. 辅助损失系数 (负载均衡)
-        self.aux_balance_coef = 1.0
-        self.aux_entropy_coef = 0.00001
-        self.aux_zloss_coef = 0.00001
+        # 5. 辅助损失系数
+        self.aux_balance_coef = float(aux_balance_coef)
+        self.aux_entropy_coef = float(aux_entropy_coef)
+        self.aux_zloss_coef = float(aux_zloss_coef)
+        # 任务/要素语义路由监督：避免路由退化为纯视觉聚类
+        self.aux_task_route_coef = float(aux_task_route_coef)
+        self.aux_element_route_coef = float(aux_element_route_coef)
+        self.aux_task_element_orth_coef = float(aux_task_element_orth_coef)
+        self.route_effect_margin = float(route_effect_margin)
+        self.route_supervision_temperature = float(route_supervision_temperature)
         self._gate_stats = {}
+        self._aux_terms = {}
+        self._last_routing = {}
 
     def _pool_semantic_text(
             self,
@@ -479,6 +504,8 @@ class MoEProjection(nn.Module):
         if isinstance(image_embs, (list, tuple)):
             image_embs = torch.cat(image_embs, dim=1)
         B, L_v, C = image_embs.shape
+        has_task_text = task_text_embs is not None
+        has_element_text = element_text_embs is not None
 
         # ==========================================
         # 1. 任务与要素双驱动的动态门控计算 (Sequence-level Routing)
@@ -550,6 +577,8 @@ class MoEProjection(nn.Module):
         gate_input = torch.cat(gate_parts, dim=-1).float()
 
         # 计算专家倾向性
+        task_logits = None
+        elem_logits = None
         if self.routing_strategy in ("two_stage", "task_then_element") and self.task_gate is not None:
             task_parts = [img_gate, t_embs]
             elem_parts = [img_gate, e_embs]
@@ -571,8 +600,107 @@ class MoEProjection(nn.Module):
             gate_logits[:, self.task_expert_count:] = elem_logits
         else:
             gate_logits = self.gate(self.gate_norm(gate_input))  # [B, num_experts]
+        invalid_gate_ratio = (~torch.isfinite(gate_logits)).float().mean()
+        gate_logits = torch.nan_to_num(gate_logits, nan=0.0, posinf=15.0, neginf=-15.0)
         gate_logits = torch.clamp(gate_logits, min=-15.0, max=15.0)
         gate_weights = torch.softmax(gate_logits, dim=-1)  # [B, num_experts]
+        gate_weights = torch.nan_to_num(
+            gate_weights,
+            nan=1.0 / float(self.num_experts),
+            posinf=1.0,
+            neginf=0.0,
+        )
+        gate_weights = gate_weights / gate_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        # 任务感知路由监督，抑制“只看视觉”的退化
+        task_route_loss = torch.zeros((), device=image_embs.device, dtype=gate_weights.dtype)
+        element_route_loss = torch.zeros((), device=image_embs.device, dtype=gate_weights.dtype)
+        task_route_kl = torch.zeros((), device=image_embs.device, dtype=gate_weights.dtype)
+        element_route_kl = torch.zeros((), device=image_embs.device, dtype=gate_weights.dtype)
+        task_route_effect = torch.zeros((), device=image_embs.device, dtype=gate_weights.dtype)
+        element_route_effect = torch.zeros((), device=image_embs.device, dtype=gate_weights.dtype)
+        task_element_orth = torch.zeros((), device=image_embs.device, dtype=gate_weights.dtype)
+        tau = max(self.route_supervision_temperature, 1e-4)
+
+        if self.training:
+            if self.routing_strategy in ("two_stage", "task_then_element") and self.task_gate is not None:
+                if has_task_text and task_logits is not None:
+                    task_text_only_parts = [torch.zeros_like(img_gate), t_embs]
+                    if self.include_physical_prompt and phy_gate is not None:
+                        task_text_only_parts.append(phy_gate)
+                    task_text_only_input = torch.cat(task_text_only_parts, dim=-1).float()
+                    task_text_only_logits = self.task_gate(self.task_gate_norm(task_text_only_input))
+                    task_route_kl = F.kl_div(
+                        F.log_softmax(task_logits / tau, dim=-1),
+                        F.softmax(task_text_only_logits.detach() / tau, dim=-1),
+                        reduction="batchmean",
+                    ) * (tau * tau)
+                    # Ensure task text has observable routing effect in two-stage mode.
+                    task_no_text_parts = [img_gate, torch.zeros_like(t_embs)]
+                    if self.include_physical_prompt and phy_gate is not None:
+                        task_no_text_parts.append(phy_gate)
+                    task_no_text_input = torch.cat(task_no_text_parts, dim=-1).float()
+                    task_no_text_logits = self.task_gate(self.task_gate_norm(task_no_text_input))
+                    task_text_effect = torch.mean(
+                        torch.abs(task_logits - task_no_text_logits)
+                    )
+                    task_route_effect = F.relu(
+                        gate_weights.new_tensor(self.route_effect_margin) - task_text_effect
+                    )
+                    task_route_loss = task_route_kl + task_route_effect
+
+                if has_element_text and elem_logits is not None:
+                    element_text_only_parts = [torch.zeros_like(img_gate), e_embs]
+                    if self.include_physical_prompt and phy_gate is not None:
+                        element_text_only_parts.append(phy_gate)
+                    element_text_only_input = torch.cat(element_text_only_parts, dim=-1).float()
+                    element_text_only_logits = self.element_gate(self.element_gate_norm(element_text_only_input))
+                    element_route_kl = F.kl_div(
+                        F.log_softmax(elem_logits / tau, dim=-1),
+                        F.softmax(element_text_only_logits.detach() / tau, dim=-1),
+                        reduction="batchmean",
+                    ) * (tau * tau)
+                    # Ensure element text has observable routing effect in two-stage mode.
+                    element_no_text_parts = [img_gate, torch.zeros_like(e_embs)]
+                    if self.include_physical_prompt and phy_gate is not None:
+                        element_no_text_parts.append(phy_gate)
+                    element_no_text_input = torch.cat(element_no_text_parts, dim=-1).float()
+                    element_no_text_logits = self.element_gate(self.element_gate_norm(element_no_text_input))
+                    element_text_effect = torch.mean(
+                        torch.abs(elem_logits - element_no_text_logits)
+                    )
+                    element_route_effect = F.relu(
+                        gate_weights.new_tensor(self.route_effect_margin) - element_text_effect
+                    )
+                    element_route_loss = element_route_kl + element_route_effect
+            else:
+                # joint 路由下，约束任务/要素文本对路由至少产生可观影响
+                if has_task_text:
+                    task_drop_parts = [img_gate, torch.zeros_like(t_embs), e_embs]
+                    if self.include_physical_prompt and phy_gate is not None:
+                        task_drop_parts.append(phy_gate)
+                    task_drop_logits = self.gate(self.gate_norm(torch.cat(task_drop_parts, dim=-1).float()))
+                    task_effect = torch.mean(torch.abs(gate_logits - task_drop_logits))
+                    task_route_loss = F.relu(
+                        gate_weights.new_tensor(self.route_effect_margin) - task_effect
+                    )
+                    task_route_effect = task_route_loss
+                if has_element_text:
+                    element_drop_parts = [img_gate, t_embs, torch.zeros_like(e_embs)]
+                    if self.include_physical_prompt and phy_gate is not None:
+                        element_drop_parts.append(phy_gate)
+                    element_drop_logits = self.gate(self.gate_norm(torch.cat(element_drop_parts, dim=-1).float()))
+                    element_effect = torch.mean(torch.abs(gate_logits - element_drop_logits))
+                    element_route_loss = F.relu(
+                        gate_weights.new_tensor(self.route_effect_margin) - element_effect
+                    )
+                    element_route_effect = element_route_loss
+
+            if has_task_text and has_element_text:
+                # 任务语义与要素语义尽量解耦
+                task_element_orth = torch.mean(
+                    torch.abs(F.cosine_similarity(t_embs.float(), e_embs.float(), dim=-1))
+                ).to(gate_weights.dtype)
 
         # 选取 Top-K 专家
         top_weights, top_indices = torch.topk(gate_weights, self.top_k, dim=-1)  # [B, k]
@@ -580,29 +708,73 @@ class MoEProjection(nn.Module):
         # 权重重归一化
         top_weights = top_weights / (top_weights.sum(dim=-1, keepdim=True) + 1e-9)
 
+        # 记录最近一次前向的路由细节（用于评测脚本可视化）
+        with torch.no_grad():
+            self._last_routing = {
+                "routing_strategy": self.routing_strategy,
+                "task_expert_count": int(self.task_expert_count),
+                "element_expert_count": int(self.element_expert_count),
+                "num_experts": int(self.num_experts),
+                "top_k": int(self.top_k),
+                "visual_token_length": int(L_v),
+                "physical_token_length": int(physical_prompts.size(1)) if physical_prompts is not None else 0,
+                "gate_logits": gate_logits.detach().float().cpu(),
+                "gate_weights": gate_weights.detach().float().cpu(),
+                "top_indices": top_indices.detach().long().cpu(),
+                "top_weights": top_weights.detach().float().cpu(),
+            }
+
         # 记录辅助损失状态
         if self.training:
+            importance_soft = gate_weights.mean(dim=0)
+            balance_loss = self.num_experts * torch.sum(importance_soft * importance_soft)
+            entropy = -torch.mean(torch.sum(gate_weights * torch.log(gate_weights + 1e-6), dim=-1))
+            zloss = torch.mean(torch.logsumexp(gate_logits.float(), dim=-1) ** 2)
+            task_route_loss = torch.nan_to_num(task_route_loss, nan=0.0, posinf=0.0, neginf=0.0)
+            element_route_loss = torch.nan_to_num(element_route_loss, nan=0.0, posinf=0.0, neginf=0.0)
+            task_route_kl = torch.nan_to_num(task_route_kl, nan=0.0, posinf=0.0, neginf=0.0)
+            element_route_kl = torch.nan_to_num(element_route_kl, nan=0.0, posinf=0.0, neginf=0.0)
+            task_route_effect = torch.nan_to_num(task_route_effect, nan=0.0, posinf=0.0, neginf=0.0)
+            element_route_effect = torch.nan_to_num(element_route_effect, nan=0.0, posinf=0.0, neginf=0.0)
+            task_element_orth = torch.nan_to_num(task_element_orth, nan=0.0, posinf=0.0, neginf=0.0)
+            entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
+            zloss = torch.nan_to_num(zloss, nan=0.0, posinf=0.0, neginf=0.0)
+
+            self._aux_terms = {
+                "balance": balance_loss,
+                "entropy": entropy,
+                "zloss": zloss,
+                "task_route": task_route_loss,
+                "element_route": element_route_loss,
+                "task_element_orth": task_element_orth,
+            }
+
             with torch.no_grad():
-                importance = gate_weights.mean(dim=0)
                 top1_indices = top_indices[:, 0]
                 load = torch.zeros(self.num_experts, device=image_embs.device, dtype=torch.float32)
                 for i in range(self.num_experts):
                     load[i] = (top1_indices == i).float().mean()
-
-                entropy = -torch.mean(torch.sum(gate_weights * torch.log(gate_weights + 1e-6), dim=-1))
-                zloss = torch.mean(torch.logsumexp(gate_logits.float(), dim=-1) ** 2)
-
-            self._gate_stats = {
-                "importance": importance,
-                "load": load,
-                "entropy": entropy,
-                "zloss": zloss,
-            }
+                self._gate_stats = {
+                    "importance": importance_soft.detach(),
+                    "load": load,
+                    "entropy": entropy.detach(),
+                    "zloss": zloss.detach(),
+                    "invalid_gate_ratio": invalid_gate_ratio.detach(),
+                    "task_route_loss": task_route_loss.detach(),
+                    "element_route_loss": element_route_loss.detach(),
+                    "task_route_kl": task_route_kl.detach(),
+                    "element_route_kl": element_route_kl.detach(),
+                    "task_route_effect": task_route_effect.detach(),
+                    "element_route_effect": element_route_effect.detach(),
+                    "task_element_orth": task_element_orth.detach(),
+                }
             if self.routing_strategy in ("two_stage", "task_then_element") and self.task_expert_count > 0:
                 task_mass = gate_weights[:, :self.task_expert_count].sum(dim=-1).mean()
                 element_mass = gate_weights[:, self.task_expert_count:].sum(dim=-1).mean()
                 self._gate_stats["task_branch_mass"] = task_mass
                 self._gate_stats["element_branch_mass"] = element_mass
+        else:
+            self._aux_terms = {}
 
         # ==========================================
         # 2. 物理先验复用与联合特征构建 (Physical Prior Reuse)
@@ -617,6 +789,9 @@ class MoEProjection(nn.Module):
         # ==========================================
         # 3. 专家分发与投影重采样 (Dispatch & Combine)
         # ==========================================
+        for expert in self.experts:
+            if hasattr(expert, "_last_spatial_attn"):
+                expert._last_spatial_attn = None
         final_output = torch.zeros(B, self.num_query, self.output_size, device=image_embs.device,
                                    dtype=image_embs.dtype)
 
@@ -654,28 +829,47 @@ class MoEProjection(nn.Module):
     def get_gate_stats(self) -> Dict[str, torch.Tensor]:
         return self._gate_stats
 
+    def get_last_routing(self) -> Dict[str, object]:
+        return self._last_routing
+
     def get_aux_loss(self) -> torch.Tensor:
-        """计算负载均衡损失，确保各个专家被均匀激活"""
-        if not self.training or not self._gate_stats:
+        """计算路由辅助损失，确保任务感知与专家均衡。"""
+        if not self.training or not self._aux_terms:
             return torch.tensor(0.0, device=self.gate.weight.device)
 
-        imp = self._gate_stats.get("importance")
-        load = self._gate_stats.get("load")
+        balance_loss = self._aux_terms.get(
+            "balance", torch.tensor(0.0, device=self.gate.weight.device)
+        )
+        entropy_loss = self._aux_terms.get(
+            "entropy", torch.tensor(0.0, device=self.gate.weight.device)
+        )
+        zloss = self._aux_terms.get(
+            "zloss", torch.tensor(0.0, device=self.gate.weight.device)
+        )
+        task_route_loss = self._aux_terms.get(
+            "task_route", torch.tensor(0.0, device=self.gate.weight.device)
+        )
+        element_route_loss = self._aux_terms.get(
+            "element_route", torch.tensor(0.0, device=self.gate.weight.device)
+        )
+        task_element_orth = self._aux_terms.get(
+            "task_element_orth", torch.tensor(0.0, device=self.gate.weight.device)
+        )
 
-        balance_loss = self.num_experts * torch.sum(imp * load)
-        entropy_loss = self._gate_stats.get("entropy", 0.0)
-        zloss = self._gate_stats.get("zloss", 0.0)
-
-        total = (self.aux_balance_coef * balance_loss +
-                 self.aux_entropy_coef * entropy_loss +
-                 self.aux_zloss_coef * zloss)
+        total = (
+            self.aux_balance_coef * balance_loss
+            - self.aux_entropy_coef * entropy_loss
+            + self.aux_zloss_coef * zloss
+            + self.aux_task_route_coef * task_route_loss
+            + self.aux_element_route_coef * element_route_loss
+            + self.aux_task_element_orth_coef * task_element_orth
+        )
+        total = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
 
         return total.to(self.gate.weight.dtype)
 
 
-# ---------------------------------------------------------
-# 以下底层依赖保持你的原版不动，用于保障模型计算不出错
-# ---------------------------------------------------------
+
 
 class PatchDropout(nn.Module):
     def __init__(self, prob, exclude_first_token=True):

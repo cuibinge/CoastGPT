@@ -63,7 +63,7 @@ def _sam_default(pred: torch.Tensor, gt: torch.Tensor, eps: float = 1e-6) -> tor
     return ang.mean()
 
 spectral_loss_sam = getattr(phys, "spectral_loss_sam", _sam_default)
-from .physics_constraints import compute_sar_sigma0_gt
+from .physics_constraints import compute_rte_rrs_gt, compute_sar_sigma0_gt
 from .moe_seg import AquacultureSegMOE, dice_loss
 # 在不支持 NPU 的环境下忽略 torch_npu 导入错误
 try:
@@ -134,6 +134,7 @@ class CoastGPT(nn.Module):
                 top_k=top_k,
                 use_generic_experts=use_generic_experts,
                 hard_topk_inference=hard_topk_inference,
+                text_embed_dim=int(getattr(config.text, "hidden_size", dec_channels)),
             )
             # 损失权重
             self.seg_loss_weight = float(seg_cfg.get("loss_weight", 1.0))
@@ -157,16 +158,36 @@ class CoastGPT(nn.Module):
             结合视觉和语言处理的模型输出
         """
         out = dict()
-        total_loss = 0.0
+        total_loss = None
 
         # 物理提示文本 -> 连续嵌入（若存在）
         physical_prompt_embs = None
         task_text_embs = None
         element_text_embs = None
+        emb_layer = None
         try:
-            emb_layer = self.language.model.get_input_embeddings()
-        except Exception:
+            if hasattr(self.language, "get_text_encoder"):
+                emb_layer = self.language.get_text_encoder().get_input_embeddings()
+            elif hasattr(self.language, "text_encoder"):
+                emb_layer = self.language.text_encoder.get_input_embeddings()
+            elif hasattr(self.language, "model"):
+                emb_layer = self.language.model.get_input_embeddings()
+        except Exception as exc:
             emb_layer = None
+            if not getattr(self, "_warned_semantic_emb_layer", False):
+                logger.warning(
+                    "Failed to get semantic embedding layer for task/element prompts: %s", exc
+                )
+                self._warned_semantic_emb_layer = True
+        if (
+            emb_layer is None
+            and not getattr(self, "_warned_semantic_emb_layer_none", False)
+            and any(data.get(k, None) is not None for k in ("task_text_ids", "element_text_ids", "physical_prompt_ids"))
+        ):
+            logger.warning(
+                "Semantic prompt ids exist in batch, but embedding layer is None; route supervision may be disabled."
+            )
+            self._warned_semantic_emb_layer_none = True
         if emb_layer is not None:
             if "physical_prompt_ids" in data and data["physical_prompt_ids"] is not None:
                 physical_prompt_embs = emb_layer(data["physical_prompt_ids"])
@@ -206,7 +227,9 @@ class CoastGPT(nn.Module):
         output = self.language(data, multimodal_embedding=multimodal_embedding)
 
         text_loss = output
-        total_loss += text_loss
+        if not torch.is_tensor(text_loss):
+            raise RuntimeError(f"language model must return a tensor loss, got {type(text_loss)}")
+        total_loss = text_loss
         out.update({"text_loss": text_loss})
 
         if hasattr(self.multimodal, "get_aux_loss"):
@@ -217,7 +240,7 @@ class CoastGPT(nn.Module):
             # 最好从 config 中读取，这里做个 fallback 默认给 0.01
             mm_aux_weight = getattr(self.config, "mm_moe_aux_weight", 0.01) 
             
-            if mm_aux_loss is not None and mm_aux_loss > 0:
+            if mm_aux_loss is not None:
                 # 累加到总损失中，注意对齐 dtype 防止混合精度报错
                 total_loss += (mm_aux_weight * mm_aux_loss).to(total_loss.dtype)
                 
@@ -238,6 +261,28 @@ class CoastGPT(nn.Module):
                 # 记录路由分布熵
                 if "entropy" in gate_stats:
                     out["mm_moe_gate_entropy"] = gate_stats["entropy"]
+                if "zloss" in gate_stats:
+                    out["mm_moe_gate_zloss"] = gate_stats["zloss"]
+                if "invalid_gate_ratio" in gate_stats:
+                    out["mm_moe_invalid_gate_ratio"] = gate_stats["invalid_gate_ratio"]
+                if "task_route_loss" in gate_stats:
+                    out["mm_moe_task_route_loss"] = gate_stats["task_route_loss"]
+                if "element_route_loss" in gate_stats:
+                    out["mm_moe_element_route_loss"] = gate_stats["element_route_loss"]
+                if "task_route_kl" in gate_stats:
+                    out["mm_moe_task_route_kl"] = gate_stats["task_route_kl"]
+                if "element_route_kl" in gate_stats:
+                    out["mm_moe_element_route_kl"] = gate_stats["element_route_kl"]
+                if "task_route_effect" in gate_stats:
+                    out["mm_moe_task_route_effect"] = gate_stats["task_route_effect"]
+                if "element_route_effect" in gate_stats:
+                    out["mm_moe_element_route_effect"] = gate_stats["element_route_effect"]
+                if "task_element_orth" in gate_stats:
+                    out["mm_moe_task_element_orth"] = gate_stats["task_element_orth"]
+                if "task_branch_mass" in gate_stats:
+                    out["mm_moe_task_branch_mass"] = gate_stats["task_branch_mass"]
+                if "element_branch_mass" in gate_stats:
+                    out["mm_moe_element_branch_mass"] = gate_stats["element_branch_mass"]
 
         # 物理约束与逐像素监督
         if self.physics_enabled and fused_spatial is not None:
@@ -295,10 +340,10 @@ class CoastGPT(nn.Module):
             tv_w = self.physics_tv_weight
             cons_w = self.physics_consistency_weight
             reg_tv = (
-                total_variation_loss(phy_pred["phy_full"]) if tv_w > 0 else torch.tensor(0.0, device=fused_spatial.device, dtype=torch.float32)
+                total_variation_loss(phy_pred["phy_full"]) if tv_w > 0 else fused_spatial.new_zeros((), dtype=torch.float32)
             )
             reg_cons = (
-                consistency_loss_multiscale(phy_pred["phy_full"], phy_pred["phy_s1"], phy_pred["phy_s2"], phy_pred["phy_s3"]) if cons_w > 0 else torch.tensor(0.0, device=fused_spatial.device, dtype=torch.float32)
+                consistency_loss_multiscale(phy_pred["phy_full"], phy_pred["phy_s1"], phy_pred["phy_s2"], phy_pred["phy_s3"]) if cons_w > 0 else fused_spatial.new_zeros((), dtype=torch.float32)
             )
 
             # 监督：支持多尺度与全分辨率
@@ -312,7 +357,8 @@ class CoastGPT(nn.Module):
             if phy_gt is None and bool(getattr(self, "physics_enabled", False)):
                 auto_gt_cfg = bool(self.config.physics.get("auto_gt_from_constraints", False))
                 if auto_gt_cfg:
-                    phy_gt = compute_rte_rrs_gt(data)
+                    rte_coeffs = self.config.physics.get("rte_tsm_coeffs", None)
+                    phy_gt = compute_rte_rrs_gt(data, rte_coeffs)
                     if phy_gt is None:
                         coeffs = self.config.physics.get("sar_sigma0_coeffs", None)
                         phy_gt = compute_sar_sigma0_gt(data, coeffs)
@@ -336,12 +382,12 @@ class CoastGPT(nn.Module):
 
                 # 边缘保持项（仅在全分辨率上）
                 edge_w = self.physics_edge_weight
-                l_edge = edge_preserve_loss(phy_pred["phy_full"], gt_full) if edge_w > 0 else torch.tensor(0.0, device=gt_full.device, dtype=torch.float32)
+                l_edge = edge_preserve_loss(phy_pred["phy_full"], gt_full) if edge_w > 0 else gt_full.new_zeros((), dtype=torch.float32)
 
                 # 光谱损失（需要多通道GT）
                 spec_w = self.physics_spectral_weight
                 spec_l = (
-                    spectral_loss_sam(phy_pred["phy_full"], gt_full) if spec_w > 0 and gt_full.shape[1] > 1 else torch.tensor(0.0, device=gt_full.device, dtype=torch.float32)
+                    spectral_loss_sam(phy_pred["phy_full"], gt_full) if spec_w > 0 and gt_full.shape[1] > 1 else gt_full.new_zeros((), dtype=torch.float32)
                 )
 
                 # 权重汇总
@@ -375,7 +421,9 @@ class CoastGPT(nn.Module):
                 })
 
         # 养殖区分割（MOE）
-        if self.seg_enabled and fused_spatial is not None:
+        has_seg_supervision = ("seg_mask" in data and data["seg_mask"] is not None)
+        run_seg_branch = self.seg_enabled and fused_spatial is not None and (has_seg_supervision or not self.training)
+        if run_seg_branch:
             H, W = data["rgb"].shape[-2], data["rgb"].shape[-1]
             # 可选模态输入：若数据集提供光学/SAR 空间特征，可传入供模态门使用
             modal_inputs = data.get("modal_inputs", None)
@@ -398,7 +446,8 @@ class CoastGPT(nn.Module):
                 element_text_mask=element_text_mask,
             )
             seg_logits = seg_out["logits"]
-            out.update({"seg_logits": seg_logits})
+            if not self.training:
+                out.update({"seg_logits": seg_logits})
             if "task_bias_norm" in seg_out:
                 out["seg_task_bias_norm"] = seg_out["task_bias_norm"]
             if "element_bias_norm" in seg_out:
@@ -425,7 +474,7 @@ class CoastGPT(nn.Module):
                 eps = 1e-8
                 seg_gate_entropy = (-(gate_w * (gate_w + eps).log()).sum(dim=1)).mean()
                 out["seg_gate_entropy"] = seg_gate_entropy
-            if "seg_mask" in data:
+            if has_seg_supervision:
                 target = data["seg_mask"]  # [B,H,W], int64
                 # CrossEntropy
                 ce = F.cross_entropy(seg_logits, target, ignore_index=self.seg_ignore_index)
@@ -435,11 +484,11 @@ class CoastGPT(nn.Module):
                 total_loss += (self.seg_loss_weight * seg_loss).to(text_loss.dtype)
                 out.update({"seg_loss": seg_loss, "seg_ce_loss": ce, "seg_dice_loss": dl})
             # 路由器辅助损失（仅在训练时返回并纳入总损失）
-            if self.training and ("router_aux" in seg_out):
+            if self.training and has_seg_supervision and ("router_aux" in seg_out):
                 aux = seg_out["router_aux"]
                 aux_entropy = aux.get("entropy", None)
                 aux_zloss = aux.get("zloss", None)
-                aux_loss = torch.tensor(0.0, device=seg_logits.device, dtype=seg_logits.dtype)
+                aux_loss = seg_logits.new_zeros(())
                 if aux_entropy is not None and self.seg_router_entropy_coef > 0:
                     aux_loss = aux_loss + self.seg_router_entropy_coef * aux_entropy
                     out["seg_router_entropy"] = aux_entropy
@@ -638,28 +687,44 @@ class CoastGPT(nn.Module):
         # torch.save(ckpt, '/root/shared-nvme/CoastGPT/Checkpoint/test2/checkpoints/iter_1299/test.pt')
 
 
+        def _report_load_result(module_name, incompatible):
+            print(
+                f"After loading {module_name}: Missing: {incompatible.missing_keys}. "
+                f"Unexpected: {incompatible.unexpected_keys}"
+            )
+            if not strict and incompatible.missing_keys:
+                legacy_gate_keys = [
+                    key for key in incompatible.missing_keys
+                    if key.startswith("task_gate") or key.startswith("element_gate")
+                ]
+                if legacy_gate_keys:
+                    print(
+                        "Detected a legacy multimodal checkpoint without two-stage routing gates; "
+                        "the missing gate parameters will keep their current initialization."
+                    )
+
         if any(key.startswith('module') for key in ckpt.keys()):
             # filtered_state_dict = {k: v for k, v in ckpt["module"].items() if k.startswith("multimodal.")}
             filtered_state_dict = {k: v for k, v in ckpt["module"].items() if
                                    k.startswith("multimodal.") or k.startswith("vision.")}
             msg = self.load_state_dict(filtered_state_dict, strict=False)
-            print(f"After loading: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
+            _report_load_result("model", msg)
 
         elif any(key.startswith('vision_ckpt') for key in ckpt.keys()) :
             vision_ckpt = ckpt["vision_ckpt"]
             multimodal_ckpt = ckpt["other_ckpt"]["multimodal_projection"]
-            msg = self.vision.load_state_dict(vision_ckpt)
-            print(f"After loading vision: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
-            msg = self.multimodal.projection.load_state_dict(multimodal_ckpt)
-            print(f"After loading multimodal: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
+            msg = self.vision.load_state_dict(vision_ckpt, strict=strict)
+            _report_load_result("vision", msg)
+            msg = self.multimodal.projection.load_state_dict(multimodal_ckpt, strict=strict)
+            _report_load_result("multimodal", msg)
 
         elif any(key.startswith('rgb_ckpt') for key in ckpt.keys()) :
             vision_ckpt = ckpt["rgb_ckpt"]
             multimodal_ckpt = ckpt["other_ckpt"]["rgb_pooler"]
-            msg = self.vision.load_state_dict(vision_ckpt)
-            print(f"After loading vision: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
-            msg = self.multimodal.projection.load_state_dict(multimodal_ckpt)
-            print(f"After loading multimodal: Missing: {msg.missing_keys}. Unexpected: {msg.unexpected_keys}")
+            msg = self.vision.load_state_dict(vision_ckpt, strict=strict)
+            _report_load_result("vision", msg)
+            msg = self.multimodal.projection.load_state_dict(multimodal_ckpt, strict=strict)
+            _report_load_result("multimodal", msg)
         # if "vision" in ckpt:
         #     self.vision.load_state_dict(ckpt["vision"], strict=strict)
         # if "multimodal" in ckpt:
@@ -740,18 +805,20 @@ class CoastGPT(nn.Module):
             if "index" not in name and "id" not in name:
                 buffer.data = buffer.data.to(dtype=compute_dtype)
 
+        text_encoder = self.language.get_text_encoder()
         if freeze_text:
             self.language.eval()  # 将文本编码器设置为评估模式
-            # 冻结输入和输出嵌入的参数
-            for p in self.language.get_text_encoder().get_input_embeddings().parameters():
+            # Stage-1 需要冻结完整语言分支，而不只是词嵌入层
+            for p in self.language.parameters():
                 p.requires_grad = False
-            for p in self.language.get_text_encoder().get_output_embeddings().parameters():
+            for p in text_encoder.parameters():
                 p.requires_grad = False
         else:
-            # 即使不冻结文本，仍然冻结输入和输出嵌入（可能是特定设计选择）
-            for p in self.language.get_text_encoder().get_input_embeddings().parameters():
+            self.language.train()
+            # 即使训练文本分支，也保持 token 输入/输出嵌入冻结，避免词表漂移
+            for p in text_encoder.get_input_embeddings().parameters():
                 p.requires_grad = False
-            for p in self.language.get_text_encoder().get_output_embeddings().parameters():
+            for p in text_encoder.get_output_embeddings().parameters():
                 p.requires_grad = False
 
         # 多模态相关参数是否训练
@@ -781,7 +848,7 @@ class CoastGPT(nn.Module):
 
         if tune_im_start and freeze_text:
             # 如果 tune_im_start 为 True 且文本被冻结，则解冻输入嵌入
-            for p in self.language.get_text_encoder().get_input_embeddings().parameters():
+            for p in text_encoder.get_input_embeddings().parameters():
                 p.requires_grad = True
             # 输出嵌入保持冻结状态（已在前面设置，此处无需重复）
 

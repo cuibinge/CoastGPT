@@ -37,6 +37,11 @@ from .utils import (
 )
 
 logger = logging.getLogger("train")
+try:
+    import torch_npu  # noqa: F401
+    HAS_TORCH_NPU = True
+except Exception:
+    HAS_TORCH_NPU = False
 
 
 class Trainer:
@@ -97,17 +102,29 @@ class Trainer:
         self.deepspeed = deepspeed
 
         self.dtype = dtype
+        dist_local_rank = (
+            int(os.environ.get("LOCAL_RANK", get_rank())) if is_distributed else None
+        )
 
         if accelerator == "cpu":
             self.device = torch.device(accelerator)
             self.autocast_type = "cpu"
         elif accelerator == "gpu":
-            assert gpus is not None, "if using gpu, please choose the gpu index"
             if is_distributed:
-                self.device = torch.device(get_rank())
+                self.device = torch.device("cuda", dist_local_rank)
             else:
-                self.device = torch.device(gpus)
+                gpu_id = 0 if gpus is None else gpus
+                self.device = torch.device("cuda", gpu_id)
             self.autocast_type = "cuda"
+        elif accelerator == "npu":
+            if not HAS_TORCH_NPU:
+                raise RuntimeError("accelerator='npu' requested, but torch_npu is not available.")
+            if is_distributed:
+                self.device = torch.device("npu", dist_local_rank)
+            else:
+                npu_id = 0 if gpus is None else gpus
+                self.device = torch.device("npu", npu_id)
+            self.autocast_type = "npu"
         elif accelerator == "mps":
             self.device = torch.device("mps")
             self.autocast_type = "cpu"
@@ -226,7 +243,7 @@ class Trainer:
             if self._is_distributed:
                 self.model = nn.SyncBatchNorm.convert_sync_batchnorm(self.model)
                 self.model = nn.parallel.DistributedDataParallel(
-                    self.model, device_ids=[get_rank()]
+                    self.model, device_ids=[self.device.index]
                 )
 
         logger.info("Using %s for training " % self.device)
@@ -300,6 +317,16 @@ class Trainer:
             if isinstance(self.model.language.text_encoder, PeftModel):
                 text_path = os.path.join(self.ckpt_dir, "TextLoRA")
                 self.model.language.text_encoder.save_pretrained(text_path)
+            # 汇总所有 NPU 分片，仅在 rank 0 保存一个合并后的完整权重文件
+            if is_main_process():
+                consolidated_path = osp.join(self.ckpt_dir, f"{file_name}_consolidated.pt")
+                inner_model = self.model.module if hasattr(self.model, "module") else self.model
+                if hasattr(inner_model, "custom_save_checkpoint"):
+                    state_dict = inner_model.custom_save_checkpoint(self.ckpt_dir)
+                else:
+                    state_dict = inner_model.state_dict()
+                torch.save(state_dict, consolidated_path)
+                logger.info(f"Saved consolidated (all-NPU-merged) checkpoint to {consolidated_path}")
         else:
             torch.save(data, file_path)
 
@@ -396,7 +423,19 @@ class Trainer:
         iter_time: float,
         lr: float,
     ) -> None:
-        metrics_dict = {k: v.detach().cpu().item() for k, v in loss_dict.items()}
+        metrics_dict = {}
+        for k, v in loss_dict.items():
+            if torch.is_tensor(v):
+                v_detached = v.detach()
+                if v_detached.numel() == 1:
+                    metrics_dict[k] = v_detached.cpu().item()
+                else:
+                    # Keep logging robust when model returns non-scalar tensors.
+                    v_float = v_detached.float()
+                    metrics_dict[f"{k}_mean"] = v_float.mean().cpu().item()
+                    metrics_dict[f"{k}_std"] = v_float.std(unbiased=False).cpu().item()
+            elif isinstance(v, (int, float, np.integer, np.floating)):
+                metrics_dict[k] = float(v)
         metrics_dict.update(data_time=data_time, iter_time=iter_time)
         # gather metrics among all workers for logging
         all_metrics_dict = gather(metrics_dict)
@@ -463,6 +502,12 @@ class Trainer:
 
         if isinstance(self.loss_dict, torch.Tensor):
             self.loss_dict = {"total_loss": self.loss_dict}
+        if "total_loss" in self.loss_dict and torch.is_tensor(self.loss_dict["total_loss"]):
+            if not self.loss_dict["total_loss"].requires_grad:
+                raise RuntimeError(
+                    "total_loss does not require grad. "
+                    "This usually means no trainable parameter participates in the current forward."
+                )
 
         ###########################
         # 3. Log Metrics
@@ -491,15 +536,18 @@ class Trainer:
         self._call_hooks("after_train")
 
     def put_input_to_device(self, modal_input: Union[torch.Tensor, List, Dict, Tuple]):
-        if isinstance(modal_input, tuple):
-            modal_input = tuple([item.to(device=self.device) for item in modal_input])
-        elif isinstance(modal_input, Dict):
-            modal_input = {
-                key: item.to(device=self.device) for key, item in modal_input.items()
-            }
-        else:
-            modal_input = modal_input.to(self.device)
-        return modal_input
+        def _move_to_device(item):
+            if torch.is_tensor(item):
+                return item.to(device=self.device)
+            if isinstance(item, Dict):
+                return {key: _move_to_device(value) for key, value in item.items()}
+            if isinstance(item, list):
+                return [_move_to_device(value) for value in item]
+            if isinstance(item, tuple):
+                return tuple(_move_to_device(value) for value in item)
+            return item
+
+        return _move_to_device(modal_input)
 
     def sub_classes_train(self):
         """

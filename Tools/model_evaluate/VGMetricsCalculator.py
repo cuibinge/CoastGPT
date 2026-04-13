@@ -1,24 +1,42 @@
 """
 该脚本用于对模型视觉定位的预测结果进行评估：
 """
+import argparse
 import json
 import re
+
 import numpy as np
-import argparse
 from sklearn.metrics import average_precision_score
 
-def parse_boxes(s):
-    """解析边界框字符串，支持多个框的情况"""
+_BIN_PATTERN = re.compile(r"<bin_(\d{1,5})>")
+
+
+def _parse_bin_boxes(s, max_bin=1000):
+    ids = [int(x) for x in _BIN_PATTERN.findall(s)]
+    if len(ids) < 4:
+        return []
     boxes = []
-    # 匹配所有方括号内的坐标
+    for i in range(0, len(ids) // 4):
+        b = ids[i * 4 : (i + 1) * 4]
+        coords = [max(0.0, min(float(v), float(max_bin))) / float(max_bin) for v in b]
+        boxes.append(coords)
+    return boxes
+
+
+def parse_boxes(s):
+    """解析边界框字符串，支持 [x1,y1,x2,y2] 与 <bin_i> 两种格式。"""
+    boxes = _parse_bin_boxes(s, max_bin=1000)
+    if boxes:
+        return boxes
+
+    boxes = []
     matches = re.findall(r'\[([^\]]+)\]', s)
     for match in matches:
         try:
-            # 分割坐标字符串并转换为浮点数
             coords = [float(x.strip()) for x in match.split(',')]
             if len(coords) == 4:
                 boxes.append(coords)
-        except:
+        except Exception:
             continue
     return boxes
 

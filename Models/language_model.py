@@ -28,6 +28,7 @@ type_dict = {
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
 }
+COORD_BIN_TOKEN_PREFIX = "<bin_"
 
 
 class CustomLlamaForCausalLM(LlamaForCausalLM):
@@ -78,6 +79,11 @@ class LanguageModel(nn.Module):
         self.tune_im_start = config.tune_im_start
         self.tune_im_patch = config.tune_im_patch
         self.num_query = config.rgb_vision.attn_pooler.num_query
+        coord_bins_cfg = getattr(config, "coord_bins", ml_collections.ConfigDict())
+        self.coord_bins_enable = bool(getattr(coord_bins_cfg, "enable", False))
+        self.coord_bins_max = int(getattr(coord_bins_cfg, "max_bin", 1000))
+        if self.coord_bins_max < 1:
+            self.coord_bins_max = 1000
 
         compute_dtype = type_dict[config.dtype]
         bnb_model_from_pretrained_args = {}
@@ -198,6 +204,22 @@ class LanguageModel(nn.Module):
 
         tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_name)
         tokenizer.pad_token_id = tokenizer.unk_token_id
+
+        if self.coord_bins_enable:
+            bin_tokens = [
+                f"{COORD_BIN_TOKEN_PREFIX}{i}>"
+                for i in range(self.coord_bins_max + 1)
+            ]
+            added_coord_tokens = tokenizer.add_tokens(bin_tokens, special_tokens=False)
+            if added_coord_tokens > 0:
+                self.get_text_encoder().resize_token_embeddings(len(tokenizer))
+                logger.info(
+                    "Added %d coordinate bin tokens: %s0> ... %s%d>",
+                    added_coord_tokens,
+                    COORD_BIN_TOKEN_PREFIX,
+                    COORD_BIN_TOKEN_PREFIX,
+                    self.coord_bins_max,
+                )
 
         if self.tune_im_patch:
             tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)

@@ -1,4 +1,6 @@
 import math
+import os
+import re
 from typing import Dict, Optional, Tuple
 
 import ml_collections
@@ -112,11 +114,21 @@ class HeterogeneousFusionBlock(nn.Module):
 class PhysicalGuidedAlign(nn.Module):
     """Use physical prompt tokens to re-align fused visual tokens."""
 
-    def __init__(self, dim: int, num_heads: int = 8, max_phys_tokens: int = 64):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        max_phys_tokens: int = 64,
+        physical_in_dim: Optional[int] = None,
+    ):
         super().__init__()
         self.dim = dim
         self.max_phys_tokens = max_phys_tokens
-        self.phys_proj = None
+        self.physical_in_dim = int(physical_in_dim) if physical_in_dim is not None else int(dim)
+        if self.physical_in_dim == self.dim:
+            self.phys_proj = nn.Identity()
+        else:
+            self.phys_proj = nn.Linear(self.physical_in_dim, self.dim)
         self.q_norm = nn.LayerNorm(dim)
         self.kv_norm = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
@@ -129,12 +141,11 @@ class PhysicalGuidedAlign(nn.Module):
         self._last_stats = {}
 
     def _project_phys(self, x: torch.Tensor) -> torch.Tensor:
-        if x.size(-1) == self.dim:
-            return x
-        if self.phys_proj is None:
-            self.phys_proj = nn.Linear(x.size(-1), self.dim).to(device=x.device, dtype=x.dtype)
-        else:
-            self.phys_proj = self.phys_proj.to(device=x.device, dtype=x.dtype)
+        if x.size(-1) != self.physical_in_dim:
+            raise ValueError(
+                f"physical token dim {x.size(-1)} mismatches expected {self.physical_in_dim}. "
+                "Set rgb_vision.physical_prompt_dim to match physical prompt embedding dim."
+            )
         return self.phys_proj(x)
 
     def forward(self, visual_tokens: torch.Tensor, physical_tokens: Optional[torch.Tensor]) -> torch.Tensor:
@@ -198,8 +209,17 @@ class DualVisionEncoder(nn.Module):
             # Enable RoPE if available in checkpoint
             self._enable_vit_rope(state)
             missing = self.global_encoder.load_state_dict(state, strict=False)
-            if isinstance(missing, torch.nn.modules.module._IncompatibleKeys):
-                warnings.warn(f"Loaded DINOv3 ViT weights with missing: {missing.missing_keys}, unexpected: {missing.unexpected_keys}")
+            self._log_state_dict_mismatch(
+                model_name="DINOv3 ViT",
+                incompatible=missing,
+                expected_missing_exact={"pos_embed", "head.weight", "head.bias"},
+                expected_unexpected_prefixes=("storage_tokens", "mask_token", "rope_embed", "local_cls_norm"),
+                expected_unexpected_regex=(
+                    r"^blocks\.\d+\.attn\.qkv\.bias_mask$",
+                    r"^blocks\.\d+\.ls1\.gamma$",
+                    r"^blocks\.\d+\.ls2\.gamma$",
+                ),
+            )
         except Exception as e:
             raise RuntimeError(f"Failed to initialize DINOv3 ViT via timm: {e}")
 
@@ -231,8 +251,10 @@ class DualVisionEncoder(nn.Module):
             # Remap common DINO ConvNeXt key patterns to timm ConvNeXt naming to maximize match
             state = self._remap_dino_convnext_to_timm(state)
             missing = self.local_encoder.load_state_dict(state, strict=False)
-            if isinstance(missing, torch.nn.modules.module._IncompatibleKeys):
-                warnings.warn(f"Loaded local ConvNeXt weights with missing: {missing.missing_keys}, unexpected: {missing.unexpected_keys}")
+            self._log_state_dict_mismatch(
+                model_name="DINOv3 ConvNeXt",
+                incompatible=missing,
+            )
         else:
             raise RuntimeError(f"Unknown local_source '{self.local_source}'. Expected 'openclip' or 'dino'.")
 
@@ -250,6 +272,12 @@ class DualVisionEncoder(nn.Module):
 
         self.physical_align_heads = int(rgb_cfg.get("physical_align_heads", 8))
         self.physical_align_max_tokens = int(rgb_cfg.get("physical_align_max_tokens", 64))
+        self.physical_prompt_dim = int(
+            rgb_cfg.get(
+                "physical_prompt_dim",
+                getattr(getattr(config, "text", ml_collections.ConfigDict()), "hidden_size", self.embedding_dim * 4),
+            )
+        )
         self.vit_dim_cfg = int(rgb_cfg.get("vit_dim", 0)) or None
         cnn_dims_cfg = rgb_cfg.get("cnn_dims", None)
         self.cnn_dims_cfg = [int(v) for v in cnn_dims_cfg] if cnn_dims_cfg else None
@@ -269,6 +297,78 @@ class DualVisionEncoder(nn.Module):
                 device=next(self.global_encoder.parameters()).device,
                 dtype=next(self.global_encoder.parameters()).dtype,
             )
+
+    @staticmethod
+    def _is_main_rank() -> bool:
+        try:
+            return int(os.environ.get("RANK", "0")) == 0
+        except Exception:
+            return True
+
+    @staticmethod
+    def _filter_mismatch_keys(
+        keys,
+        expected_exact=(),
+        expected_prefixes=(),
+        expected_regex=(),
+    ):
+        expected_exact = set(expected_exact or [])
+        prefixes = tuple(expected_prefixes or ())
+        regexes = [re.compile(p) for p in (expected_regex or ())]
+        kept = []
+        for k in keys or []:
+            if k in expected_exact:
+                continue
+            if prefixes and any(str(k).startswith(p) for p in prefixes):
+                continue
+            if regexes and any(r.match(str(k)) for r in regexes):
+                continue
+            kept.append(k)
+        return kept
+
+    def _log_state_dict_mismatch(
+        self,
+        model_name: str,
+        incompatible,
+        expected_missing_exact=(),
+        expected_missing_prefixes=(),
+        expected_missing_regex=(),
+        expected_unexpected_exact=(),
+        expected_unexpected_prefixes=(),
+        expected_unexpected_regex=(),
+    ) -> None:
+        if not isinstance(incompatible, torch.nn.modules.module._IncompatibleKeys):
+            return
+        if not self._is_main_rank():
+            return
+
+        missing = self._filter_mismatch_keys(
+            incompatible.missing_keys,
+            expected_exact=expected_missing_exact,
+            expected_prefixes=expected_missing_prefixes,
+            expected_regex=expected_missing_regex,
+        )
+        unexpected = self._filter_mismatch_keys(
+            incompatible.unexpected_keys,
+            expected_exact=expected_unexpected_exact,
+            expected_prefixes=expected_unexpected_prefixes,
+            expected_regex=expected_unexpected_regex,
+        )
+
+        if not missing and not unexpected:
+            return
+
+        # Keep logs compact in distributed training.
+        max_show = 8
+        msg = (
+            f"{model_name} weight mismatch after load_state_dict(strict=False). "
+            f"missing={len(missing)}, unexpected={len(unexpected)}"
+        )
+        if missing:
+            msg += f", missing_sample={missing[:max_show]}"
+        if unexpected:
+            msg += f", unexpected_sample={unexpected[:max_show]}"
+        warnings.warn(msg)
 
     def _add_2d_sincos_pos_embed(self, x: torch.Tensor, h: int, w: int):
         """x: [B, H*W, C] add 2D sine-cos position."""
@@ -489,6 +589,7 @@ class DualVisionEncoder(nn.Module):
             dim=fused_dim,
             num_heads=self.physical_align_heads,
             max_phys_tokens=self.physical_align_max_tokens,
+            physical_in_dim=self.physical_prompt_dim,
         ).to(device=device, dtype=dtype)
         self.final_proj = nn.Linear(fused_dim, self.embedding_dim).to(device=device, dtype=dtype)
         self._fusion_vit_dim = vit_dim

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 class PhysicsGuidedLoss(nn.Module):
     """
@@ -72,6 +72,75 @@ class PhysicsGuidedLoss(nn.Module):
             loss_phy = torch.mean(loss_elements)
             
         return loss_phy
+
+
+def _extract_tensor(batch: Dict, keys: Sequence[str]) -> Optional[torch.Tensor]:
+    for key in keys:
+        value = batch.get(key, None)
+        if torch.is_tensor(value):
+            return value
+    return None
+
+
+def _to_bchw(x: torch.Tensor) -> Optional[torch.Tensor]:
+    if x.dim() == 4:
+        return x
+    if x.dim() == 3:
+        return x.unsqueeze(1)
+    if x.dim() == 2:
+        return x.unsqueeze(0).unsqueeze(0)
+    return None
+
+
+def compute_rte_rrs_gt(batch: Dict, coeffs: Dict = None) -> Optional[torch.Tensor]:
+    """
+    Build physical GT from water-leaving reflectance with a Nechad-style semi-analytical model.
+
+    TSM = (A * Rrs_red) / (1 - Rrs_red / C)
+    """
+    coeffs = coeffs or {}
+    A_tsm = float(coeffs.get("A_tsm", 289.29))
+    C_tsm = float(coeffs.get("C_tsm", 0.1686))
+    red_band_index = int(coeffs.get("red_band_index", 2))
+    eps = 1e-6
+
+    # Prefer explicitly provided red-band reflectance.
+    rrs_red = _extract_tensor(batch, ["rrs_red", "Rrs_red"])
+
+    # Fallback: derive red band from multi-band reflectance tensor.
+    if rrs_red is None:
+        rrs_full = _extract_tensor(
+            batch,
+            ["rrs", "Rrs", "rrs_map", "Rrs_map", "rrs_full", "Rrs_full", "reflectance", "Reflectance"],
+        )
+        if rrs_full is None:
+            return None
+
+        if rrs_full.dim() == 4:
+            if rrs_full.size(1) > 1:
+                red_band_index = min(max(red_band_index, 0), rrs_full.size(1) - 1)
+                rrs_red = rrs_full[:, red_band_index : red_band_index + 1, :, :]
+            else:
+                rrs_red = rrs_full
+        elif rrs_full.dim() == 3:
+            # [B,H,W] style input
+            rrs_red = rrs_full.unsqueeze(1)
+        elif rrs_full.dim() == 2:
+            # Single map [H,W]
+            rrs_red = rrs_full.unsqueeze(0).unsqueeze(0)
+        else:
+            return None
+    else:
+        rrs_red = _to_bchw(rrs_red)
+        if rrs_red is None:
+            return None
+
+    rrs_red = torch.nan_to_num(rrs_red.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    rrs_red = torch.clamp(rrs_red, min=0.0, max=(C_tsm - eps))
+    denominator = torch.clamp(1.0 - rrs_red / C_tsm, min=eps)
+    tsm_pred = (A_tsm * rrs_red) / denominator
+    return tsm_pred
+
 
 def compute_sar_sigma0_gt(batch: Dict, coeffs: Dict = None) -> Optional[torch.Tensor]:
     """

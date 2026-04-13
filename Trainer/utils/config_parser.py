@@ -54,7 +54,8 @@ class ConfigArgumentParser(argparse.ArgumentParser):
             namespace = vars(super().parse_args(remaining_argv))
             if wandb:
                 # 如果使用 wandb，将命令行参数更新到配置文件的参数中
-                config_vars.update(namespace)
+                # 仅用非 None 的命令行值覆盖 yaml，避免未传参数的默认 None 抹掉 yaml 配置
+                config_vars.update({k: v for k, v in namespace.items() if v is not None})
                 return config_vars
             else:
                 # 否则，将配置文件的参数更新到命令行参数中

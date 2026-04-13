@@ -21,15 +21,21 @@ logger = logging.getLogger("train")
 
 # 定义基于轮次（epoch）的训练器类，继承自 Trainer 类
 class EpochBasedTrainer(Trainer):
-    def __init__(self, max_epochs: int, **kwargs):
+    def __init__(self, max_epochs: int, max_iters_override: int = None, **kwargs):
         """
         Args:
             max_epochs (int): 总的训练轮次。
+            max_iters_override (int, optional): 若设置，则训练在达到该迭代数后提前结束。
         """
         # 调用父类的构造函数
         super().__init__(**kwargs)
         # 存储总的训练轮次
         self.max_epochs = max_epochs
+        self.max_iters_override = (
+            int(max_iters_override)
+            if max_iters_override is not None and int(max_iters_override) > 0
+            else None
+        )
 
         # 当前训练轮次，初始化为 0
         self.epoch = 0
@@ -58,7 +64,10 @@ class EpochBasedTrainer(Trainer):
     # 总的迭代次数的属性
     @property
     def max_iters(self) -> int:
-        return self.max_epochs * self.epoch_len
+        base_iters = self.max_epochs * self.epoch_len
+        if self.max_iters_override is None:
+            return base_iters
+        return min(base_iters, self.max_iters_override)
 
     # 当前的迭代次数的属性
     @property
@@ -122,6 +131,8 @@ class EpochBasedTrainer(Trainer):
         self.model.train()
         # 遍历当前轮次内的迭代次数
         for self.inner_iter in range(self.inner_iter, self.epoch_len):
+            if self.max_iters_override is not None and self.cur_iter >= self.max_iters_override:
+                break
         # for self.inner_iter in range(0, 10):
             # 调用 'before_iter' 钩子函数
             self._call_hooks("before_iter")
@@ -143,8 +154,12 @@ class EpochBasedTrainer(Trainer):
         logger.info(
             f"Start training from epoch {self.start_epoch} to {self.max_epochs}."
         )
+        if self.max_iters_override is not None:
+            logger.info(f"Early-stop by max_iters_override={self.max_iters_override}.")
         # 遍历从开始轮次到结束轮次
         for self.epoch in range(self.start_epoch, self.max_epochs):
+            if self.max_iters_override is not None and self.cur_iter >= self.max_iters_override:
+                break
             # 调用 'before_epoch' 钩子函数
             self._call_hooks("before_epoch")
             # 训练一个轮次
