@@ -6,6 +6,11 @@ from .common_arch import AttnPooler, LayerNorm, LayerNormFp32
 
 
 class EmbeddingModel(nn.Module):
+    """
+    把视觉特征映射到语言模型能接收的隐藏特征里
+    
+    具体来说,就是与语言模型 hidden state 同维度、可直接拼接进输入序列的多模态特征
+    """
     def __init__(self, config: ml_collections.ConfigDict):
         """
         初始化 EmbeddingModel 模型。

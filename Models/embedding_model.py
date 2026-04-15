@@ -6,6 +6,11 @@ from .common_arch import AttnPooler, LayerNorm, LayerNormFp32
 
 
 class EmbeddingModel(nn.Module):
+    """
+    
+    在embedding_model_r1.py的基础上,额外编码了地理位置(lat/lon),时间(timestamp),然后把 image_embedding + geo_embedding + time_embedding 拼起来返回
+    
+    """
     def __init__(self, config: ml_collections.ConfigDict):
         """
         初始化 EmbeddingModel 模型。

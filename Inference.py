@@ -21,8 +21,9 @@ from Models import (
 from Models.coastgpt import CoastGPT
 from Models.utils import KeywordsStoppingCriteria, type_dict
 
-
-def load_image(image_file):
+# 加载图像的函数，可以从本地路径或URL加载图像，并将其转换为RGB格式。
+def load_image(image_file)->Image.Image:
+    """Load an image from a local path or a URL."""
     if image_file.startswith("http") or image_file.startswith("https"):
         response = requests.get(image_file)
         image = Image.open(BytesIO(response.content)).convert("RGB")
@@ -85,17 +86,25 @@ def parse_option():
 
 
 def main(config: ml_collections.ConfigDict):
+    
+    # 构建CoastGPT模型，传入配置对象作为参数。
     model = CoastGPT(config)
-    if getattr(config, "hf_model", False):
+    
+    # 如果是huggingface模型，使用模型自带的processor，否则使用默认的transform
+    if getattr(config, "hf_model", False):             
         vision_processor = model.get_image_processor()
     else:
         vision_processor = build_vlp_transform(config, is_train=False)
-    dtype = type_dict[config.dtype]
+    
+    # 将模型参数转换为指定的数据类型，以节省内存和加速推理。数据类型由配置中的dtype字段指定，可以是float32、float16或bfloat16。
+    dtype = type_dict[config.dtype]       
     model.to(dtype)
-
+    
+    # 创建一个对话对象，用于管理对话的状态和格式。对话对象是从默认对话模板复制而来的，包含了角色信息和消息列表。
     conv = default_conversation.copy()
     roles = conv.roles
 
+    # 加载预训练模型权重和分词器。
     if config.model_path is not None:
         if getattr(config, "hf_model", False):
             msg = model.custom_load_state_dict(config.model_path, strict=False)
@@ -114,12 +123,14 @@ def main(config: ml_collections.ConfigDict):
             tokenizer = model.language.tokenizer
         print(msg)
 
+    # 将模型移动到设备上进行推理
     if config.accelerator == "gpu":
         device = torch.device("cuda")
     else:
         device = torch.device(config.accelerator)
     model.to(device)
 
+    # 加载图像,并使用视觉处理器将图像转换为张量，以便输入到模型中进行推理。
     if config.image_file is not None:
         image = load_image(config.image_file)
         if config.rgb_vision.arch.startswith("vit"):

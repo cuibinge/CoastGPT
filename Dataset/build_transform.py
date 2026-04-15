@@ -31,34 +31,36 @@ def build_cls_transform(config, is_train=True, num_channels=3):
     else:
         raise ValueError(f"Unsupported number of channels: {num_channels}")
 
+    
     if is_train:
         transform = create_transform(
-            input_size=config.transform.input_size,
-            is_training=True,
-            color_jitter=config.color_jitter,
-            auto_augment=config.aa,
-            interpolation="bicubic",
-            re_prob=config.reprob,  # re means random erasing
-            re_mode=config.remode,
-            re_count=config.recount,
-            mean=mean,
-            std=std,
+            input_size=config.transform.input_size,     # 输入图像尺寸
+            is_training=True,                           # 是否为训练阶段
+            color_jitter=config.color_jitter,           # 颜色抖动
+            auto_augment=config.aa,                     # 自动增强
+            interpolation="bicubic",                    # 插值方法
+            re_prob=config.reprob,                      # 随机擦除概率
+            re_mode=config.remode,                      # 随机擦除模式
+            re_count=config.recount,                    # 随机擦除计数
+            mean=mean,                                  # 均值
+            std=std,                                    # 标准差
         )
         return transform
 
+    # 验证阶段
     t = []
-    crop_pct = 224 / 256
-    size = int(config.transform.input_size[0] / crop_pct)
+    crop_pct = 224 / 256                                    # 裁剪比例
+    size = int(config.transform.input_size[0] / crop_pct)   # 裁剪尺寸
     t.append(
         transforms.Resize(
-            size, interpolation=PIL.Image.BICUBIC
-        ),  # to maintain same ratio w.r.t. 224 images
+            size, interpolation=PIL.Image.BICUBIC           # 插值方法
+        ),                                                  # 保持与224图像相同的比例
     )
     t.append(transforms.CenterCrop(config.transform.input_size))
 
-    t.append(transforms.ToTensor())
-    t.append(transforms.Normalize(mean, std))
-    return transforms.Compose(t)
+    t.append(transforms.ToTensor())                         # 转换为张量
+    t.append(transforms.Normalize(mean, std))               # 归一化
+    return transforms.Compose(t)                            # 返回图像变换组合
 
 def build_vlp_transform(config: ml_collections.ConfigDict, is_train: bool = True, num_channels=3):
     """
