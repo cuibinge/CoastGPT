@@ -12,7 +12,18 @@ tune_rgb_bk: False
 tune_rgb_pooler: True
 
 rgb_vision:
-  arch: vit_large
+  arch: dual
+  # global encoder uses DINOv3 ViT-L/16 (frozen)
+  global_encoder_name: dinov3_vitl16
+  # local encoder uses DINOv3 ConvNeXt via timm (frozen)
+  local_source: dino
+  local_encoder_name: convnext_base
+  # path to DINOv3 ConvNeXt-Base checkpoint
+  local_ckpt_path: './dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth'
+  freeze_global: True
+  freeze_local: True
+  # required: path to DINOv3 ViT-L/16 checkpoint (.pth/.pt)
+  global_ckpt_path: './dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth'
   vit_name: openai/clip-vit-large-patch14
   input_size: [224, 224]
   patch_dropout: 0.
@@ -38,7 +49,7 @@ text:
   bos_token_id: 1
   eos_token_id: 2
   tie_word_embeddings: False
-  path: meta-llama/Llama-2-7b-chat-hf
+  path: ../Llama-2-7b-chat-hf
 sar_vision:
   arch: base
   input_size: [192, 192]
@@ -86,11 +97,11 @@ lora:
   lora_bias: none
 
 # optimizer
-optimizer: adanp
+optimizer: adanp                 # adanp/adamw
 lr: 0.0002
 wd: 0.
 epochs: 1
-max_grad_norm: 0.3
+max_grad_norm: 0.0
 
 # scheduler
 schedule:
@@ -111,3 +122,55 @@ language:
   embedding_dim: 4096
 vit_name: openai/clip-vit-large-patch14
 tune_multimodal: True
+
+# Physics branch configuration
+physics:
+  enabled: false
+  out_channels: 1
+  loss_weight: 1.0
+  edge_weight: 0.0
+  tv_weight: 0.01
+  consistency_weight: 0.05
+  spectral_weight: 0.0
+  auto_gt_from_constraints: true
+  # Optional SAR empirical coefficients for auto GT when constraints provided
+  sar_sigma0_coeffs:
+    A: -10.0
+    B: 2.0
+    C: 0.05
+    D_VV: 0.0
+    D_VH: -3.0
+
+# Aquaculture segmentation (MOE) configuration
+aquaculture_seg:
+  enabled: false           # 设置为 false 可禁用分割头
+  num_classes: 2           # 类别数：如 [背景, 养殖区]
+  loss_weight: 1.0         # 分割总体损失的权重
+  ce_weight: 1.0           # 交叉熵损失权重
+  dice_weight: 0.0         # Dice 损失权重
+  ignore_index: 255        # 标注中忽略标签的索引值
+  include_context_expert: true  # 启用 ASPP/SPP 上下文专家
+  log_gate_stats: true     # 记录门控权重统计（mean、Top-1 占比）
+  # 路由器正则项系数（用于训练时辅助约束门控分布）
+  router_aux_loss_coef:
+    entropy: 0.001         # 建议范围 1e-4 ~ 5e-3；增大更均匀
+    zloss: 0.001           # 建议范围 1e-4 ~ 5e-3；抑制logits过大
+  # 适配器配置（安全默认值：整体关闭）
+  adapters:
+    enable: false
+    spectral:
+      enable: false
+      target_dim: 16    # 示例：光谱专家输入压缩到 16 维
+    texture:
+      enable: false
+      target_dim: 8     # 示例：纹理专家输入压缩到 8 维
+      depth: 2
+    spp:
+      enable: false
+      project_dim: 64   # 示例：SPP 筛选后投影到 64 维
+      levels: [1, 2, 4]
+    modality_gate:
+      enable: false
+      optical_weight: 0.7
+      sar_weight: 0.3
+      cloudy_boost: 0.3

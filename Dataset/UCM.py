@@ -3,6 +3,7 @@ from typing import Callable, Union
 
 from PIL import Image
 from torch.utils.data import Dataset
+import torch_npu
 
 
 class UCM(Dataset):

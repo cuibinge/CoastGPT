@@ -1,6 +1,7 @@
 from typing import Dict, Iterator, List, Optional
 from operator import itemgetter
 from torch.utils.data import DataLoader, Dataset, DistributedSampler, Sampler
+import torch_npu
 
 # 分布式采样器包装类，用于在分布式训练中使用任意采样器
 class DistributedSamplerWrapper(DistributedSampler):

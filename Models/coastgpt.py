@@ -6,17 +6,71 @@ from typing import Dict, List, Tuple
 import ml_collections
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from deepspeed.utils.zero_to_fp32 import (
     get_fp32_state_dict_from_zero_checkpoint,
     load_state_dict_from_zero_checkpoint,
 )
 from peft import PeftModel
-from .vision_model import VisionModel  # 自定义视觉模型模块
+from .vision_model import VisionModel as SingleVisionModel  # 自定义视觉模型模块
+from .dual_vision_encoder import DualVisionEncoder  # 双编码器视觉模块
 from .language_model import LanguageModel  # 自定义语言模型模块
 # from .embedding_model import EmbeddingModel
 from .embedding_model_r1 import EmbeddingModel
-from .attention_supervision import AttentionSupervision
+from . import physics_decoder as phys
+# 物理解码与损失函数（兼容部分环境缺失符号）
+PhysicsDecoder = phys.PhysicsDecoder
+pixelwise_mse = getattr(phys, "pixelwise_mse", lambda pred, gt: F.mse_loss(pred, gt))
 
+def _edge_preserve_default(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    # 简单梯度一致性正则（不依赖 Sobel），在缺失 edge_preserve_loss 时回退使用
+    dh_p = torch.abs(pred[:, :, 1:, :] - pred[:, :, :-1, :])
+    dw_p = torch.abs(pred[:, :, :, 1:] - pred[:, :, :, :-1])
+    dh_g = torch.abs(gt[:, :, 1:, :] - gt[:, :, :-1, :])
+    dw_g = torch.abs(gt[:, :, :, 1:] - gt[:, :, :, :-1])
+    return F.l1_loss(dh_p, dh_g) + F.l1_loss(dw_p, dw_g)
+
+edge_preserve_loss = getattr(phys, "edge_preserve_loss", _edge_preserve_default)
+
+def _tv_default(x: torch.Tensor) -> torch.Tensor:
+    # 总变分回退实现
+    dh = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :]).mean()
+    dw = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1]).mean()
+    return dh + dw
+
+total_variation_loss = getattr(phys, "total_variation_loss", _tv_default)
+
+def _consistency_default(phy_full, phy_s1, phy_s2, phy_s3) -> torch.Tensor:
+    # 多尺度一致性回退实现
+    H, W = phy_full.shape[-2], phy_full.shape[-1]
+    s1_up = F.interpolate(phy_s1, size=(H, W), mode="bilinear", align_corners=False)
+    s2_up = F.interpolate(phy_s2, size=(H, W), mode="bilinear", align_corners=False)
+    s3_up = F.interpolate(phy_s3, size=(H, W), mode="bilinear", align_corners=False)
+    return (F.mse_loss(phy_full, s1_up) + F.mse_loss(phy_full, s2_up) + F.mse_loss(phy_full, s3_up)) / 3.0
+
+consistency_loss_multiscale = getattr(phys, "consistency_loss_multiscale", _consistency_default)
+
+def _sam_default(pred: torch.Tensor, gt: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    # 光谱角映射回退实现
+    B, C, H, W = pred.shape
+    p = pred.permute(0, 2, 3, 1).reshape(-1, C)
+    g = gt.permute(0, 2, 3, 1).reshape(-1, C)
+    dot = (p * g).sum(dim=1)
+    pn = torch.norm(p, dim=1)
+    gn = torch.norm(g, dim=1)
+    cos = torch.clamp(dot / (pn * gn + eps), min=-1.0, max=1.0)
+    ang = torch.acos(cos)
+    return ang.mean()
+
+spectral_loss_sam = getattr(phys, "spectral_loss_sam", _sam_default)
+from .physics_constraints import compute_rte_rrs_gt, compute_sar_sigma0_gt
+from .moe_seg import AquacultureSegMOE, dice_loss
+# 在不支持 NPU 的环境下忽略 torch_npu 导入错误
+try:
+    import torch_npu  # noqa: F401
+    HAS_TORCH_NPU = True
+except Exception:
+    HAS_TORCH_NPU = False
 
 logger = logging.getLogger("train")
 
@@ -30,13 +84,67 @@ class CoastGPT(nn.Module):
             config: 包含模型参数的配置字典
         """
         super(CoastGPT, self).__init__()
+        # 保存配置以便在 forward 中访问（例如自动生成物理 GT 的开关和参数）
+        self.config = config
         self.stage = config.stage  # 从配置中存储训练/推理阶段
 
         # 初始化视觉和语言组件
-        self.vision = VisionModel(config)  # 视觉处理模块
+        if getattr(config, "rgb_vision", ml_collections.ConfigDict()).get("arch", "vit_large") == "dual":
+            self.vision = DualVisionEncoder(config)  # 双编码器视觉处理模块
+        else:
+            self.vision = SingleVisionModel(config)  # 单编码器视觉处理模块
         self.language = LanguageModel(config)  # 语言处理模块
         self.multimodal = EmbeddingModel(config)  # 多模态嵌入模块
-        self.attention_supervision = AttentionSupervision()
+
+        # 物理解码器（可选）
+        phy_cfg = getattr(config, "physics", ml_collections.ConfigDict())
+        self.physics_enabled = bool(phy_cfg.get("enabled", False))
+        if self.physics_enabled:
+            out_channels = int(phy_cfg.get("out_channels", 1))
+            # 使用视觉融合后的通道维度作为解码器通道
+            dec_channels = int(getattr(self.vision, "embedding_dim", 256))
+            self.physics = PhysicsDecoder(out_channels=out_channels, dec_channels=dec_channels)
+            # 损失权重配置
+            self.physics_loss_weight = float(phy_cfg.get("loss_weight", 1.0))
+            self.physics_edge_weight = float(phy_cfg.get("edge_weight", 0.0))
+            self.physics_tv_weight = float(phy_cfg.get("tv_weight", 0.0))
+            self.physics_consistency_weight = float(phy_cfg.get("consistency_weight", 0.0))
+            self.physics_spectral_weight = float(phy_cfg.get("spectral_weight", 0.0))
+
+        # 养殖区分割（MOE）分支（可选）
+        seg_cfg = getattr(config, "aquaculture_seg", ml_collections.ConfigDict())
+        self.seg_enabled = bool(seg_cfg.get("enabled", False))
+        if self.seg_enabled:
+            num_classes = int(seg_cfg.get("num_classes", 2))
+            dec_channels = int(getattr(self.vision, "embedding_dim", 256))
+            include_context = bool(seg_cfg.get("include_context_expert", True))
+            adapter_cfg = seg_cfg.get("adapters", ml_collections.ConfigDict())
+            # 额外的 MOE 配置：与训练保持一致
+            num_experts = seg_cfg.get("num_experts", None)
+            use_generic_experts = bool(seg_cfg.get("use_generic_experts", False))
+            top_k = int(seg_cfg.get("top_k", 0))
+            hard_topk_inference = bool(seg_cfg.get("hard_topk_inference", True))
+            # 传递适配器与 MOE 配置
+            self.seg_head = AquacultureSegMOE(
+                in_channels=dec_channels,
+                num_classes=num_classes,
+                include_context=include_context,
+                adapter_cfg=adapter_cfg.to_dict() if hasattr(adapter_cfg, "to_dict") else adapter_cfg,
+                num_experts=num_experts,
+                top_k=top_k,
+                use_generic_experts=use_generic_experts,
+                hard_topk_inference=hard_topk_inference,
+            )
+            # 损失权重
+            self.seg_loss_weight = float(seg_cfg.get("loss_weight", 1.0))
+            self.seg_ce_weight = float(seg_cfg.get("ce_weight", 1.0))
+            self.seg_dice_weight = float(seg_cfg.get("dice_weight", 1.0))
+            self.seg_ignore_index = int(seg_cfg.get("ignore_index", 255))
+            self.seg_log_gate_stats = bool(seg_cfg.get("log_gate_stats", True))
+            # 路由器辅助损失系数（entropy、zloss）
+            router_aux_cfg = seg_cfg.get("router_aux_loss_coef", {})
+            self.seg_router_entropy_coef = float(router_aux_cfg.get("entropy", 0.0))
+            self.seg_router_zloss_coef = float(router_aux_cfg.get("zloss", 0.0))
 
     def forward(self, data: Dict):
         """
@@ -52,38 +160,212 @@ class CoastGPT(nn.Module):
         total_loss = 0.0
 
         # 通过视觉模型处理图像
-        image_embedding = self.vision(data)
+        if self.physics_enabled and isinstance(self.vision, DualVisionEncoder):
+            image_seq, fused_spatial, pyramid_raw = self.vision.encode_with_spatial(data["rgb"])
+        else:
+            image_seq = self.vision(data)
+            fused_spatial, pyramid_raw = None, None
 
         # 多模态嵌入处理
-        multimodal_embedding = self.multimodal(data, image_embedding=image_embedding)
+        multimodal_embedding = self.multimodal(data, image_embedding=image_seq)
 
         # 通过语言模型处理组合输入
-        output = self.language(data, multimodal_embedding=multimodal_embedding, output_attentions=True)
-        # 如果是训练模式且数据中包含分割掩码
-        if self.training and 'seg_mask' in data:
-            # 获取分割token的索引
-            seg_token_indices = data.get('seg_token_indices', None)
-            if seg_token_indices is not None:
-                # 计算注意力图
-                attention_maps = output.get('attentions', None)
-                if attention_maps is not None:
-                    attention_map = self.attention_supervision.compute_attention_map(
-                        attention_maps, seg_token_indices
-                    )
-                    
-                    # 计算KL散度损失
-                    seg_mask = data['seg_mask']
-                    kl_loss = self.attention_supervision.compute_kl_loss(attention_map, seg_mask)
-                    
-                    # 将KL散度损失添加到总损失中
-                    total_loss += kl_loss
-                    out.update({"kl_loss": kl_loss})
-        
+        output = self.language(data, multimodal_embedding=multimodal_embedding)
 
-        text_loss = output if isinstance(output, torch.Tensor) else output.get('loss', 0.0)
         text_loss = output
         total_loss += text_loss
         out.update({"text_loss": text_loss})
+
+        # 物理约束与逐像素监督
+        if self.physics_enabled and fused_spatial is not None:
+            H, W = data["rgb"].shape[-2], data["rgb"].shape[-1]
+
+            # 为避免半精度下的数值不稳定导致 NaN，物理解码与损失在 fp32 中计算
+            try:
+                dev_type = fused_spatial.device.type
+            except Exception:
+                dev_type = "cuda"
+
+            # 在物理分支禁用 autocast，显式使用 float32 计算
+            from torch import autocast as _autocast
+            with _autocast(device_type=dev_type, enabled=False):
+                fused_spatial_fp32 = fused_spatial.float()
+                # 清洗上游产生的 NaN/Inf，避免在物理解码器中扩散
+                fused_spatial_fp32 = torch.nan_to_num(
+                    fused_spatial_fp32, nan=0.0, posinf=0.0, neginf=0.0
+                )
+                # 确保物理解码器参数与输入 dtype/device 一致（显式转为 float32）
+                try:
+                    self.physics.to(device=fused_spatial_fp32.device, dtype=torch.float32)
+                except Exception:
+                    # 兼容部分环境不支持 module.to(dtype=...) 的情况
+                    for p in self.physics.parameters():
+                        p.data = p.data.to(dtype=torch.float32, device=fused_spatial_fp32.device)
+                    for name, buffer in self.physics.named_buffers():
+                        buffer.data = buffer.data.to(dtype=torch.float32, device=fused_spatial_fp32.device)
+                phy_pred = self.physics(
+                    fused_spatial=fused_spatial_fp32,
+                    pyramid_raw=pyramid_raw,
+                    input_size=(H, W),
+                )
+            # 如果物理解码输出仍出现非有限值，记录并回退为零以避免损失为 NaN
+            phy_maps = [
+                phy_pred.get("phy_full"),
+                phy_pred.get("phy_s1"),
+                phy_pred.get("phy_s2"),
+                phy_pred.get("phy_s3"),
+            ]
+            has_nan = any([
+                (m is not None and not torch.isfinite(m).all()) for m in phy_maps
+            ])
+            if has_nan:
+                logger.warning("Physics decoder produced non-finite values; sanitizing outputs.")
+                for k in ["phy_full", "phy_s1", "phy_s2", "phy_s3"]:
+                    if k in phy_pred and phy_pred[k] is not None:
+                        phy_pred[k] = torch.nan_to_num(phy_pred[k], nan=0.0, posinf=0.0, neginf=0.0)
+                out.update({"phy_has_nan": torch.tensor(1.0, device=fused_spatial.device)})
+            else:
+                out.update({"phy_has_nan": torch.tensor(0.0, device=fused_spatial.device)})
+            # 训练日志仅接受标量；不将大尺寸的预测图加入返回，避免日志崩溃
+
+            # 先计算与GT无关的正则项
+            tv_w = self.physics_tv_weight
+            cons_w = self.physics_consistency_weight
+            reg_tv = (
+                total_variation_loss(phy_pred["phy_full"]) if tv_w > 0 else torch.tensor(0.0, device=fused_spatial.device, dtype=torch.float32)
+            )
+            reg_cons = (
+                consistency_loss_multiscale(phy_pred["phy_full"], phy_pred["phy_s1"], phy_pred["phy_s2"], phy_pred["phy_s3"]) if cons_w > 0 else torch.tensor(0.0, device=fused_spatial.device, dtype=torch.float32)
+            )
+
+            # 监督：支持多尺度与全分辨率
+            phy_gt = None
+            if "phy_gt" in data:
+                phy_gt = data["phy_gt"]
+            elif "phy_gt_full" in data:
+                phy_gt = data["phy_gt_full"]
+
+            # 若无显式 phy_gt，且启用自动物理真值生成，则尝试约束推导
+            if phy_gt is None and bool(getattr(self, "physics_enabled", False)):
+                auto_gt_cfg = bool(self.config.physics.get("auto_gt_from_constraints", False))
+                if auto_gt_cfg:
+                    phy_gt = compute_rte_rrs_gt(data)
+                    if phy_gt is None:
+                        coeffs = self.config.physics.get("sar_sigma0_coeffs", None)
+                        phy_gt = compute_sar_sigma0_gt(data, coeffs)
+
+            if phy_gt is not None:
+                # 对齐 GT 尺寸到各尺度
+                gt_full = F.interpolate(phy_gt, size=(H, W), mode="bilinear", align_corners=False) if phy_gt.shape[-2:] != (H, W) else phy_gt
+                l_full = pixelwise_mse(phy_pred["phy_full"], gt_full)
+
+                # 多尺度 GT
+                s1_sz = phy_pred["phy_s1"].shape[-2:]
+                s2_sz = phy_pred["phy_s2"].shape[-2:]
+                s3_sz = phy_pred["phy_s3"].shape[-2:]
+                gt_s1 = F.interpolate(gt_full, size=s1_sz, mode="bilinear", align_corners=False)
+                gt_s2 = F.interpolate(gt_full, size=s2_sz, mode="bilinear", align_corners=False)
+                gt_s3 = F.interpolate(gt_full, size=s3_sz, mode="bilinear", align_corners=False)
+
+                l_s1 = pixelwise_mse(phy_pred["phy_s1"], gt_s1)
+                l_s2 = pixelwise_mse(phy_pred["phy_s2"], gt_s2)
+                l_s3 = pixelwise_mse(phy_pred["phy_s3"], gt_s3)
+
+                # 边缘保持项（仅在全分辨率上）
+                edge_w = self.physics_edge_weight
+                l_edge = edge_preserve_loss(phy_pred["phy_full"], gt_full) if edge_w > 0 else torch.tensor(0.0, device=gt_full.device, dtype=torch.float32)
+
+                # 光谱损失（需要多通道GT）
+                spec_w = self.physics_spectral_weight
+                spec_l = (
+                    spectral_loss_sam(phy_pred["phy_full"], gt_full) if spec_w > 0 and gt_full.shape[1] > 1 else torch.tensor(0.0, device=gt_full.device, dtype=torch.float32)
+                )
+
+                # 权重汇总
+                # 基础权重（可从配置进一步扩展）
+                w_full = 1.0
+                w_s1 = 0.5
+                w_s2 = 0.35
+                w_s3 = 0.25
+                physics_weight = self.physics_loss_weight
+
+                phy_loss = (
+                    w_full * l_full + w_s1 * l_s1 + w_s2 * l_s2 + w_s3 * l_s3
+                ) + edge_w * l_edge + tv_w * reg_tv + cons_w * reg_cons + spec_w * spec_l
+                # 保持与文本损失相同的数据类型，避免混合精度导致的类型不一致
+                total_loss += (physics_weight * phy_loss).to(text_loss.dtype)
+                out.update({
+                    "phy_loss": phy_loss,
+                    "phy_tv_loss": reg_tv,
+                    "phy_consistency_loss": reg_cons,
+                    "phy_spectral_loss": spec_l,
+                })
+            else:
+                # 无GT时仅加入正则项
+                physics_weight = self.physics_loss_weight
+                phy_loss = tv_w * reg_tv + cons_w * reg_cons
+                total_loss += (physics_weight * phy_loss).to(text_loss.dtype)
+                out.update({
+                    "phy_loss": phy_loss,
+                    "phy_tv_loss": reg_tv,
+                    "phy_consistency_loss": reg_cons,
+                })
+
+        # 养殖区分割（MOE）
+        if self.seg_enabled and fused_spatial is not None:
+            H, W = data["rgb"].shape[-2], data["rgb"].shape[-1]
+            # 可选模态输入：若数据集提供光学/SAR 空间特征，可传入供模态门使用
+            modal_inputs = data.get("modal_inputs", None)
+            context_flags = {"cloudy": bool(data.get("cloudy", False))}
+            seg_out = self.seg_head(fused_spatial, input_size=(H, W), modal_inputs=modal_inputs, context=context_flags)
+            seg_logits = seg_out["logits"]
+            out.update({"seg_logits": seg_logits})
+            # 门控统计信息（空间加权平均）
+            if self.seg_log_gate_stats and "gate_logits" in seg_out:
+                gate_logits = seg_out["gate_logits"]  # [B,E,h,w]
+                gate_w = torch.softmax(gate_logits.float(), dim=1)
+                # 每个专家的平均权重
+                gate_mean = gate_w.mean(dim=(0, 2, 3))  # [E]
+                # Top-1 专家占比
+                top_idx = torch.argmax(gate_w, dim=1)  # [B,h,w]
+                E = gate_w.shape[1]
+                top_ratio = []
+                total = float(top_idx.numel())
+                for e in range(E):
+                    frac = (top_idx == e).float().sum() / total
+                    top_ratio.append(frac)
+                # 展开为标量键，便于日志与可视化
+                for e in range(E):
+                    out[f"seg_gate_mean_e{e}"] = gate_mean[e]
+                    out[f"seg_gate_top1_ratio_e{e}"] = top_ratio[e]
+                # 路由分布的平均熵（标量）
+                eps = 1e-8
+                seg_gate_entropy = (-(gate_w * (gate_w + eps).log()).sum(dim=1)).mean()
+                out["seg_gate_entropy"] = seg_gate_entropy
+            if "seg_mask" in data:
+                target = data["seg_mask"]  # [B,H,W], int64
+                # CrossEntropy
+                ce = F.cross_entropy(seg_logits, target, ignore_index=self.seg_ignore_index)
+                # Dice（在 float32 概率上计算）
+                dl = dice_loss(seg_logits, target, num_classes=self.seg_head.num_classes, ignore_index=self.seg_ignore_index)
+                seg_loss = self.seg_ce_weight * ce + self.seg_dice_weight * dl
+                total_loss += (self.seg_loss_weight * seg_loss).to(text_loss.dtype)
+                out.update({"seg_loss": seg_loss, "seg_ce_loss": ce, "seg_dice_loss": dl})
+            # 路由器辅助损失（仅在训练时返回并纳入总损失）
+            if self.training and ("router_aux" in seg_out):
+                aux = seg_out["router_aux"]
+                aux_entropy = aux.get("entropy", None)
+                aux_zloss = aux.get("zloss", None)
+                aux_loss = torch.tensor(0.0, device=seg_logits.device, dtype=seg_logits.dtype)
+                if aux_entropy is not None and self.seg_router_entropy_coef > 0:
+                    aux_loss = aux_loss + self.seg_router_entropy_coef * aux_entropy
+                    out["seg_router_entropy"] = aux_entropy
+                if aux_zloss is not None and self.seg_router_zloss_coef > 0:
+                    aux_loss = aux_loss + self.seg_router_zloss_coef * aux_zloss
+                    out["seg_router_zloss"] = aux_zloss
+                if aux_loss is not None:
+                    total_loss += aux_loss.to(text_loss.dtype)
+                    out["seg_router_aux_loss"] = aux_loss
         out.update({"total_loss": total_loss})
 
         return out
@@ -169,6 +451,20 @@ class CoastGPT(nn.Module):
                 loar_output_path = file_name / "TextLoRA"
             self.language.text_encoder.save_pretrained(str(loar_output_path))
 
+        return dict(vision_ckpt=vision_ckpt, other_ckpt=other_ckpt)
+
+    def custom_export_fp32_state(self) -> Dict[str, Dict[str, torch.Tensor]]:
+        """
+        本地导出 FP32 权重，不依赖 DeepSpeed 已写入的 Zero 检查点。
+
+        用于 NPU/HCCL 环境下的容错保存路径：直接从当前模块聚合 ZeRO-3 参数并转 CPU。
+        """
+        # 直接遍历当前模型参数；maybe_zero_3 在 ZeRO-3 下会自动聚合
+        named_params = list(self.named_parameters())
+        # 视觉分支参数（剥离前缀并转为 CPU Tensor）
+        vision_ckpt = get_rgb_maybe_zero_3(named_params)
+        # 其他关键模块参数（统一转为 CPU Tensor）
+        other_ckpt = get_other_maybe_zero_3(named_params)
         return dict(vision_ckpt=vision_ckpt, other_ckpt=other_ckpt)
     # def custom_save_checkpoint(self, file_name: str):
     #     # 转换 ZeRO 检查点至 FP32 完整权重
@@ -383,6 +679,23 @@ class CoastGPT(nn.Module):
                 param.requires_grad = False
             param.data = param.data.to(dtype=compute_dtype)
 
+        # 物理分支：为避免 AMP 下 dtype 不一致导致的算子报错/NaN，强制使用 float32
+        if getattr(self, "physics_enabled", False) and hasattr(self, "physics"):
+            for p in self.physics.parameters():
+                # 物理分支通常需要训练以优化约束映射
+                p.requires_grad = True
+                p.data = p.data.to(dtype=torch.float32)
+            for name, buffer in self.physics.named_buffers():
+                buffer.data = buffer.data.to(dtype=torch.float32)
+
+        # 分割分支：采用 compute_dtype 参与 AMP 训练
+        if getattr(self, "seg_enabled", False) and hasattr(self, "seg_head"):
+            for p in self.seg_head.parameters():
+                p.requires_grad = True
+                p.data = p.data.to(dtype=compute_dtype)
+            for name, buffer in self.seg_head.named_buffers():
+                buffer.data = buffer.data.to(dtype=compute_dtype)
+
         if tune_im_start and freeze_text:
             # 如果 tune_im_start 为 True 且文本被冻结，则解冻输入嵌入
             for p in self.language.get_text_encoder().get_input_embeddings().parameters():
@@ -412,11 +725,12 @@ def maybe_zero_3(param, ignore_status=False, name=None):
 
 def get_other_maybe_zero_3(named_params):
     # 定义需要处理的键名
-    names = ["multimodal.projection", "embed_tokens"]
+    names = ["multimodal.projection", "embed_tokens", "physics"]
     multimodal_projection = dict()
     text_proj = dict()
     embed_tokens = dict()
     lm_head = dict()
+    physics_ckpt = dict()
 
     # 将输入的 named_params 转换为列表，方便遍历
     params = list(named_params)
@@ -426,6 +740,7 @@ def get_other_maybe_zero_3(named_params):
         embed_tokens=embed_tokens,
         text_proj=text_proj,
         lm_head=lm_head,
+        physics=physics_ckpt,
     )
     # 遍历参数
     for k, v in params:
@@ -434,9 +749,11 @@ def get_other_maybe_zero_3(named_params):
                 # 使用 name 作为键名，而不是其他变量名
                 # 这里需要将 name 映射到 to_return 的键名
                 if name == "multimodal.projection":
-                    to_return["multimodal_projection"][k.split(name + ".")[-1]] = v
+                    to_return["multimodal_projection"][k.split(name + ".")[-1]] = maybe_zero_3(v, ignore_status=True, name=k)
                 elif name == "embed_tokens":
-                    to_return["embed_tokens"][k.split(name + ".")[-1]] = v
+                    to_return["embed_tokens"][k.split(name + ".")[-1]] = maybe_zero_3(v, ignore_status=True, name=k)
+                elif name == "physics":
+                    to_return["physics"][k.split(name + ".")[-1]] = maybe_zero_3(v, ignore_status=True, name=k)
 
     return to_return
 # def get_other_maybe_zero_3(named_params):

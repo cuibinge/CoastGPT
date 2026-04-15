@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 
 import timm.models.vision_transformer  # 导入timm库中的Vision Transformer实现
+import torch_npu
 
 # 自定义Vision Transformer类，继承自timm的实现
 class VisionTransformer(timm.models.vision_transformer.VisionTransformer):

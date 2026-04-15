@@ -1,5 +1,3 @@
-
-#源于LHRS
 import logging
 import os
 import os.path as osp
@@ -35,6 +33,7 @@ from .utils import (
     is_main_process,
     symlink,
 )
+import torch_npu
 
 logger = logging.getLogger("train")
 
@@ -111,9 +110,11 @@ class Trainer:
         elif accelerator == "mps":
             self.device = torch.device("mps")
             self.autocast_type = "cpu"
+        elif accelerator == "npu":
+            self.device = torch.device("npu")
+            self.autocast_type = "npu"
         else:
             raise NotImplementedError
-
         self._hooks: List[HookBase] = []
         self._data_iter = iter(data_loader)
         self._max_num_checkpoints = max_num_checkpoints
@@ -296,10 +297,56 @@ class Trainer:
         logger.info(f"Saving checkpoint to {file_path}")
 
         if self.deepspeed:
-            self.model.save_checkpoint(self.ckpt_dir, file_name, client_state=data)
-            if isinstance(self.model.language.text_encoder, PeftModel):
-                text_path = os.path.join(self.ckpt_dir, "TextLoRA")
-                self.model.language.text_encoder.save_pretrained(text_path)
+            try:
+                import torch_npu
+                torch_npu.npu.synchronize()
+            except Exception:
+                pass
+            # With DeepSpeed's TorchCheckpointEngine, multiple ranks writing the same file
+            # can corrupt the archive and trigger "unexpected pos" / "file write failed".
+            # Gate the actual file write to the main process and synchronize others.
+            from .utils import is_main_process
+            import torch.distributed as dist
+
+            if is_main_process():
+                try:
+                    # Prefer DeepSpeed's engine save when available
+                    self.model.save_checkpoint(self.ckpt_dir, file_name, client_state=data)
+                    # Unwrap DeepSpeed/Distributed wrappers to access the underlying model
+                    base_model = self.model.module if hasattr(self.model, "module") else self.model
+                    # CoastGPT uses `language` for the text module; keep backward compatibility with `text`
+                    language_module = getattr(base_model, "language", getattr(base_model, "text", None))
+                    if language_module is not None and isinstance(language_module.text_encoder, PeftModel):
+                        text_path = os.path.join(self.ckpt_dir, "TextLoRA")
+                        language_module.text_encoder.save_pretrained(text_path)
+                except Exception as e:
+                    logger.error(f"[Torch] DeepSpeed save_checkpoint failed: {e}. Falling back to local FP32 export.")
+                    # Fallback path: export FP32 weights from the current module without DS tag writes
+                    base_model = self.model.module if hasattr(self.model, "module") else self.model
+                    # Build minimal client state (optimizer is managed by DS, so we skip here)
+                    local_state = {
+                        "cur_stat": self.cur_stat,
+                        "num_gpus": get_world_size(),
+                        "metric_storage": self.metric_storage,
+                    }
+                    # Use model-provided exporter if available for ZeRO-3 safe gather
+                    exporter = getattr(base_model, "custom_export_fp32_state", None)
+                    if callable(exporter):
+                        local_state["model"] = exporter()
+                    else:
+                        # Last resort: plain state_dict (may be partial under ZeRO-3)
+                        module_obj = base_model if isinstance(base_model, nn.Module) else self.model_or_module
+                        local_state["model"] = module_obj.state_dict()
+                    # Save to file
+                    torch.save(local_state, file_path)
+                    # Save LoRA adapters as well if present
+                    language_module = getattr(base_model, "language", getattr(base_model, "text", None))
+                    if language_module is not None and isinstance(language_module.text_encoder, PeftModel):
+                        text_path = os.path.join(self.ckpt_dir, "TextLoRA")
+                        language_module.text_encoder.save_pretrained(text_path)
+            # Ensure non-main ranks wait until checkpoint is fully written
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
         else:
             torch.save(data, file_path)
 
@@ -318,7 +365,34 @@ class Trainer:
         assert (checkpoint is not None) ^ (path != "")
 
         if self.deepspeed:
-            _, checkpoint = self.model.load_checkpoint(path)
+            # DeepSpeed tag-based resume (directory path)
+            if path and os.path.isdir(path):
+                _, checkpoint = self.model.load_checkpoint(path)
+            else:
+                # Fallback resume from locally saved file (torch.save)
+                if path:
+                    logger.info(f"Loading fallback checkpoint from {path} ...")
+                    checkpoint = torch.load(path, map_location="cpu")
+                else:
+                    checkpoint = None
+                if checkpoint is None:
+                    return
+                # Load model weights into the underlying module
+                base_model = self.model.module if hasattr(self.model, "module") else self.model
+                if hasattr(base_model, "custom_load_state_dict"):
+                    incompatible = base_model.custom_load_state_dict(path, strict=False)
+                else:
+                    incompatible = base_model.load_state_dict(checkpoint["model"], strict=False)
+                if incompatible is not None and getattr(incompatible, "missing_keys", []):
+                    logger.warning(
+                        "Encounter missing keys when loading model weights (DS fallback):\n"
+                        f"{incompatible.missing_keys}"
+                    )
+                if incompatible is not None and getattr(incompatible, "unexpected_keys", []):
+                    logger.warning(
+                        "Encounter unexpected keys when loading model weights (DS fallback):\n"
+                        f"{incompatible.unexpected_keys}"
+                    )
         else:
             if path:
                 logger.info(f"Loading checkpoint from {path} ...")

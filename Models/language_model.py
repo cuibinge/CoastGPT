@@ -20,6 +20,7 @@ from . import (
     IGNORE_INDEX,
     IMAGE_TOKEN_INDEX,
 )
+import torch_npu
 
 logger = logging.getLogger("train")
 type_dict = {
@@ -89,7 +90,7 @@ class LanguageModel(nn.Module):
         ):
             device = torch.device("cuda:" + os.environ["CUDA_VISABLE_DEVICES"])
         else:
-            device = torch.device("cuda")
+            device = torch.device("npu")
         if config.bits in [4, 8]:
             from transformers import BitsAndBytesConfig
 
@@ -257,15 +258,15 @@ class LanguageModel(nn.Module):
         """
         return x
 
-    # 修改decode方法
     def decode(
         self,
         input_ids: torch.Tensor,
         image_embedding: torch.Tensor = None,
         attention_mask: Optional[Union[torch.Tensor, None]] = None,
         labels: torch.Tensor = None,
-        output_attentions: bool = False,
-    ) -> Union[torch.Tensor, Dict]:
+    ) -> Tuple[torch.Tensor]:
+        #    cl_loss_func: Callable = None,
+        #    cl_logit_scale: torch.Tensor = None) -> Tuple[torch.Tensor]:
         (
             input_ids,
             attention_mask,
@@ -279,7 +280,26 @@ class LanguageModel(nn.Module):
             image_embedding=image_embedding if image_embedding is not None else None,
             past_key_values=None,
         )
-    
+        # Sanitize embeddings to avoid NaNs/Infs propagating into logits
+        if inputs_embeds is not None:
+            inputs_embeds = torch.nan_to_num(inputs_embeds)
+
+        # If all labels are IGNORE_INDEX, some backends can return NaN loss.
+        # Guard by short-circuiting to zero loss in that case.
+        valid_label_count = None
+        if labels is not None:
+            try:
+                valid_label_count = torch.count_nonzero(labels.ne(IGNORE_INDEX)).item()
+            except Exception:
+                # Fallback in case labels dtype/device cause issues
+                valid_label_count = int((labels != IGNORE_INDEX).sum().item())
+
+        if labels is not None and valid_label_count == 0:
+            logger.warning("All labels are IGNORE_INDEX for current batch; returning zero loss to avoid NaN.")
+            # Return a zero scalar loss tensor on the correct device/dtype
+            zero_loss = torch.zeros((), device=input_ids.device, dtype=torch.float32)
+            return zero_loss
+
         outputs = self.text_encoder(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -287,31 +307,22 @@ class LanguageModel(nn.Module):
             inputs_embeds=inputs_embeds,
             labels=labels,
             output_hidden_states=True,
-            output_attentions=output_attentions,  # 输出注意力图
             use_cache=False,
             return_dict=True,
         )
-    
-        if output_attentions:
-            return outputs
-        else:
-            return outputs["loss"]
-    
-    # 修改forward方法
+
+        text_loss = outputs["loss"]
+
+        return text_loss
+
     def forward(
         self,
         x: Dict[str, Union[str, torch.Tensor, BatchEncoding]],
         multimodal_embedding: torch.Tensor = None,
-        output_attentions: bool = False,
         **kwargs,
     ):
         modal_input = self.get_modal_input(x)
-        return self.decode(
-            **self.encode(modal_input), 
-            image_embedding=multimodal_embedding, 
-            output_attentions=output_attentions,
-            **kwargs
-        )
+        return self.decode(**self.encode(modal_input), image_embedding=multimodal_embedding, **kwargs)
 
 
     def prepare_inputs_for_multimodal(

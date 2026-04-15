@@ -4,6 +4,11 @@ from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from torchvision import transforms
 from transformers import CLIPImageProcessor
+# 在不支持 NPU 的环境下忽略 torch_npu 导入错误
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    pass
 
 # 定义四通道数据的均值和标准差
 IMAGENET_FOUR_CHANNEL_DEFAULT_MEAN = IMAGENET_DEFAULT_MEAN + (0.5,)

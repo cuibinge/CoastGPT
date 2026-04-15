@@ -1,6 +1,7 @@
 import torch
 from torchvision.datasets import ImageFolder
 from transformers import CLIPImageProcessor
+import torch_npu
 
 CLASS_NAME_MAP = {
     "AID": [

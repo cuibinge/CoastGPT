@@ -1,5 +1,5 @@
-OUTPUT_PATH=""  # Path to save the output
-DATA_PATH=""  # Path to the step_one dataset
+OUTPUT_PATH="./Checkpoints"  # Path to save the output
+DATA_PATH="../Data/PretrainData"  # Path to the step_one dataset
 SCRIPT_PATH=./train_stage_one.py
 CONFIG_PATH=./Configs/train.yaml
 
@@ -9,10 +9,12 @@ deepspeed \
     $SCRIPT_PATH \
     -c \
     $CONFIG_PATH \
-    --batch-size 8 \
+    --batch-size 4 \
     --workers 4 \
     --data-path $DATA_PATH \
     --output $OUTPUT_PATH \
-    --accelerator "gpu" \
+    --accelerator "npu" \
     --enable-amp True \
     --use-checkpoint \
+    --wandb False \
+    --name "stage1"

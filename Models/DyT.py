@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import torch_npu
+
 class DyT(nn.Module):
     def __init__(self,num_features):
         super().__init__()

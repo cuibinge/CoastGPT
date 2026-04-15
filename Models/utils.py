@@ -1,5 +1,10 @@
 import torch
 from transformers import StoppingCriteria
+# 在不支持 NPU 的环境下忽略 torch_npu 导入错误
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    pass
 
 type_dict = {
     "float32": torch.float32,

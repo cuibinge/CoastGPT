@@ -1,4 +1,10 @@
-/.idea
-models/__pycache__/__init__.cpython-310.pyc
-models/__pycache__/test4MTP.cpython-310-pytest-8.3.4.pyc
-models/__pycache__/ViT_MTP.cpython-310.pyc
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Also ignore possible misspelled pycache directories/files
+_pychche_/
+**/_pychche_/
+
+lhrs_webui.py
+
