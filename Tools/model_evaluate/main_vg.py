@@ -21,7 +21,6 @@ import torch
 import torch.backends.cudnn as cudnn  # CUDA优化
 import torch.distributed as dist  # 分布式训练支持
 import wandb  # 实验跟踪工具
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -117,11 +116,9 @@ def parse_option():
     # 基本参数
     parser.add_argument("--batch-size", type=int, help="batch size for single GPU")
     parser.add_argument("--data-path", type=str, default="Data/Stage2Data/RSVG_Image", help="path to dataset")
-    parser.add_argument("--data-target", type=str, default="Data/Stage2Data/RSVG.json",
-                        help="path to dataset annotation file ")
+    parser.add_argument("--data-target", type=str, default="Data/Stage2Data/RSVG.json", help="path to dataset annotation file ")
     parser.add_argument("--workers", type=int, default=8, help="workers of dataloader")
-    parser.add_argument("--model-path", type=str, default="Checkpoint/test/checkpoints/FINAL.pt",
-                        help="pretrained checkpoint path")
+    parser.add_argument("--model-path", type=str, default="Checkpoint/test/checkpoints/FINAL.pt", help="pretrained checkpoint path")
     parser.add_argument("--enable-amp", type=str2bool, default=False, help="mixed precision")
     parser.add_argument(
         "--output",
@@ -216,7 +213,7 @@ def main(config: ml_collections.ConfigDict):
         if config.is_distribute:
             device = torch.device(getattr(config, "local_rank", 0))
         elif (
-                "CUDA_VISABLE_DEVICES" in os.environ.keys() and len(os.environ["CUDA_VISABLE_DEVICES"].split(",")) == 1
+            "CUDA_VISABLE_DEVICES" in os.environ.keys() and len(os.environ["CUDA_VISABLE_DEVICES"].split(",")) == 1
         ):
             device = torch.device("cuda:" + os.environ["CUDA_VISABLE_DEVICES"])
         else:
@@ -230,7 +227,7 @@ def main(config: ml_collections.ConfigDict):
     with torch.no_grad():  # 禁用梯度计算
         # 使用进度条遍历数据加载器
         for image, input_ids, targets, file_name, attention_mask in tqdm(
-                data_loader, unit_scale=config.batch_size, desc="Evaluating"
+            data_loader, unit_scale=config.batch_size, desc="Evaluating"
         ):
             # 将数据移动到相应设备
             image = image.to(device)
@@ -243,9 +240,9 @@ def main(config: ml_collections.ConfigDict):
 
             # 使用自动混合精度（如果启用）
             with torch.autocast(
-                    device_type="cuda" if config.accelerator == "gpu" else "cpu",
-                    enabled=config.enable_amp,
-                    dtype=dtype,
+                device_type="cuda" if config.accelerator == "gpu" else "cpu",
+                enabled=config.enable_amp,
+                dtype=dtype,
             ):
                 # 使用模型生成边界框预测
                 output_ids = model.generate(

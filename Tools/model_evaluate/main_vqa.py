@@ -1,14 +1,33 @@
+"""
+视觉问答任务推理脚本，负责生成预测结果 json 文件
+------------------------------------------------
+功能：
+1. 解析命令行配置
+2. 初始化（包括分布式设置）
+3. 加载模型（CoastGPT）和数据集（RSVQAHR / RSVQALR）
+4. 对测试集进行推理（支持混合精度）
+5. 生成预测结果 json 文件
+"""
+
 import json
+import sys
+from pathlib import Path
 import logging
 import os
 import re
+from collections import defaultdict
+from typing import List
 
 import ml_collections.config_dict
 import numpy as np
 import torch
-import torch.backends.cudnn as cudnn
-import torch.distributed as dist
-import wandb
+import torch.backends.cudnn as cudnn  # 用于优化CUDA深度学习运算
+import torch.distributed as dist  # 分布式训练支持
+import wandb  # 实验跟踪和可视化工具
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from Trainer import init_distributed
 from Trainer.utils import ConfigArgumentParser, setup_logger, str2bool
 from Trainer.utils.distribute import (
@@ -17,50 +36,46 @@ from Trainer.utils.distribute import (
     is_distributed,
     is_main_process,
 )
-from Dataset import DataCollatorForVGSupervisedDataset, VGEvalDataset
-from Dataset.conversation import default_conversation
-from Models import build_model
-from utils import type_dict
-from tqdm import tqdm
-from transformers import CLIPImageProcessor
+from Dataset import RSVQAHR, RSVQALR, DataCollatorForVQASupervisedDataset
+from Models.coastgpt import CoastGPT  # 主要模型
 
-logger = logging.getLogger("train")
+from tqdm import tqdm  # 进度条显示
+from transformers import CLIPImageProcessor  # 图像预处理
 
-
-def calculate_iou(box1, box2):
-    x1, y1, x2, y2 = box1
-    x3, y3, x4, y4 = box2
-
-    intersection_x1 = max(x1, x3)
-    intersection_y1 = max(y1, y3)
-    intersection_x2 = min(x2, x4)
-    intersection_y2 = min(y2, y4)
-
-    intersection_area = max(0, intersection_x2 - intersection_x1 + 1) * max(
-        0, intersection_y2 - intersection_y1 + 1
-    )
-
-    box1_area = (x2 - x1 + 1) * (y2 - y1 + 1)
-    box2_area = (x4 - x3 + 1) * (y4 - y3 + 1)
-
-    union_area = box1_area + box2_area - intersection_area
-
-    iou = intersection_area / union_area
-
-    return iou
+# 数据类型映射字典
+type_dict = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+logger = logging.getLogger("train")  # 创建日志记录器
 
 
 def save_result(result, result_dir, filename, remove_duplicate=""):
+    """
+    保存推理结果到JSON文件，支持分布式环境下的结果合并
+
+    参数:
+        result: 要保存的结果数据
+        result_dir: 结果目录路径
+        filename: 输出文件名
+        remove_duplicate: 去重字段名（可选）
+    """
+    # 为每个进程创建单独的结果文件
     result_file = os.path.join(result_dir, "%s_rank%d.json" % (filename, get_rank()))
+    # 最终合并后的结果文件
     final_result_file = os.path.join(result_dir, "%s.json" % filename)
 
+    # 保存当前进程的结果
     json.dump(result, open(result_file, "w"))
 
+    # 分布式环境下等待所有进程完成
     if is_distributed():
         dist.barrier()
 
+    # 主进程负责合并所有结果
     if is_main_process():
-        # combine results from all processes
+        # 合并所有进程的结果
         result = []
 
         for rank in range(get_world_size()):
@@ -68,6 +83,7 @@ def save_result(result, result_dir, filename, remove_duplicate=""):
             res = json.load(open(result_file, "r"))
             result += res
 
+        # 如果需要去重
         if remove_duplicate:
             result_new = []
             id_list = []
@@ -77,6 +93,7 @@ def save_result(result, result_dir, filename, remove_duplicate=""):
                     result_new.append(res)
             result = result_new
 
+        # 保存最终结果
         json.dump(result, open(final_result_file, "w"))
         logger.info("result file saved to %s" % final_result_file)
 
@@ -84,6 +101,12 @@ def save_result(result, result_dir, filename, remove_duplicate=""):
 
 
 def parse_option():
+    """
+    解析命令行参数和配置文件
+
+    返回:
+        config: 配置对象
+    """
     parser = ConfigArgumentParser()
     parser.add_argument(
         "--opts",
@@ -92,12 +115,19 @@ def parse_option():
         nargs="+",
     )
 
-    # basic
+    # 基本参数
     parser.add_argument("--batch-size", type=int, help="batch size for single GPU")
-    parser.add_argument("--data-path", type=str, default="Data/Stage2Data/RSVG_Image", help="path to dataset")
-    parser.add_argument("--data-target", type=str, default="Data/Stage2Data/RSVG.json", help="path to dataset annotation file ")
+    parser.add_argument("--data-path", type=str, help="path to dataset")
+    parser.add_argument("--data-target", type=str, help="path to dataset annotation file ")
+    parser.add_argument(
+        "--data-type",
+        type=str,
+        choices=["LR", "HR"],
+        help="VQA dataset type",
+        default="HR",
+    )
     parser.add_argument("--workers", type=int, default=8, help="workers of dataloader")
-    parser.add_argument("--model-path", type=str, default="Checkpoint/test/checkpoints/FINAL.pt", help="pretrained checkpoint path")
+    parser.add_argument("--model-path", type=str, default=None, help="pretrained checkpoint path")
     parser.add_argument("--enable-amp", type=str2bool, default=False, help="mixed precision")
     parser.add_argument(
         "--output",
@@ -120,12 +150,12 @@ def parse_option():
         help="Use Infinite loader if ture, else default datalodaer (Usually, inf_sampler for iterbased training)",
     )
 
-    # wandb
+    # wandb参数
     parser.add_argument("--wandb", type=str2bool, default=False, help="wandb logger")
     parser.add_argument("--entity", type=str, default="pumpkinn", help="wandb entity")
     parser.add_argument("--project", type=str, default="MaskIndexNet", help="wandb project")
 
-    # HardWare
+    # 硬件参数
     parser.add_argument(
         "--accelerator",
         default="cpu",
@@ -135,6 +165,7 @@ def parse_option():
     )
     parser.add_argument("--local_rank", type=int, help="local rank")
 
+    # 解析参数并转换为配置字典
     config = parser.parse_args(wandb=True)
     config = ml_collections.config_dict.ConfigDict(config)
 
@@ -142,162 +173,135 @@ def parse_option():
 
 
 def main(config: ml_collections.ConfigDict):
+    """主推理函数"""
     logger.info(f"Creating model")
-    model = build_model(config, activate_modal=("rgb", "text"))
+    # 创建CoastGPT模型
+    model = CoastGPT(config)
+    # 设置数据类型
     dtype = type_dict[config.dtype]
     model.to(dtype)
 
-    vis_transform = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
-    dataset = VGEvalDataset(
-        root=config.data_path,
-        target=config.data_target,
-        transform=vis_transform,
-        tokenizer=model.text.tokenizer,
-    )
+    # 加载CLIP图像处理器用于图像预处理
+    vis_transform = CLIPImageProcessor.from_pretrained("/root/autodl-tmp/clip-vit-large-patch14")
+
+    # 根据数据类型选择相应的数据集
+    if config.data_type == "HR":
+        dataset = RSVQAHR(
+            root=config.data_target,
+            image_root=config.data_path,
+            image_transform=vis_transform,
+            split="test",
+            token_prefix="<image>[VQA] ",
+            prompt_type=config.prompt_template,
+            tokenizer=model.language.tokenizer,
+        )
+    else:
+        dataset = RSVQALR(
+            root=config.data_target,
+            image_root=config.data_path,
+            image_transform=vis_transform,
+            split="test",
+            token_prefix="<image>[VQA] ",
+            prompt_type=config.prompt_template,
+            tokenizer=model.language.tokenizer,
+        )
     logger.info(f"Data Length: {len(dataset)}")
 
+    # 创建数据加载器
     data_loader = torch.utils.data.DataLoader(
         dataset,
         num_workers=config.workers,
         pin_memory=True,
         batch_size=config.batch_size,
         shuffle=False,
-        collate_fn=DataCollatorForVGSupervisedDataset(model.text.tokenizer),
+        collate_fn=DataCollatorForVQASupervisedDataset(model.language.tokenizer),
     )
 
+    # 加载预训练模型权重
     if config.model_path is not None:
         logger.info(f"Loading pretrained checkpoint from {config.model_path}")
         if getattr(model, "custom_load_state_dict", False):
+            # 使用自定义加载方法
             msg = model.custom_load_state_dict(config.model_path)
         else:
+            # 标准加载方法
             ckpt = torch.load(config.model_path, map_location="cpu")
             msg = model.load_state_dict(ckpt["model"], strict=False)
         if msg is not None:
             logger.info(f"After loading, missing keys: {msg.missing_keys}, unexpected keys: {msg.unexpected_keys}")
             logger.info(str(model))
 
+    # 设置设备
     if config.accelerator == "gpu":
-        if config.is_distribute:
-            device = torch.device(getattr(config, "local_rank", 0))
-        elif (
-            "CUDA_VISABLE_DEVICES" in os.environ.keys() and len(os.environ["CUDA_VISABLE_DEVICES"].split(",")) == 1
-        ):
-            device = torch.device("cuda:" + os.environ["CUDA_VISABLE_DEVICES"])
-        else:
-            device = torch.device("cuda")
+        device = torch.device("cuda")
     else:
         device = torch.device(config.accelerator)
     model.to(device)
-    model.eval()
+    model.eval()  # 设置为评估模式
 
-    preds = []
-    with torch.no_grad():
-        for image, input_ids, targets, file_name, attention_mask in tqdm(
-            data_loader, unit_scale=config.batch_size, desc="Evaluating"
-        ):
-            image = image.to(device)
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
+    preds = []  # 存储预测结果
+    with torch.no_grad():  # 禁用梯度计算
+        # 使用进度条遍历数据加载器
+        for data_dict in tqdm(data_loader, unit_scale=config.batch_size, desc="Evaluating"):
+            # 将数据移动到相应设备
+            images = data_dict["images"].to(device)
+            questions = data_dict["questions"].to(device)
+            attention_mask = data_dict["attn_mask"].to(device)
 
-            if input_ids.shape[0] != image.shape[0]:
-                # last iter
-                input_ids = input_ids[: image.shape[0]]
+            # 获取目标和其他元数据
+            targets = data_dict["targets"]
+            types = data_dict["types"]
+            questions_idx = data_dict["questions_idx"]
 
+            # 处理最后一个批次可能的大小不匹配问题
+            if questions.shape[0] != images.shape[0]:
+                questions = questions[: images.shape[0]]
+
+            # 使用自动混合精度（如果启用）
             with torch.autocast(
                 device_type="cuda" if config.accelerator == "gpu" else "cpu",
                 enabled=config.enable_amp,
                 dtype=dtype,
             ):
+                # 使用模型生成答案
                 output_ids = model.generate(
-                    input_ids=input_ids,
-                    images=image,
-                    num_beams=1,
-                    attention_mask=attention_mask,
-                    do_sample=False,
+                    input_ids=questions,
+                    images=images,
+                    do_sample=False,  # 不使用采样
+                    num_beams=1,  # 使用贪婪搜索
                     temperature=1.0,
                     top_p=1.0,
-                    max_new_tokens=100,
+                    attention_mask=attention_mask,
+                    max_new_tokens=50,  # 最大生成长度
                 )
 
-            outputs = model.text.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+            # 解码生成的token ID为文本
+            outputs = model.language.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
             outputs = [output.strip() for output in outputs]
-            for pred, target, name in zip(outputs, targets, file_name):
-                preds.append(dict(pred=pred, target=target, filename=name))
 
-    save_result(preds, config.output, "eval_save_file", "filename")
-    if is_main_process():
-        pattern = r"\[([0-9., ]+)\]"
+            # 收集预测结果
+            for pred, target, types, question_id in zip(outputs, targets, types, questions_idx):
+                preds.append(dict(pred=pred, target=target, types=types, question_id=question_id))
 
-        with open(os.path.join(config.output, "eval_save_file.json")) as f:
-            predictions = json.load(f)
-
-        parse_result = []
-        fail_instance = 0
-        for item in predictions:
-            pred_match = re.findall(pattern, item["pred"])
-            if len(pred_match) == 0:
-                fail_instance += 1
-
-            try:
-                pred_result = [list(map(float, match.split(","))) for match in pred_match]
-            except:
-                fail_instance += 1
-                continue
-
-            target_match = re.findall(pattern, item["target"])
-            target_result = [list(map(float, match.split(","))) for match in target_match]
-
-            new_pred_result = []
-            new_target_result = []
-            for pred, target in zip(pred_result, target_result):
-                if len(pred) == 4:
-                    new_pred_result.append(pred)
-                    new_target_result.append(target)
-                elif len(pred) > 4:
-                    while len(pred) != 4:
-                        pred.pop()
-                    new_pred_result.append(pred)
-                    new_target_result.append(target)
-                else:
-                    fail_instance += 1
-
-            if len(new_pred_result) > 0:
-                parse_result.append(
-                    dict(
-                        filename=item["filename"],
-                        pred=new_pred_result,
-                        target=new_target_result,
-                    )
-                )
-
-        count = 0
-        total = 0
-        for item in parse_result:
-            preds = item["pred"]
-            targets = item["target"]
-
-            for pred, target in zip(preds, targets):
-                iou_score = calculate_iou(pred, target)
-                if iou_score > 0.5:
-                    count += 1
-                total += 1
-
-        logger.info(f"Accuracy: {count / total * 100}")
-        logger.info(f"Fail Sample: {fail_instance}")
-        logger.info(f"Accuracy With Fail Sample: {count / (total + fail_instance) * 100}")
+    # 保存结果到JSON文件
+    save_result(preds, config.output, "RSVQA_LR_result", "question_id")
 
 
 if __name__ == "__main__":
+    # 解析配置
     config = parse_option()
 
+    # 初始化分布式设置
     config.rank, config.local_rank, config.world_size = init_distributed()
     config.is_distribute = config.world_size > 1
     config.adjust_norm = False
     print(config)
 
+    # 设置日志记录器
     setup_logger("train", output=config.output, rank=config.rank)
     os.makedirs(config.output, exist_ok=True)
 
+    # 设置随机种子以确保可重复性
     if config.is_distribute:
         seed = config.seed + dist.get_rank()
     else:
@@ -305,8 +309,9 @@ if __name__ == "__main__":
 
     torch.manual_seed(seed)
     np.random.seed(seed)
-    cudnn.benchmark = True
+    cudnn.benchmark = True  # 启用CuDNN自动优化
 
+    # 主进程保存完整配置
     if config.rank == 0:
         path = os.path.join(config.output, "config.json")
         with open(path, "w") as f:
@@ -315,8 +320,10 @@ if __name__ == "__main__":
         logger.info(f"Full config saved to {path}")
         logger.info(config)
 
+    # 初始化W&B（如果启用）
     if config.wandb and config.rank == 0:
         wandb.init(config=config.to_dict(), entity=config.entity, project=config.project)
         config = wandb.config
 
+    # 运行主函数
     main(config)

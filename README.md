@@ -16,7 +16,7 @@ git clone git@github.com:cuibinge/CoastGPT.git
 cd CoastGPT
 conda create -n CoastGPT python=3.10
 conda activate CoastGPT
-pip install requirement
+pip install -r requirements.txt
 ```
 本研究的实验与计算工作依托于华为昇腾AI云服务平台完成，特此对其提供的稳定算力支持表示感谢。
 
