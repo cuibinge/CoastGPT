@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from timm.layers import LayerNorm2d
+import torch_npu
 
 
 class DynamicTanh(nn.Module):

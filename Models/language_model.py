@@ -20,6 +20,7 @@ from . import (
     IGNORE_INDEX,
     IMAGE_TOKEN_INDEX,
 )
+import torch_npu
 
 logger = logging.getLogger("train")
 type_dict = {
@@ -89,7 +90,7 @@ class LanguageModel(nn.Module):
         ):
             device = torch.device("cuda:" + os.environ["CUDA_VISABLE_DEVICES"])
         else:
-            device = torch.device("cuda")
+            device = torch.device("npu")
         if config.bits in [4, 8]:
             from transformers import BitsAndBytesConfig
 
@@ -279,6 +280,25 @@ class LanguageModel(nn.Module):
             image_embedding=image_embedding if image_embedding is not None else None,
             past_key_values=None,
         )
+        # Sanitize embeddings to avoid NaNs/Infs propagating into logits
+        if inputs_embeds is not None:
+            inputs_embeds = torch.nan_to_num(inputs_embeds)
+
+        # If all labels are IGNORE_INDEX, some backends can return NaN loss.
+        # Guard by short-circuiting to zero loss in that case.
+        valid_label_count = None
+        if labels is not None:
+            try:
+                valid_label_count = torch.count_nonzero(labels.ne(IGNORE_INDEX)).item()
+            except Exception:
+                # Fallback in case labels dtype/device cause issues
+                valid_label_count = int((labels != IGNORE_INDEX).sum().item())
+
+        if labels is not None and valid_label_count == 0:
+            logger.warning("All labels are IGNORE_INDEX for current batch; returning zero loss to avoid NaN.")
+            # Return a zero scalar loss tensor on the correct device/dtype
+            zero_loss = torch.zeros((), device=input_ids.device, dtype=torch.float32)
+            return zero_loss
 
         outputs = self.text_encoder(
             input_ids=input_ids,

@@ -3,6 +3,7 @@ import torch  # 导入PyTorch核心库
 import torch.nn as nn  # 导入PyTorch的神经网络模块
 from typing import Dict, List, Optional, Tuple, Union
 from .common_arch import AttnPooler, LayerNorm, LayerNormFp32
+import torch_npu
 
 
 class EmbeddingModel(nn.Module):
@@ -30,8 +31,9 @@ class EmbeddingModel(nn.Module):
             num_query=config.rgb_vision.attn_pooler.num_query,
             num_layers=config.rgb_vision.attn_pooler.num_layers,
             num_attention_heads=config.rgb_vision.attn_pooler.num_attn_heads,
-            encoder_hidden_size=config.vision.embedding_dim,
-            hidden_size=config.vision.embedding_dim,
+            # Align with DualVisionEncoder output channels
+            encoder_hidden_size=getattr(config, "alignment_dim", 768),
+            hidden_size=getattr(config, "alignment_dim", 768),
             output_size=config.text.hidden_size,
             norm_layer=norm_layer,
             checkpoint=getattr(config, "use_checkpoint", False),

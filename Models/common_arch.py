@@ -1,3 +1,4 @@
+import os
 from collections import OrderedDict
 from typing import Callable, List, Optional, Union
 
@@ -5,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+import torch_npu
 
 
 class TextProjHead(nn.Module):
@@ -144,12 +146,37 @@ class AttnPooler(nn.Module):
             stage1_query, stage2_query, stage3_query = torch.split(
                 query_tokens, self.num_query // self.stage_num, dim=1
             )
+            stage_query_sizes = [
+                self.num_query // self.stage_num,
+                self.num_query // self.stage_num,
+                self.num_query // self.stage_num,
+            ]
         else:
             stage1_query, stage2_query, stage3_query = torch.split(
                 query_tokens, self.stage_num, dim=1
             )
+            stage_query_sizes = list(self.stage_num)
+
+        # Robust image split: if preset split_part doesn't match sequence length, derive sizes proportionally to query splits
+        L = image_embs.size(1)
+        preset_sum = sum(self.split_part) if isinstance(self.split_part, (list, tuple)) else None
+        if isinstance(self.split_part, (list, tuple)) and preset_sum == L:
+            split_sizes = list(self.split_part)
+        else:
+            base = sum(stage_query_sizes)
+            # Avoid division by zero
+            if base == 0:
+                split_sizes = [L // 3, L // 3, L - 2 * (L // 3)]
+            else:
+                # Proportional allocation, ensure exact sum to L
+                sizes = [int(round(L * s / base)) for s in stage_query_sizes]
+                diff = L - sum(sizes)
+                # Adjust last bucket to absorb rounding difference
+                sizes[-1] += diff
+                split_sizes = sizes
+
         stage1_image, stage2_image, stage3_image = torch.split(
-            image_embs, self.split_part, dim=1
+            image_embs, split_sizes, dim=1
         )
 
         all_tokens = []
@@ -271,6 +298,10 @@ class ResidualAttentionBlock(nn.Module):
         is_cross_attention: bool = False,
     ):
         super().__init__()
+        self.disable_npu_sdpa = (
+            os.environ.get("COASTGPT_DISABLE_NPU_SDPA", "1").lower()
+            not in ("0", "false", "no")
+        )
 
         self.ln_1 = norm_layer(d_model)
         self.attn = nn.MultiheadAttention(d_model, n_head)
@@ -299,6 +330,112 @@ class ResidualAttentionBlock(nn.Module):
             else nn.Identity()
         )
 
+    def _should_use_manual_attention(self, q_x: torch.Tensor) -> bool:
+        return q_x.device.type == "npu" and self.disable_npu_sdpa
+
+    def _expand_attn_mask(
+        self,
+        attn_mask: torch.Tensor,
+        batch_size: int,
+        num_heads: int,
+        tgt_len: int,
+        src_len: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        mask = attn_mask.to(device=device)
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0).unsqueeze(0)
+        elif mask.dim() == 3:
+            if mask.shape[0] == batch_size * num_heads:
+                mask = mask.view(batch_size, num_heads, tgt_len, src_len)
+            elif mask.shape[0] == batch_size:
+                mask = mask.unsqueeze(1)
+            else:
+                raise ValueError(
+                    f"Unsupported 3D attention mask shape: {tuple(mask.shape)}"
+                )
+        elif mask.dim() != 4:
+            raise ValueError(
+                f"Unsupported attention mask dimension: {mask.dim()}"
+            )
+
+        if mask.shape[-2:] != (tgt_len, src_len):
+            raise ValueError(
+                "Attention mask shape does not match attention scores: "
+                f"expected (*, *, {tgt_len}, {src_len}), got {tuple(mask.shape)}"
+            )
+
+        if mask.dtype == torch.bool:
+            return mask
+        return mask.to(dtype=dtype)
+
+    def _manual_attention(
+        self,
+        q_x: torch.Tensor,
+        k_x: torch.Tensor,
+        v_x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        embed_dim = self.attn.embed_dim
+        num_heads = self.attn.num_heads
+        head_dim = embed_dim // num_heads
+        tgt_len, batch_size, _ = q_x.shape
+        src_len = k_x.shape[0]
+
+        w_q, w_k, w_v = self.attn.in_proj_weight.chunk(3, dim=0)
+        if self.attn.in_proj_bias is None:
+            b_q = b_k = b_v = None
+        else:
+            b_q, b_k, b_v = self.attn.in_proj_bias.chunk(3, dim=0)
+
+        q = F.linear(q_x, w_q, b_q)
+        k = F.linear(k_x, w_k, b_k)
+        v = F.linear(v_x, w_v, b_v)
+
+        q = q.contiguous().view(tgt_len, batch_size, num_heads, head_dim)
+        k = k.contiguous().view(src_len, batch_size, num_heads, head_dim)
+        v = v.contiguous().view(src_len, batch_size, num_heads, head_dim)
+
+        q = q.permute(1, 2, 0, 3)
+        k = k.permute(1, 2, 0, 3)
+        v = v.permute(1, 2, 0, 3)
+
+        # Keep score computation on the eager path to avoid torch_npu flash-attention kernels.
+        attn_scores = torch.matmul(q.float(), k.float().transpose(-2, -1))
+        attn_scores = attn_scores * (head_dim ** -0.5)
+
+        if attn_mask is not None:
+            expanded_mask = self._expand_attn_mask(
+                attn_mask=attn_mask,
+                batch_size=batch_size,
+                num_heads=num_heads,
+                tgt_len=tgt_len,
+                src_len=src_len,
+                dtype=attn_scores.dtype,
+                device=attn_scores.device,
+            )
+            if expanded_mask.dtype == torch.bool:
+                attn_scores = attn_scores.masked_fill(
+                    expanded_mask, torch.finfo(attn_scores.dtype).min
+                )
+            else:
+                attn_scores = attn_scores + expanded_mask
+
+        attn_probs = F.softmax(attn_scores, dim=-1, dtype=torch.float32)
+        if self.attn.dropout > 0:
+            attn_probs = F.dropout(
+                attn_probs, p=self.attn.dropout, training=self.training
+            )
+        attn_probs = attn_probs.to(dtype=v.dtype)
+
+        attn_output = torch.matmul(attn_probs, v)
+        attn_output = attn_output.permute(2, 0, 1, 3).contiguous()
+        attn_output = attn_output.view(tgt_len, batch_size, embed_dim)
+        return F.linear(
+            attn_output, self.attn.out_proj.weight, self.attn.out_proj.bias
+        )
+
     def attention(
         self,
         q_x: torch.Tensor,
@@ -309,7 +446,10 @@ class ResidualAttentionBlock(nn.Module):
         k_x = k_x if k_x is not None else q_x
         v_x = v_x if v_x is not None else q_x
 
-        attn_mask = attn_mask.to(q_x.dtype) if attn_mask is not None else None
+        if attn_mask is not None and attn_mask.dtype != torch.bool:
+            attn_mask = attn_mask.to(q_x.dtype)
+        if self._should_use_manual_attention(q_x):
+            return self._manual_attention(q_x, k_x, v_x, attn_mask=attn_mask)
         return self.attn(q_x, k_x, v_x, need_weights=False, attn_mask=attn_mask)[0]
 
     def forward(

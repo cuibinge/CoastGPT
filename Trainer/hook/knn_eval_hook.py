@@ -19,6 +19,7 @@ from torchmetrics.classification import MulticlassAccuracy
 from ..utils import get_rank, get_world_size, is_distributed, is_main_process
 from .hookbase import HookBase
 from .logger_hook import LoggerHook
+import torch_npu
 
 logger = logging.getLogger("train")
 
@@ -36,7 +37,7 @@ class KnnEvaluate(HookBase):
         self.trainer.model_or_module.eval()
         train_loader, test_loader = self.trainer.eval_data_loader
 
-        with torch.cuda.amp.autocast(enabled=self.enable_amp):
+        with torch_npu.npu.amp.autocast(enabled=self.enable_amp):
             results_dict_knn = eval_knn(
                 model=self.trainer.model,
                 train_loader=train_loader,
@@ -227,7 +228,7 @@ class SmoothedValue:
         """
         if not is_distributed():
             return
-        t = torch.tensor([self.count, self.total], dtype=torch.float64, device="cuda")
+        t = torch.tensor([self.count, self.total], dtype=torch.float64, device="npu")
         torch.distributed.barrier()
         torch.distributed.all_reduce(t)
         t = t.tolist()
@@ -338,7 +339,7 @@ class MetricLogger(object):
             "time: {time}",
             "data: {data}",
         ]
-        if torch.cuda.is_available():
+        if torch_npu.npu.is_available():
             log_list += ["max mem: {memory:.0f}"]
 
         log_msg = self.delimiter.join(log_list)
@@ -353,7 +354,7 @@ class MetricLogger(object):
                 )
                 eta_seconds = iter_time.global_avg * (n_iterations - i)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
-                if torch.cuda.is_available():
+                if torch_npu.npu.is_available():
                     logger.info(
                         log_msg.format(
                             i,
@@ -362,7 +363,7 @@ class MetricLogger(object):
                             meters=str(self),
                             time=str(iter_time),
                             data=str(data_time),
-                            memory=torch.cuda.max_memory_allocated() / MB,
+                            memory=torch_npu.npu.max_memory_allocated() / MB,
                         )
                     )
                 else:
@@ -426,7 +427,7 @@ def all_gather_and_flatten(tensor_rank):
 def extract_features_with_dataloader(
     model, data_loader, sample_count, gather_on_cpu=False, device=torch.device("cpu")
 ):
-    gather_device = torch.device("cpu") if gather_on_cpu else torch.device("cuda")
+    gather_device = torch.device("cpu") if gather_on_cpu else torch.device("npu")
     metric_logger = MetricLogger(delimiter="  ")
     features, all_labels = None, None
     for samples, labels_rank, index in metric_logger.log_every(data_loader, 10):

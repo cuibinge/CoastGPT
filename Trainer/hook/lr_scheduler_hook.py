@@ -2,7 +2,7 @@ import numbers
 from math import cos, pi
 
 from .hookbase import HookBase
-
+import torch_npu
 
 class LrUpdaterHook(HookBase):
     """

@@ -1,3 +1,4 @@
+
 import functools
 import logging
 import os
@@ -5,11 +6,13 @@ import socket
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple, Union
 
 import deepspeed
+
 import numpy as np
 import torch
 import torch.distributed as torch_dist
 from torch import Tensor
 from torch._C._distributed_c10d import ProcessGroup
+import torch_npu
 
 logger = logging.getLogger("train")
 
@@ -132,13 +135,13 @@ def get_comm_device(group: Optional[ProcessGroup] = None) -> torch.device:
     """
     backend = get_backend(group)
     if backend == "hccl":
-        import torch_npu  # noqa: F401
+        import torch_npu  
 
         return torch.device("npu", torch.npu.current_device())
     elif backend == torch_dist.Backend.NCCL:
         return torch.device("cuda", torch.cuda.current_device())
     elif backend == "cncl":
-        import torch_mlu  # noqa: F401
+        import torch_mlu  
 
         return torch.device("mlu", torch.mlu.current_device())
     elif backend == "smddp":
@@ -238,7 +241,11 @@ def _get_global_gloo_group() -> ProcessGroup:
     """Return a process group based on gloo backend, containing all ranks.
     The result is cached.
     """
-    if torch_dist.get_backend() == "nccl":
+    # if torch_dist.get_backend() == "nccl":
+    #     return torch_dist.new_group(backend="gloo")
+    # else:
+    #     return torch_dist.group.WORLD
+    if torch_dist.get_backend() == "hccl":
         return torch_dist.new_group(backend="gloo")
     else:
         return torch_dist.group.WORLD
@@ -517,8 +524,11 @@ def deepspeed_init_distributed() -> Tuple[int]:
     print(f"| distributed init (rank {rank})", flush=True)
     deepspeed.init_distributed()
     torch_dist.barrier()
-    torch.cuda.set_device(local_rank)
+    import torch_npu
+    torch_npu.npu.set_device(local_rank)
+    #torch.cuda.set_device(local_rank)
     setup_print_for_distributed(rank == 0)
+    
     return rank, local_rank, world_size
 
 
@@ -566,8 +576,11 @@ def init_distributed(auto: bool = False) -> Tuple[int]:
             os.environ["MASTER_PORT"] = new_port
 
     print(f"| distributed init (rank {rank})", flush=True)
-    torch_dist.init_process_group(backend="nccl")
+    #torch_dist.init_process_group(backend="nccl")
+    torch_dist.init_process_group(backend="hccl")
     torch_dist.barrier()
-    torch.cuda.set_device(local_rank)
+    #torch.cuda.set_device(local_rank)
+    import torch_npu
+    torch_npu.npu.set_device(local_rank)
     setup_print_for_distributed(rank == 0)
     return rank, local_rank, world_size

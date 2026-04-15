@@ -3,6 +3,7 @@ from io import BytesIO
 import ml_collections
 import requests
 import torch
+import torch_npu
 import transformers
 from PIL import Image
 from transformers import TextStreamer

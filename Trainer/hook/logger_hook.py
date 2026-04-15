@@ -9,7 +9,7 @@ import wandb
 from torch.utils.tensorboard import SummaryWriter
 
 from .hookbase import HookBase
-
+import torch_npu
 logger = logging.getLogger("train")
 
 
@@ -88,8 +88,8 @@ class LoggerHook(HookBase):
         else:
             eta_string = None
 
-        if torch.cuda.is_available():
-            max_mem_mb = torch.cuda.max_memory_allocated() / 1024.0 / 1024.0
+        if torch_npu.npu.is_available():
+            max_mem_mb = torch_npu.npu.max_memory_allocated() / 1024.0 / 1024.0
         else:
             max_mem_mb = None
 

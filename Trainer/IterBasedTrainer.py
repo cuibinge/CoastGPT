@@ -11,7 +11,7 @@ from .hook import (
 )
 from .trainer import Trainer
 from .utils import collect_env, is_main_process
-
+import torch_npu
 # 创建一个名为 'train' 的日志记录器
 logger = logging.getLogger("train")
 
@@ -64,13 +64,13 @@ class IterBasedTrainer(Trainer):
 
     # 构建默认钩子函数列表的方法
     def _build_default_hook(self) -> List[HookBase]:
+        # 将 LoggerHook 放在前面，CheckpointHook 放在最后，
+        # 以保证优化器/DeepSpeed 步骤在保存检查点之前执行。
         return [
-            # 构建检查点保存的钩子函数
-            self.build_ckpt_hook(),
-            # 日志记录的钩子函数，设置日志记录周期、TensorBoard日志目录和是否使用WandB
             LoggerHook(
                 self._log_period, tb_log_dir=self.tb_log_dir, use_wandb=self.wandb
             ),
+            self.build_ckpt_hook(),
         ]
 
     # 加载当前训练状态的方法

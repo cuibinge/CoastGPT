@@ -19,6 +19,7 @@ from .cap_dataset import (
 from .ImageFolderInstance import ImageFolderInstance
 from .meterml import METERMLDataset
 from .UCM import UCM
+import torch_npu
 
 logger = logging.getLogger("train")
 

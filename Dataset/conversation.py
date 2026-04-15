@@ -4,6 +4,11 @@ from typing import List, Tuple
 import base64
 from io import BytesIO
 from PIL import Image
+# 在不支持 NPU 的环境下忽略 torch_npu 导入错误
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    pass
 
 # 定义分隔符风格的枚举类
 class SeparatorStyle(Enum):

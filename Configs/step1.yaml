@@ -12,7 +12,18 @@ tune_rgb_bk: False
 tune_rgb_pooler: True
 
 rgb_vision:
-  arch: vit_large
+  arch: dual
+  # global encoder uses DINOv3 ViT-L/16 (frozen)
+  global_encoder_name: dinov3_vitl16
+  # local encoder uses DINOv3 ConvNeXt via timm (frozen)
+  local_source: dino
+  local_encoder_name: convnext_base
+  # path to DINOv3 ConvNeXt-Base checkpoint
+  local_ckpt_path: './dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth'
+  freeze_global: True
+  freeze_local: True
+  # required: path to DINOv3 ViT-L/16 checkpoint (.pth/.pt)
+  global_ckpt_path: './dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth'
   vit_name: openai/clip-vit-large-patch14
   input_size: [224, 224]
   patch_dropout: 0.
@@ -102,4 +113,22 @@ schedule:
   decay_epochs: 30
   decay_rate: 0.1
   multisteps: []
-  gamma: 0.1
+gamma: 0.1
+
+# Physics branch configuration
+physics:
+  enabled: true
+  out_channels: 1
+  loss_weight: 1.0
+  edge_weight: 0.0
+  tv_weight: 0.01
+  consistency_weight: 0.05
+  spectral_weight: 0.0
+  auto_gt_from_constraints: true
+  # Optional SAR empirical coefficients for auto GT when constraints provided
+  sar_sigma0_coeffs:
+    A: -10.0
+    B: 2.0
+    C: 0.05
+    D_VV: 0.0
+    D_VH: -3.0
