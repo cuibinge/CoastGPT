@@ -5,7 +5,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-import torch_npu
+import warnings
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 
 class TextProjHead(nn.Module):
@@ -51,7 +55,6 @@ class RgbProjHead(TextProjHead):
             model.proj.load_state_dict(new_ckpt)
             del new_ckpt
         del ckpt
-
         return model
 
 
@@ -79,30 +82,21 @@ class LinearProjection(nn.Module):
 
 class AttnPooler(nn.Module):
     """
-    Attention Pooler
-
-    Args:
-        hidden_size: hidden size of the model
-        num_layers: number of layers
-        num_attention_heads: number of attention heads
-        encoder_hidden_size: hidden size of the encoder
-        num_query: number of query vectors
-        norm_layer: normalization layer
-        output_size: output size of the model
+    Attention Pooler (Expert 序列压缩专家)
     """
 
     def __init__(
-        self,
-        num_query: int,
-        num_layers: int,
-        num_attention_heads: int,
-        encoder_hidden_size: int,
-        hidden_size: int,
-        output_size: int,
-        norm_layer: Optional[Callable[..., nn.Module]] = None,
-        checkpoint: bool = False,
-        stage_num: Union[List, int] = [64, 48, 32],  # [64, 48, 32]
-        split_part: List = [256, 256, 256],  # [256,256, 256]
+            self,
+            num_query: int,
+            num_layers: int,
+            num_attention_heads: int,
+            encoder_hidden_size: int,
+            hidden_size: int,
+            output_size: int,
+            norm_layer: Optional[Callable[..., nn.Module]] = None,
+            checkpoint: bool = False,
+            stage_num: Union[List, int] = [64, 48, 32],
+            split_part: List = [256, 256, 256],
     ):
         super().__init__()
         self.checkpoint = checkpoint
@@ -124,7 +118,7 @@ class AttnPooler(nn.Module):
                     d_model=hidden_size,
                     n_head=num_attention_heads,
                     is_cross_attention=True,
-                    ls_init_value=1e-1,  # 🌟 关键：极小的初始化值防止能量爆炸
+                    ls_init_value=1e-1,
                     norm_layer=norm_layer,
                 )
                 for _ in range(num_layers)
@@ -134,11 +128,18 @@ class AttnPooler(nn.Module):
         self.out_proj = nn.Linear(hidden_size, output_size)
 
     def forward(
-        self,
-        image_embs: torch.Tensor,
+            self,
+            image_embs: torch.Tensor,
+            physical_queries: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        image_embs: [B, L, C] key/value 序列 (通常为视觉+物理提示拼接后的 Z_tilde)
+        physical_queries: [B, L_p, C] 可选的物理提示查询，与可学习查询一起参与注意力
+        """
         if self.in_proj is not None:
             image_embs = self.in_proj(image_embs)
+            if physical_queries is not None:
+                physical_queries = self.in_proj(physical_queries)
 
         query_tokens = self.query.expand(image_embs.size(0), -1, -1)
 
@@ -152,55 +153,85 @@ class AttnPooler(nn.Module):
                 self.num_query // self.stage_num,
             ]
         else:
-            stage1_query, stage2_query, stage3_query = torch.split(
-                query_tokens, self.stage_num, dim=1
-            )
             stage_query_sizes = list(self.stage_num)
+            if len(stage_query_sizes) != 3:
+                raise ValueError(f"stage_num must have 3 parts, got: {stage_query_sizes}")
+            if sum(stage_query_sizes) != self.num_query:
+                # Keep training robust when num_query changes from default 144.
+                even = self.num_query // 3
+                stage_query_sizes = [even, even, self.num_query - 2 * even]
+            stage1_query, stage2_query, stage3_query = torch.split(
+                query_tokens, stage_query_sizes, dim=1
+            )
 
-        # Robust image split: if preset split_part doesn't match sequence length, derive sizes proportionally to query splits
+        # 动态切分，兼容拼接了物理特征后长度 L 变长的情况
         L = image_embs.size(1)
         preset_sum = sum(self.split_part) if isinstance(self.split_part, (list, tuple)) else None
         if isinstance(self.split_part, (list, tuple)) and preset_sum == L:
             split_sizes = list(self.split_part)
         else:
             base = sum(stage_query_sizes)
-            # Avoid division by zero
             if base == 0:
                 split_sizes = [L // 3, L // 3, L - 2 * (L // 3)]
             else:
-                # Proportional allocation, ensure exact sum to L
                 sizes = [int(round(L * s / base)) for s in stage_query_sizes]
                 diff = L - sum(sizes)
-                # Adjust last bucket to absorb rounding difference
                 sizes[-1] += diff
                 split_sizes = sizes
 
-        stage1_image, stage2_image, stage3_image = torch.split(
-            image_embs, split_sizes, dim=1
-        )
+        stage1_image, stage2_image, stage3_image = torch.split(image_embs, split_sizes, dim=1)
+        if physical_queries is not None:
+            Lp = physical_queries.size(1)
+            # 按照视觉分段比例切分物理查询；避免空段
+            if L > 0:
+                phy_sizes = [max(1, int(round(Lp * s / L))) for s in split_sizes]
+                diff_phy = Lp - sum(phy_sizes)
+                phy_sizes[-1] += diff_phy
+            else:
+                phy_sizes = [Lp // 3, Lp // 3, Lp - 2 * (Lp // 3)]
+            stage1_phy, stage2_phy, stage3_phy = torch.split(physical_queries, phy_sizes, dim=1)
+        else:
+            stage1_phy = stage2_phy = stage3_phy = None
 
         all_tokens = []
-        for sub_token, sub_image in zip(
-            [stage1_query, stage2_query, stage3_query],
-            [stage1_image, stage2_image, stage3_image],
+        spatial_attns = []
+        for sub_token, sub_image, sub_phy in zip(
+                [stage1_query, stage2_query, stage3_query],
+                [stage1_image, stage2_image, stage3_image],
+                [stage1_phy, stage2_phy, stage3_phy],
         ):
-            cat_embs = torch.cat([sub_token, sub_image], dim=1)
-            # cat_embs = sub_image
-            cat_embs = cat_embs.permute(1, 0, 2)  # (B, L, D) -> (L, B, D)
-            sub_token = sub_token.permute(1, 0, 2)  # (B, L, D) -> (L, B, D)
+            if sub_phy is not None:
+                # 让物理提示也作为查询参与专家内部注意力
+                sub_token = torch.cat([sub_token, sub_phy], dim=1)
+            # key/value 仅由图像特征和物理序列组成，避免查询看到自身
+            kv_parts = [sub_image]
+            if sub_phy is not None:
+                kv_parts.append(sub_phy)
+            cat_embs = torch.cat(kv_parts, dim=1)
+            cat_embs = cat_embs.permute(1, 0, 2)
+            sub_token = sub_token.permute(1, 0, 2)
 
             for layer in self.layers:
                 sub_token = layer(sub_token, cat_embs, cat_embs)
 
-            sub_token = sub_token.permute(1, 0, 2)  # (L, B, D) -> (B, L, D)
+            if not self.training and hasattr(self.layers[-1], "_last_attn_weights"):
+                attn = self.layers[-1]._last_attn_weights
+                img_len = sub_image.size(1)
+                img_attn = attn[:, :, :img_len].mean(dim=1)
+                spatial_attns.append(img_attn)
+
+            sub_token = sub_token.permute(1, 0, 2)
             all_tokens.append(sub_token)
+
+        if not self.training and len(spatial_attns) == 3:
+            full_spatial_attn = torch.cat(spatial_attns, dim=1)
+            self._last_spatial_attn = full_spatial_attn[0].cpu()
 
         query_tokens = torch.cat(all_tokens, dim=1)
         out = self.out_proj(query_tokens)
         return out
 
 
-# 在 common_arch.py 中定义 RMSNorm (类似 Llama-2 实现)
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
@@ -208,35 +239,109 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        # 只缩放，不平移，保留特征显著性
-        norm_x = torch.mean(x**2, dim=-1, keepdim=True)
+        norm_x = torch.mean(x ** 2, dim=-1, keepdim=True)
         x_normed = x * torch.rsqrt(norm_x + self.eps)
         return self.weight * x_normed
 
-class MoEProjection(nn.Module):
+
+class PhysicalPromptEncoder(nn.Module):
     """
-    针对遥感多模态对齐优化的专家混合投影层 (MoE Projection)
-    新增：final_norm 与能量缩放逻辑，解决 LLM 激活过载问题
+    将物理属性提示 (波段、GSD、时间等) 编码为可与视觉 token 拼接的序列。
     """
 
     def __init__(
-        self,
-        num_experts: int,
-        num_query: int,
-        num_layers: int,
-        num_attention_heads: int,
-        encoder_hidden_size: int,
-        hidden_size: int,
-        output_size: int,
-        norm_layer: Optional[Callable[..., nn.Module]] = None,
-        checkpoint: bool = False,
-        top_k: int = 2, # 建议设为 2，以增强专家间的协同
+            self,
+            in_channels: int = 1,
+            embed_dim: int = 768,
+            pool_scales: Union[List[int], tuple] = (1, 2, 4),
+    ):
+        super().__init__()
+        self.pool_scales = list(pool_scales) if pool_scales is not None else [1]
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=1)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(
+            self,
+            tsm: Optional[torch.Tensor],
+            mask: Optional[torch.Tensor] = None
+    ) -> Optional[torch.Tensor]:
+        if tsm is None:
+            return None
+
+        # squeeze potential extra dimension from dataloader collate
+        if tsm.dim() == 5:
+            tsm = tsm.squeeze(1)
+        if tsm.dim() == 3:
+            tsm = tsm.unsqueeze(1)
+
+        if mask is not None:
+            if mask.dim() == 5:
+                mask = mask.squeeze(1)
+            if mask.dim() == 3:
+                mask = mask.unsqueeze(1)
+            tsm = tsm * mask
+
+        prompts = []
+        for s in self.pool_scales:
+            pooled = F.adaptive_avg_pool2d(tsm, output_size=(s, s))
+            tokens = self.proj(pooled).flatten(2).transpose(1, 2)
+            prompts.append(self.norm(tokens))
+
+        if len(prompts) == 0:
+            return None
+        return torch.cat(prompts, dim=1)
+
+
+# =========================================================================
+# 核心重构：任务与要素双驱动、物理先验复用的稀疏混合专家投影层 (T-MoE)
+# =========================================================================
+class MoEProjection(nn.Module):
+    """
+    对应论文 2.2 节：
+    2.2.1 任务与要素双驱动的动态门控路由
+    2.2.2 物理先验复用与联合特征投影
+    """
+
+    def __init__(
+            self,
+            num_experts: int,
+            num_query: int,
+            num_layers: int,
+            num_attention_heads: int,
+            encoder_hidden_size: int,
+            hidden_size: int,
+            output_size: int,
+            task_dim: int = 256,
+            text_embed_dim: Optional[int] = None,
+            physical_prompt_embed_dims: Optional[List[int]] = None,
+            include_physical_prompt: bool = True,
+            norm_layer: Optional[Callable[..., nn.Module]] = None,
+            checkpoint: bool = False,
+            top_k: int = 2,
+            routing_strategy: str = "joint",
+            task_expert_ratio: float = 0.5,
+            aux_balance_coef: float = 1.0,
+            aux_entropy_coef: float = 1e-5,
+            aux_zloss_coef: float = 1e-5,
+            aux_task_route_coef: float = 0.05,
+            aux_element_route_coef: float = 0.05,
+            aux_task_element_orth_coef: float = 0.01,
+            route_effect_margin: float = 0.05,
+            route_supervision_temperature: float = 1.0,
     ):
         super().__init__()
         self.num_experts = num_experts
-        self.top_k = top_k
+        self.top_k = min(top_k, num_experts)
+        self.checkpoint = checkpoint
+        self.num_query = num_query
+        self.output_size = output_size
+        self.encoder_hidden_size = encoder_hidden_size
+        self.include_physical_prompt = include_physical_prompt
+        self.routing_strategy = str(routing_strategy).lower()
+        self.task_expert_ratio = float(task_expert_ratio)
+        self.text_embed_dim = int(text_embed_dim) if text_embed_dim is not None else int(encoder_hidden_size)
 
-        # 1. 初始化 4 个独立的 AttnPooler 专家
+        # 1. 专家组：基于交叉注意力的序列压缩器 (AttnPooler)
         self.experts = nn.ModuleList([
             AttnPooler(
                 num_query=num_query,
@@ -250,140 +355,568 @@ class MoEProjection(nn.Module):
             ) for _ in range(num_experts)
         ])
 
-        # 2. 空间门控网络：作用于每个序列 Token (L)
-        self.gate_norm = nn.LayerNorm(encoder_hidden_size)
-        self.gate = nn.Linear(encoder_hidden_size, num_experts)
+        # 2. 任务与要素文本语义池化（彻底替代离散 ID 嵌入）
+        self.task_text_query = nn.Parameter(torch.zeros(1, 1, encoder_hidden_size))
+        self.element_text_query = nn.Parameter(torch.zeros(1, 1, encoder_hidden_size))
+        nn.init.trunc_normal_(self.task_text_query, std=0.02)
+        nn.init.trunc_normal_(self.element_text_query, std=0.02)
+        if self.text_embed_dim != encoder_hidden_size:
+            self.task_text_in_proj = nn.Linear(self.text_embed_dim, encoder_hidden_size)
+            self.element_text_in_proj = nn.Linear(self.text_embed_dim, encoder_hidden_size)
+        else:
+            self.task_text_in_proj = nn.Identity()
+            self.element_text_in_proj = nn.Identity()
+        self.task_text_proj = nn.Linear(encoder_hidden_size, task_dim)
+        self.element_text_proj = nn.Linear(encoder_hidden_size, task_dim)
+
+        # 3. 双驱动门控网络 (全局视觉特征 + 任务特征 + 要素特征 + 物理先验)
+        # 为门控对齐维度：将视觉全局和物理池化都投影到 task_dim
+        self.gate_img_proj = nn.Linear(encoder_hidden_size, task_dim)
+        combined_dim = task_dim + task_dim + task_dim
+        if self.include_physical_prompt:
+            combined_dim += task_dim
+            self.physical_gate_proj = nn.Linear(encoder_hidden_size, task_dim)
+            supported_phy_dims = set(physical_prompt_embed_dims or [])
+            supported_phy_dims.add(encoder_hidden_size)
+            self.supported_physical_dims = sorted({int(d) for d in supported_phy_dims if d is not None})
+            self.physical_in_proj = nn.ModuleDict()
+            for d in self.supported_physical_dims:
+                if d != encoder_hidden_size:
+                    self.physical_in_proj[str(d)] = nn.Linear(d, encoder_hidden_size)
+            # 上下文感知的物理提示池化：单查询自注意力
+            self.physical_pool_query = nn.Parameter(torch.zeros(1, 1, encoder_hidden_size))
+            nn.init.trunc_normal_(self.physical_pool_query, std=0.02)
+        else:
+            self.physical_gate_proj = None
+            self.physical_in_proj = None
+            self.supported_physical_dims = []
+            self.physical_pool_query = None
+        self.gate_norm = nn.LayerNorm(combined_dim)
+        self.gate = nn.Linear(combined_dim, num_experts)
+
+        # 可选：两段式路由（前半专家偏任务，后半专家偏要素）
+        self.task_expert_count = 0
+        self.element_expert_count = 0
+        self.task_gate = None
+        self.task_gate_norm = None
+        self.element_gate = None
+        self.element_gate_norm = None
+        if self.routing_strategy in ("two_stage", "task_then_element"):
+            if num_experts < 2:
+                warnings.warn("two_stage routing requires num_experts >= 2, fallback to joint routing.")
+                self.routing_strategy = "joint"
+            else:
+                self.task_expert_count = max(1, min(num_experts - 1, int(round(num_experts * self.task_expert_ratio))))
+                self.element_expert_count = num_experts - self.task_expert_count
+                task_gate_dim = task_dim + task_dim + (task_dim if self.include_physical_prompt else 0)
+                element_gate_dim = task_dim + task_dim + (task_dim if self.include_physical_prompt else 0)
+                self.task_gate_norm = nn.LayerNorm(task_gate_dim)
+                self.task_gate = nn.Linear(task_gate_dim, self.task_expert_count)
+                self.element_gate_norm = nn.LayerNorm(element_gate_dim)
+                self.element_gate = nn.Linear(element_gate_dim, self.element_expert_count)
+
+        # 4. 稳定性输出增益和归一化
         self.output_gain = nn.Parameter(torch.ones(output_size) * 0.3)
-        
-        # 🌟 核心防线：解决 549.0 能量过载的归一化层
         self.final_norm = RMSNorm(output_size)
-        # 3. 统计缓存与损失系数
-        self._aux_loss = torch.tensor(0.0)
+
+        # 5. 辅助损失系数
+        self.aux_balance_coef = float(aux_balance_coef)
+        self.aux_entropy_coef = float(aux_entropy_coef)
+        self.aux_zloss_coef = float(aux_zloss_coef)
+        # 任务/要素语义路由监督：避免路由退化为纯视觉聚类
+        self.aux_task_route_coef = float(aux_task_route_coef)
+        self.aux_element_route_coef = float(aux_element_route_coef)
+        self.aux_task_element_orth_coef = float(aux_task_element_orth_coef)
+        self.route_effect_margin = float(route_effect_margin)
+        self.route_supervision_temperature = float(route_supervision_temperature)
         self._gate_stats = {}
-        self._aux_coeff = {"balance": 1.0, "entropy": 0.00001, "zloss":  0.00001}
+        self._aux_terms = {}
+        self._last_routing = {}
 
-    def set_aux_coefficients(self, balance: float = 1.0, entropy: float = 0.00001, zloss: float = 0.00001):
-        self._aux_coeff = dict(balance=balance, entropy=entropy, zloss=zloss)
+    def _pool_semantic_text(
+            self,
+            text_embs: Optional[torch.Tensor],
+            text_mask: Optional[torch.Tensor],
+            in_proj: nn.Module,
+            query: torch.Tensor,
+            proj: nn.Linear,
+            target_batch: int,
+            dtype: torch.dtype,
+            device: torch.device,
+    ) -> torch.Tensor:
+        if text_embs is None:
+            return torch.zeros(target_batch, proj.out_features, device=device, dtype=dtype)
+        if text_embs.size(0) != target_batch:
+            raise ValueError(f"text_embs batch ({text_embs.size(0)}) != image batch ({target_batch})")
+        text_embs = in_proj(text_embs)
+        text_embs = torch.nan_to_num(
+            text_embs.to(device=device, dtype=torch.float32),
+            nan=0.0,
+            posinf=1e4,
+            neginf=-1e4,
+        )
+        text_embs = torch.clamp(text_embs, min=-1e4, max=1e4)
+        if text_mask is not None:
+            text_mask = text_mask.to(device=device).bool()
+        if text_embs.dim() == 2:
+            pooled = text_embs
+        else:
+            q = query.expand(text_embs.size(0), -1, -1).to(device=device, dtype=torch.float32)  # [B,1,C]
+            scores = torch.matmul(q, text_embs.transpose(1, 2)) / (text_embs.size(-1) ** 0.5)
+            if text_mask is not None:
+                if text_mask.dim() == 1:
+                    text_mask = text_mask.unsqueeze(0).expand(text_embs.size(0), -1)
+                if text_mask.dim() != 2:
+                    raise ValueError("text_mask must be [B, L] for sequence text embeddings")
+                if text_mask.size(1) != text_embs.size(1):
+                    raise ValueError(
+                        f"text_mask length ({text_mask.size(1)}) != text_embs length ({text_embs.size(1)})"
+                    )
+                scores = scores.masked_fill(~text_mask.unsqueeze(1), -1e4)
+            scores = torch.nan_to_num(scores, nan=0.0, posinf=1e4, neginf=-1e4)
+            scores = torch.clamp(scores, min=-1e4, max=1e4)
+            weights = torch.softmax(scores, dim=-1)
+            weights = torch.nan_to_num(weights, nan=0.0, posinf=1.0, neginf=0.0)
+            if text_mask is not None:
+                weights = weights * text_mask.unsqueeze(1).to(weights.dtype)
+                weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+            pooled = torch.matmul(weights, text_embs).squeeze(1)  # [B,C]
+        pooled = torch.nan_to_num(pooled, nan=0.0, posinf=1e4, neginf=-1e4)
+        pooled = torch.clamp(pooled, min=-1e4, max=1e4)
+        pooled = pooled.to(device=device, dtype=proj.weight.dtype)
+        out = proj(pooled)
+        out = torch.nan_to_num(out, nan=0.0, posinf=1e4, neginf=-1e4)
+        return out.to(dtype=dtype)
 
-    def get_aux_loss(self) -> torch.Tensor:
-        # 整合了重复定义的方法，确保系数被正确应用
-        imp = self._gate_stats.get("importance")
-        load = self._gate_stats.get("load")
-        if imp is None or load is None: return torch.tensor(0.0, device=self.gate.weight.device)
-        
-        balance = self.num_experts * torch.sum(imp * load)
-        entropy = self._gate_stats.get("entropy",0.00001)
-        zloss = self._gate_stats.get("zloss", 0.00001)
-        
-        return (self._aux_coeff["balance"] * balance + 
-                self._aux_coeff["entropy"] * entropy + 
-                self._aux_coeff["zloss"] * zloss).to(self.gate.weight.dtype)
+    def _project_physical_prompts(self, physical_prompts: torch.Tensor) -> torch.Tensor:
+        if physical_prompts.size(-1) == self.encoder_hidden_size:
+            return physical_prompts
+        key = str(int(physical_prompts.size(-1)))
+        if self.physical_in_proj is None or key not in self.physical_in_proj:
+            raise ValueError(
+                f"Unsupported physical prompt dim {physical_prompts.size(-1)}; "
+                f"supported dims: {self.supported_physical_dims}"
+            )
+        return self.physical_in_proj[key](physical_prompts)
 
-    def get_gate_stats(self) -> Dict[str, torch.Tensor]:
-        return self._gate_stats
-
-    def forward(self, image_embs: torch.Tensor) -> torch.Tensor:
-        b, l, c = image_embs.shape
-
-        # --- A. 计算局部空间权重图 [B, L, E] ---
-        # 不再对 dim=1 取 mean，而是对每个补丁进行点名
-        x_fp32 = image_embs.float()
-        self.gate_norm.to(torch.float32)
-        self.gate.to(torch.float32)
-        
-        # token_logits 形状: [B, L, num_experts]
-        token_logits = self.gate(self.gate_norm(x_fp32))
-        token_logits = torch.clamp(token_logits, min=-15.0, max=15.0)
-        
-        # 计算 Token 级别的权重分配
-        token_weights = torch.softmax(token_logits, dim=-1) # [B, L, E]
-
-        # --- B. 计算路由统计 (用于负载均衡 aux_loss) ---
-        # 计算所有补丁对专家的平均重要性
-        importance = token_weights.view(-1, self.num_experts).mean(dim=0)
-        
-        with torch.no_grad():
-            _, top1_idx = torch.max(token_weights, dim=-1) # 每个补丁的首选专家
-            load = torch.zeros(self.num_experts, device=image_embs.device, dtype=torch.float32)
-            for i in range(self.num_experts):
-                load[i] = (top1_idx == i).float().mean()
-
-        # 缓存统计信息
-        self._gate_stats = {
-            "importance": importance.detach(), 
-            "load": load.detach(),
-            "entropy": -torch.mean(torch.sum(token_weights * torch.log(token_weights + 1e-6), dim=-1)).detach(),
-            "zloss": torch.mean(torch.logsumexp(token_logits, dim=-1) ** 2).detach()
-        }
-
-        # --- C. 局部加权专家并行处理 ---
-        token_weights = token_weights.to(image_embs.dtype)
-        mixed_output = 0
-
-        # 遍历专家，每个专家只处理它被“点名”的那些空间补丁
-        for i in range(self.num_experts):
-            # 获取第 i 个专家在所有 L 个位置的权重 [B, L, 1]
-            # 这里的 w_i 充当了“空间权重图”，标识了该专家负责哪些区域
-            w_i = token_weights[:, :, i:i+1]
-            
-            # 空间加权：专家 i 重点从权重高的补丁中提取信息
-            gated_input = image_embs * w_i
-            
-            # 专家执行 AttnPooler，将 L 个 Token 聚合成 num_query 个 Token
-            expert_out = self.experts[i](gated_input)
-            mixed_output += expert_out
-
-        # 1. 精度对齐并执行归一化 (这一步会将每个 Token 的 Norm 锁死在 64)
-        if self.final_norm.weight.dtype != mixed_output.dtype:
-            self.final_norm.to(mixed_output.dtype)
-        
-        mixed_output = self.final_norm(mixed_output)
-
-        # 2. 🌟 关键点：在归一化之后执行缩放 🌟
-        # 目标：将总能量从 768 降到 200 左右
-        # 计算系数：200 / 768 ≈ 0.26
-        # 我们使用 0.3 作为缩放因子
-        return mixed_output *self.output_gain
-        
-
-    def set_aux_coefficients(self, balance: float = 1.0, entropy: float = 0.0, zloss: float = 0.0):
-        """Optionally set coefficients to scale different components when queried."""
-        self._aux_coeff = dict(balance=balance, entropy=entropy, zloss=zloss)
-
-    def get_aux_loss(self) -> torch.Tensor:
-        """Return the auxiliary load-balancing loss computed in the last forward.
-
-        If coefficients have been set via `set_aux_coefficients`, they are applied.
-        Otherwise, returns the raw balance-only loss.
+    def forward(
+            self,
+            image_embs: torch.Tensor,
+            physical_prompts: Optional[torch.Tensor] = None,
+            task_text_embs: Optional[torch.Tensor] = None,
+            element_text_embs: Optional[torch.Tensor] = None,
+            physical_prompt_mask: Optional[torch.Tensor] = None,
+            task_text_mask: Optional[torch.Tensor] = None,
+            element_text_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        if self._aux_loss is None:
-            return torch.tensor(0.0, device=self.gate.weight.device)
-        coeff = getattr(self, "_aux_coeff", None)
-        if coeff is None:
-            return self._aux_loss
-        # reconstruct components from stats and logits proxies
-        imp = self._gate_stats.get("importance")
-        load = self._gate_stats.get("load")
-        entropy = self._gate_stats.get("entropy")
-        zloss = self._gate_stats.get("zloss")
-        balance = self.num_experts * torch.sum(imp * load)
-        return coeff["balance"] * balance + coeff["entropy"] * entropy + coeff["zloss"] * zloss
+        image_embs: [B, L_v, C] 多尺度视觉特征序列 (Z_visual)
+        physical_prompts: [B, L_p, C] 物理先验提示序列 (H_prior)
+        task_text_embs: [B, L_t, C] 任务文本 embedding（Tokenizer + LLM Embedding）
+        element_text_embs: [B, L_e, C] 要素文本 embedding（Tokenizer + LLM Embedding）
+        *_mask: [B, L] 有效 token 掩码（用于避免 padding 稀释语义）
+        """
+        if isinstance(image_embs, (list, tuple)):
+            image_embs = torch.cat(image_embs, dim=1)
+        B, L_v, C = image_embs.shape
+        has_task_text = task_text_embs is not None
+        has_element_text = element_text_embs is not None
+
+        # ==========================================
+        # 1. 任务与要素双驱动的动态门控计算 (Sequence-level Routing)
+        # ==========================================
+        # 获取宏观全局图像上下文并对齐到 task_dim
+        img_global = torch.nan_to_num(
+            image_embs.float().mean(dim=1),
+            nan=0.0,
+            posinf=1e4,
+            neginf=-1e4,
+        )  # [B, C]
+        img_global = torch.clamp(img_global, min=-1e4, max=1e4)
+        img_gate = self.gate_img_proj(img_global.to(dtype=self.gate_img_proj.weight.dtype))  # [B, task_dim]
+        img_gate = torch.nan_to_num(img_gate, nan=0.0, posinf=1e4, neginf=-1e4)
+        img_gate = torch.clamp(img_gate, min=-1e4, max=1e4)
+
+        # 从任务/要素文本 embedding 中提取语义上下文 h_task, h_element
+        t_embs = self._pool_semantic_text(
+            text_embs=task_text_embs,
+            text_mask=task_text_mask,
+            in_proj=self.task_text_in_proj,
+            query=self.task_text_query,
+            proj=self.task_text_proj,
+            target_batch=B,
+            dtype=image_embs.dtype,
+            device=image_embs.device,
+        )
+        e_embs = self._pool_semantic_text(
+            text_embs=element_text_embs,
+            text_mask=element_text_mask,
+            in_proj=self.element_text_in_proj,
+            query=self.element_text_query,
+            proj=self.element_text_proj,
+            target_batch=B,
+            dtype=image_embs.dtype,
+            device=image_embs.device,
+        )
+
+        if self.include_physical_prompt:
+            if physical_prompts is not None:
+                physical_prompts = self._project_physical_prompts(physical_prompts).to(
+                    device=image_embs.device,
+                    dtype=image_embs.dtype,
+                )
+                # 上下文感知池化：单查询自注意力
+                q = self.physical_pool_query.expand(physical_prompts.size(0), -1, -1)  # [B,1,C]
+                attn_scores = torch.matmul(q, physical_prompts.transpose(1, 2)) / (physical_prompts.size(-1) ** 0.5)  # [B,1,L_p]
+                if physical_prompt_mask is not None:
+                    pm = physical_prompt_mask.to(device=image_embs.device).bool()
+                    if pm.dim() == 1:
+                        pm = pm.unsqueeze(0).expand(physical_prompts.size(0), -1)
+                    if pm.dim() != 2:
+                        raise ValueError("physical_prompt_mask must be [B, L_p]")
+                    if pm.size(1) != physical_prompts.size(1):
+                        raise ValueError(
+                            f"physical_prompt_mask length ({pm.size(1)}) != physical_prompts length ({physical_prompts.size(1)})"
+                        )
+                    attn_scores = attn_scores.masked_fill(~pm.unsqueeze(1), -1e4)
+                attn_weights = torch.softmax(attn_scores, dim=-1)
+                if physical_prompt_mask is not None:
+                    attn_weights = attn_weights * pm.unsqueeze(1).to(attn_weights.dtype)
+                    attn_weights = attn_weights / attn_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+                phy_pooled = torch.matmul(attn_weights, physical_prompts).squeeze(1)  # [B, C]
+                phy_gate = self.physical_gate_proj(phy_pooled)
+                phy_query = physical_prompts
+            else:
+                phy_gate = torch.zeros_like(t_embs)
+                phy_query = None
+        else:
+            phy_gate = None
+            phy_query = None
+
+        # 拼接用于联合门控评估 [z_bar_visual; h_task; h_element; h_phy]
+        gate_parts = [img_gate, t_embs, e_embs]
+        if self.include_physical_prompt and phy_gate is not None:
+            gate_parts.append(phy_gate)
+        gate_input = torch.cat(gate_parts, dim=-1)
+        gate_input = torch.nan_to_num(gate_input, nan=0.0, posinf=1e4, neginf=-1e4)
+        gate_input = torch.clamp(gate_input, min=-1e4, max=1e4)
+
+        # 计算专家倾向性
+        task_logits = None
+        elem_logits = None
+        if self.routing_strategy in ("two_stage", "task_then_element") and self.task_gate is not None:
+            task_parts = [img_gate, t_embs]
+            elem_parts = [img_gate, e_embs]
+            if self.include_physical_prompt and phy_gate is not None:
+                task_parts.append(phy_gate)
+                elem_parts.append(phy_gate)
+            task_input = torch.cat(task_parts, dim=-1).to(dtype=self.task_gate_norm.weight.dtype)
+            elem_input = torch.cat(elem_parts, dim=-1).to(dtype=self.element_gate_norm.weight.dtype)
+            task_input = torch.nan_to_num(task_input, nan=0.0, posinf=1e4, neginf=-1e4)
+            elem_input = torch.nan_to_num(elem_input, nan=0.0, posinf=1e4, neginf=-1e4)
+            task_input = torch.clamp(task_input, min=-1e4, max=1e4)
+            elem_input = torch.clamp(elem_input, min=-1e4, max=1e4)
+
+            task_logits = self.task_gate(self.task_gate_norm(task_input))
+            elem_logits = self.element_gate(self.element_gate_norm(elem_input))
+            gate_logits = torch.full(
+                (B, self.num_experts),
+                fill_value=-1e4,
+                device=image_embs.device,
+                dtype=task_logits.dtype,
+            )
+            gate_logits[:, :self.task_expert_count] = task_logits
+            gate_logits[:, self.task_expert_count:] = elem_logits
+        else:
+            gate_input = gate_input.to(dtype=self.gate_norm.weight.dtype)
+            gate_logits = self.gate(self.gate_norm(gate_input))  # [B, num_experts]
+        invalid_gate_ratio = (~torch.isfinite(gate_logits)).float().mean()
+        gate_logits = torch.nan_to_num(gate_logits, nan=0.0, posinf=15.0, neginf=-15.0)
+        gate_logits = torch.clamp(gate_logits, min=-15.0, max=15.0)
+        gate_weights = torch.softmax(gate_logits, dim=-1)  # [B, num_experts]
+        gate_weights = torch.nan_to_num(
+            gate_weights,
+            nan=1.0 / float(self.num_experts),
+            posinf=1.0,
+            neginf=0.0,
+        )
+        gate_weights = gate_weights / gate_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        # 任务感知路由监督，抑制“只看视觉”的退化
+        task_route_loss = torch.zeros((), device=image_embs.device, dtype=gate_weights.dtype)
+        element_route_loss = torch.zeros((), device=image_embs.device, dtype=gate_weights.dtype)
+        task_route_kl = torch.zeros((), device=image_embs.device, dtype=gate_weights.dtype)
+        element_route_kl = torch.zeros((), device=image_embs.device, dtype=gate_weights.dtype)
+        task_route_effect = torch.zeros((), device=image_embs.device, dtype=gate_weights.dtype)
+        element_route_effect = torch.zeros((), device=image_embs.device, dtype=gate_weights.dtype)
+        task_element_orth = torch.zeros((), device=image_embs.device, dtype=gate_weights.dtype)
+        tau = max(self.route_supervision_temperature, 1e-4)
+
+        if self.training:
+            if self.routing_strategy in ("two_stage", "task_then_element") and self.task_gate is not None:
+                if has_task_text and task_logits is not None:
+                    task_text_only_parts = [torch.zeros_like(img_gate), t_embs]
+                    if self.include_physical_prompt and phy_gate is not None:
+                        task_text_only_parts.append(phy_gate)
+                    task_text_only_input = torch.cat(task_text_only_parts, dim=-1).to(
+                        dtype=self.task_gate_norm.weight.dtype
+                    )
+                    task_text_only_logits = self.task_gate(self.task_gate_norm(task_text_only_input))
+                    task_route_kl = F.kl_div(
+                        F.log_softmax(task_logits / tau, dim=-1),
+                        F.softmax(task_text_only_logits.detach() / tau, dim=-1),
+                        reduction="batchmean",
+                    ) * (tau * tau)
+                    # Ensure task text has observable routing effect in two-stage mode.
+                    task_no_text_parts = [img_gate, torch.zeros_like(t_embs)]
+                    if self.include_physical_prompt and phy_gate is not None:
+                        task_no_text_parts.append(phy_gate)
+                    task_no_text_input = torch.cat(task_no_text_parts, dim=-1).to(
+                        dtype=self.task_gate_norm.weight.dtype
+                    )
+                    task_no_text_logits = self.task_gate(self.task_gate_norm(task_no_text_input))
+                    task_text_effect = torch.mean(
+                        torch.abs(task_logits - task_no_text_logits)
+                    )
+                    task_route_effect = F.relu(
+                        gate_weights.new_tensor(self.route_effect_margin) - task_text_effect
+                    )
+                    task_route_loss = task_route_kl + task_route_effect
+
+                if has_element_text and elem_logits is not None:
+                    element_text_only_parts = [torch.zeros_like(img_gate), e_embs]
+                    if self.include_physical_prompt and phy_gate is not None:
+                        element_text_only_parts.append(phy_gate)
+                    element_text_only_input = torch.cat(element_text_only_parts, dim=-1).to(
+                        dtype=self.element_gate_norm.weight.dtype
+                    )
+                    element_text_only_logits = self.element_gate(self.element_gate_norm(element_text_only_input))
+                    element_route_kl = F.kl_div(
+                        F.log_softmax(elem_logits / tau, dim=-1),
+                        F.softmax(element_text_only_logits.detach() / tau, dim=-1),
+                        reduction="batchmean",
+                    ) * (tau * tau)
+                    # Ensure element text has observable routing effect in two-stage mode.
+                    element_no_text_parts = [img_gate, torch.zeros_like(e_embs)]
+                    if self.include_physical_prompt and phy_gate is not None:
+                        element_no_text_parts.append(phy_gate)
+                    element_no_text_input = torch.cat(element_no_text_parts, dim=-1).to(
+                        dtype=self.element_gate_norm.weight.dtype
+                    )
+                    element_no_text_logits = self.element_gate(self.element_gate_norm(element_no_text_input))
+                    element_text_effect = torch.mean(
+                        torch.abs(elem_logits - element_no_text_logits)
+                    )
+                    element_route_effect = F.relu(
+                        gate_weights.new_tensor(self.route_effect_margin) - element_text_effect
+                    )
+                    element_route_loss = element_route_kl + element_route_effect
+            else:
+                # joint 路由下，约束任务/要素文本对路由至少产生可观影响
+                if has_task_text:
+                    task_drop_parts = [img_gate, torch.zeros_like(t_embs), e_embs]
+                    if self.include_physical_prompt and phy_gate is not None:
+                        task_drop_parts.append(phy_gate)
+                    task_drop_input = torch.cat(task_drop_parts, dim=-1).to(dtype=self.gate_norm.weight.dtype)
+                    task_drop_logits = self.gate(self.gate_norm(task_drop_input))
+                    task_effect = torch.mean(torch.abs(gate_logits - task_drop_logits))
+                    task_route_loss = F.relu(
+                        gate_weights.new_tensor(self.route_effect_margin) - task_effect
+                    )
+                    task_route_effect = task_route_loss
+                if has_element_text:
+                    element_drop_parts = [img_gate, t_embs, torch.zeros_like(e_embs)]
+                    if self.include_physical_prompt and phy_gate is not None:
+                        element_drop_parts.append(phy_gate)
+                    element_drop_input = torch.cat(element_drop_parts, dim=-1).to(dtype=self.gate_norm.weight.dtype)
+                    element_drop_logits = self.gate(self.gate_norm(element_drop_input))
+                    element_effect = torch.mean(torch.abs(gate_logits - element_drop_logits))
+                    element_route_loss = F.relu(
+                        gate_weights.new_tensor(self.route_effect_margin) - element_effect
+                    )
+                    element_route_effect = element_route_loss
+
+            if has_task_text and has_element_text:
+                # 任务语义与要素语义尽量解耦
+                task_element_orth = torch.mean(
+                    torch.abs(F.cosine_similarity(t_embs.float(), e_embs.float(), dim=-1))
+                ).to(gate_weights.dtype)
+
+        # 选取 Top-K 专家
+        top_weights, top_indices = torch.topk(gate_weights, self.top_k, dim=-1)  # [B, k]
+
+        # 权重重归一化
+        top_weights = top_weights / (top_weights.sum(dim=-1, keepdim=True) + 1e-9)
+
+        # 记录最近一次前向的路由细节（用于评测脚本可视化）
+        with torch.no_grad():
+            self._last_routing = {
+                "routing_strategy": self.routing_strategy,
+                "task_expert_count": int(self.task_expert_count),
+                "element_expert_count": int(self.element_expert_count),
+                "num_experts": int(self.num_experts),
+                "top_k": int(self.top_k),
+                "visual_token_length": int(L_v),
+                "physical_token_length": int(physical_prompts.size(1)) if physical_prompts is not None else 0,
+                "gate_logits": gate_logits.detach().float().cpu(),
+                "gate_weights": gate_weights.detach().float().cpu(),
+                "top_indices": top_indices.detach().long().cpu(),
+                "top_weights": top_weights.detach().float().cpu(),
+            }
+
+        # 记录辅助损失状态
+        if self.training:
+            importance_soft = gate_weights.mean(dim=0)
+            balance_loss = self.num_experts * torch.sum(importance_soft * importance_soft)
+            entropy = -torch.mean(torch.sum(gate_weights * torch.log(gate_weights + 1e-6), dim=-1))
+            zloss = torch.mean(torch.logsumexp(gate_logits.float(), dim=-1) ** 2)
+            task_route_loss = torch.nan_to_num(task_route_loss, nan=0.0, posinf=0.0, neginf=0.0)
+            element_route_loss = torch.nan_to_num(element_route_loss, nan=0.0, posinf=0.0, neginf=0.0)
+            task_route_kl = torch.nan_to_num(task_route_kl, nan=0.0, posinf=0.0, neginf=0.0)
+            element_route_kl = torch.nan_to_num(element_route_kl, nan=0.0, posinf=0.0, neginf=0.0)
+            task_route_effect = torch.nan_to_num(task_route_effect, nan=0.0, posinf=0.0, neginf=0.0)
+            element_route_effect = torch.nan_to_num(element_route_effect, nan=0.0, posinf=0.0, neginf=0.0)
+            task_element_orth = torch.nan_to_num(task_element_orth, nan=0.0, posinf=0.0, neginf=0.0)
+            entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
+            zloss = torch.nan_to_num(zloss, nan=0.0, posinf=0.0, neginf=0.0)
+
+            self._aux_terms = {
+                "balance": balance_loss,
+                "entropy": entropy,
+                "zloss": zloss,
+                "task_route": task_route_loss,
+                "element_route": element_route_loss,
+                "task_element_orth": task_element_orth,
+            }
+
+            with torch.no_grad():
+                top1_indices = top_indices[:, 0]
+                load = torch.zeros(self.num_experts, device=image_embs.device, dtype=torch.float32)
+                for i in range(self.num_experts):
+                    load[i] = (top1_indices == i).float().mean()
+                self._gate_stats = {
+                    "importance": importance_soft.detach(),
+                    "load": load,
+                    "entropy": entropy.detach(),
+                    "zloss": zloss.detach(),
+                    "invalid_gate_ratio": invalid_gate_ratio.detach(),
+                    "task_route_loss": task_route_loss.detach(),
+                    "element_route_loss": element_route_loss.detach(),
+                    "task_route_kl": task_route_kl.detach(),
+                    "element_route_kl": element_route_kl.detach(),
+                    "task_route_effect": task_route_effect.detach(),
+                    "element_route_effect": element_route_effect.detach(),
+                    "task_element_orth": task_element_orth.detach(),
+                }
+            if self.routing_strategy in ("two_stage", "task_then_element") and self.task_expert_count > 0:
+                task_mass = gate_weights[:, :self.task_expert_count].sum(dim=-1).mean()
+                element_mass = gate_weights[:, self.task_expert_count:].sum(dim=-1).mean()
+                self._gate_stats["task_branch_mass"] = task_mass
+                self._gate_stats["element_branch_mass"] = element_mass
+        else:
+            self._aux_terms = {}
+
+        # ==========================================
+        # 2. 物理先验复用与联合特征构建 (Physical Prior Reuse)
+        # ==========================================
+        # 沿着序列维度拼接视觉特征与物理提示: Z_tilde = Concat(Z_visual, H_prior)
+        if physical_prompts is not None:
+            # physical_prompts shape expected to be [B, L_p, C]
+            z_tilde = torch.cat([image_embs, physical_prompts], dim=1)  # [B, L_v + L_p, C]
+        else:
+            z_tilde = image_embs
+
+        # ==========================================
+        # 3. 专家分发与投影重采样 (Dispatch & Combine)
+        # ==========================================
+        for expert in self.experts:
+            if hasattr(expert, "_last_spatial_attn"):
+                expert._last_spatial_attn = None
+        final_output = torch.zeros(B, self.num_query, self.output_size, device=image_embs.device,
+                                   dtype=image_embs.dtype)
+
+        for i in range(self.top_k):
+            expert_idx = top_indices[:, i]  # [B]
+            expert_weight = top_weights[:, i]  # [B]
+
+            for e_id in range(self.num_experts):
+                mask = (expert_idx == e_id)  # 布尔掩码 [B]
+                if not mask.any():
+                    continue
+
+                # 提取指派给当前专家的 "物理联合序列 Z_tilde"
+                selected_z_tilde = z_tilde[mask]  # [num_selected, L_v + L_p, C]
+
+                # AttnPooler 处理包含物理属性的长序列
+                expert_out = self.experts[e_id](selected_z_tilde, physical_queries=phy_query[mask] if phy_query is not None else None)  # [num_selected, num_query, output_size]
+                # 专家内部可拼接物理查询，输出长度可能 > num_query；仅保留可学习查询对应的前 num_query 个 token
+                if expert_out.size(1) != self.num_query:
+                    expert_out = expert_out[:, : self.num_query, :]
+
+                # 加权融合
+                selected_weights = expert_weight[mask].unsqueeze(1).unsqueeze(2)  # [num_selected, 1, 1]
+                weighted_out = expert_out * selected_weights
+
+                final_output[mask] += weighted_out
+
+        # ==========================================
+        # 4. 特征对齐与约束输出
+        # ==========================================
+        final_output = self.final_norm(final_output) * self.output_gain
+
+        return final_output
 
     def get_gate_stats(self) -> Dict[str, torch.Tensor]:
-        """Return cached gate statistics (importance, load, entropy, zloss)."""
         return self._gate_stats
+
+    def get_last_routing(self) -> Dict[str, object]:
+        return self._last_routing
+
+    def get_aux_loss(self) -> torch.Tensor:
+        """计算路由辅助损失，确保任务感知与专家均衡。"""
+        if not self.training or not self._aux_terms:
+            return torch.tensor(0.0, device=self.gate.weight.device)
+
+        balance_loss = self._aux_terms.get(
+            "balance", torch.tensor(0.0, device=self.gate.weight.device)
+        )
+        entropy_loss = self._aux_terms.get(
+            "entropy", torch.tensor(0.0, device=self.gate.weight.device)
+        )
+        zloss = self._aux_terms.get(
+            "zloss", torch.tensor(0.0, device=self.gate.weight.device)
+        )
+        task_route_loss = self._aux_terms.get(
+            "task_route", torch.tensor(0.0, device=self.gate.weight.device)
+        )
+        element_route_loss = self._aux_terms.get(
+            "element_route", torch.tensor(0.0, device=self.gate.weight.device)
+        )
+        task_element_orth = self._aux_terms.get(
+            "task_element_orth", torch.tensor(0.0, device=self.gate.weight.device)
+        )
+
+        total = (
+            self.aux_balance_coef * balance_loss
+            - self.aux_entropy_coef * entropy_loss
+            + self.aux_zloss_coef * zloss
+            + self.aux_task_route_coef * task_route_loss
+            + self.aux_element_route_coef * element_route_loss
+            + self.aux_task_element_orth_coef * task_element_orth
+        )
+        total = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return total.to(self.gate.weight.dtype)
+
+
 
 
 class PatchDropout(nn.Module):
-    """
-    https://arxiv.org/abs/2212.00794
-    """
-
     def __init__(self, prob, exclude_first_token=True):
         super().__init__()
         assert 0 <= prob < 1.0
         self.prob = prob
-        self.exclude_first_token = exclude_first_token  # exclude CLS token
+        self.exclude_first_token = exclude_first_token
 
     def forward(self, x):
         if not self.training or self.prob == 0.0:
@@ -425,8 +958,6 @@ class LayerScale(nn.Module):
 
 
 class LayerNormFp32(nn.LayerNorm):
-    """Subclass torch's LayerNorm to handle fp16 (by casting to float32 and back)."""
-
     def forward(self, x: torch.Tensor):
         orig_type = x.dtype
         x = F.layer_norm(
@@ -436,8 +967,6 @@ class LayerNormFp32(nn.LayerNorm):
 
 
 class LayerNorm(nn.LayerNorm):
-    """Subclass torch's LayerNorm (with cast back to input dtype)."""
-
     def forward(self, x: torch.Tensor):
         orig_type = x.dtype
         x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
@@ -446,14 +975,14 @@ class LayerNorm(nn.LayerNorm):
 
 class ResidualAttentionBlock(nn.Module):
     def __init__(
-        self,
-        d_model: int,
-        n_head: int,
-        mlp_ratio: float = 4.0,
-        ls_init_value: float = None,
-        act_layer: Callable = nn.GELU,
-        norm_layer: Callable = LayerNorm,
-        is_cross_attention: bool = False,
+            self,
+            d_model: int,
+            n_head: int,
+            mlp_ratio: float = 4.0,
+            ls_init_value: float = None,
+            act_layer: Callable = nn.GELU,
+            norm_layer: Callable = LayerNorm,
+            is_cross_attention: bool = False,
     ):
         super().__init__()
 
@@ -485,24 +1014,31 @@ class ResidualAttentionBlock(nn.Module):
         )
 
     def attention(
-        self,
-        q_x: torch.Tensor,
-        k_x: Optional[torch.Tensor] = None,
-        v_x: Optional[torch.Tensor] = None,
-        attn_mask: Optional[torch.Tensor] = None,
+            self,
+            q_x: torch.Tensor,
+            k_x: Optional[torch.Tensor] = None,
+            v_x: Optional[torch.Tensor] = None,
+            attn_mask: Optional[torch.Tensor] = None,
     ):
         k_x = k_x if k_x is not None else q_x
         v_x = v_x if v_x is not None else q_x
 
         attn_mask = attn_mask.to(q_x.dtype) if attn_mask is not None else None
-        return self.attn(q_x, k_x, v_x, need_weights=False, attn_mask=attn_mask)[0]
+        need_weights = not self.training
+        attn_out, attn_weights = self.attn(
+            q_x, k_x, v_x, need_weights=need_weights, attn_mask=attn_mask
+        )
+
+        if need_weights:
+            self._last_attn_weights = attn_weights.detach()
+        return attn_out
 
     def forward(
-        self,
-        q_x: torch.Tensor,
-        k_x: Optional[torch.Tensor] = None,
-        v_x: Optional[torch.Tensor] = None,
-        attn_mask: Optional[torch.Tensor] = None,
+            self,
+            q_x: torch.Tensor,
+            k_x: Optional[torch.Tensor] = None,
+            v_x: Optional[torch.Tensor] = None,
+            attn_mask: Optional[torch.Tensor] = None,
     ):
         k_x = (
             self.ln_1_kv(k_x) if hasattr(self, "ln_1_kv") and k_x is not None else None
