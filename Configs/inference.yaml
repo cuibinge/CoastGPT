@@ -1,20 +1,32 @@
-# Control
-alignment_dim: 768
-adjust_norm: False
-generate: False
-prompt_template: "llava_llama_2"
-stage: 0
+﻿# Control
+alignment_dim: 768                     # 双视觉分支融合后的通道维度
+adjust_norm: False                     # 是否在投影层里使用更稳的归一化方式
+generate: False                        # 生成开关，当前主流程里基本未使用
+prompt_template: "llava_llama_2"       # 对话提示模板名称
+stage: 0                               # 运行阶段，0 表示推理/评估
 
 # Tune Parameter
-tune_im_start: False
-tune_im_patch: False
-tune_rgb_bk: False  # True for 1
-tune_rgb_pooler: False  # True for both 1 & 2
+tune_im_start: False                   # 是否使用 <im_start> 和 <im_end> 包住图像标记
+tune_im_patch: False                   # 是否启用 <im_patch> 图像 patch 特殊标记
+tune_rgb_bk: False                     # 是否训练 RGB 视觉主干，stage 1 常用 True
+tune_rgb_pooler: False                 # 是否训练视觉到语言的投影池化层，stage 1/2 可用
 
 rgb_vision:
-  arch: vit_large
-  vit_name: openai/clip-vit-large-patch14
+  arch: dual
+  # global encoder uses DINOv3 ViT-L/16 (frozen)
+  global_encoder_name: dinov3_vitl16
+  # local encoder uses DINOv3 ConvNeXt via timm (frozen)
+  local_source: dino
+  local_encoder_name: convnext_base
+  # path to DINOv3 ConvNeXt-Base checkpoint
+  local_ckpt_path: './dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth'
+  freeze_global: True
+  freeze_local: True
+  # required: path to DINOv3 ViT-L/16 checkpoint (.pth/.pt)
+  global_ckpt_path: './dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth'
   input_size: [224, 224]
+  # Physical prompt embedding dim (LLaMA2-7B token embedding is 4096)
+  physical_prompt_dim: 4096
   patch_dropout: 0.
   input_patchnorm: False
   tune_pooler: True
@@ -22,94 +34,159 @@ rgb_vision:
     num_query: 144
     num_attn_heads: 16
     num_layers: 6
-text:
+
+# rgb_vision_legacy:                     # 旧版 RGB 视觉编码器配置
+#   arch: vit_large                      # 视觉编码器类型
+#   vit_name: openai/clip-vit-large-patch14  # 图像预处理器使用的 CLIP 模型名
+#   input_size: [224, 224]               # RGB 分支输入尺寸
+#   patch_dropout: 0.                    # patch dropout 比例，0 表示不丢弃
+#   input_patchnorm: False               # 是否对输入 patch 做归一化
+#   tune_pooler: True                    # 是否允许池化相关层参与训练
+#   attn_pooler:                         # 视觉 token 压缩到语言空间前的注意力池化器
+#     num_query: 144                     # 输出多少个视觉 query token
+#     num_attn_heads: 16                 # 注意力头数
+#     num_layers: 6                      # 池化器层数
+
+text:                                  # 文本大模型配置
   # llama-v2 config
-  vocab_size: 32000
-  hidden_size: 4096
-  intermediate_size: 11008
-  num_hidden_layers: 32
-  num_attention_heads: 32
-  hidden_act: "silu"
-  max_position_embeddings: 2048
-  initializer_range: 0.02
-  rms_norm_eps: 1e-5
-  use_cache: True
-  pad_token_id: 0
-  bos_token_id: 1
-  eos_token_id: 2
-  tie_word_embeddings: False
-  path: meta-llama/Llama-2-7b-chat-hf
-sar_vision:
-  arch: base
-  input_size: [192, 192]
-  n_queries: 256
-  in_chans: 2
+  vocab_size: 32000                    # 词表大小
+  hidden_size: 4096                    # 文本隐藏维度，也是视觉投影目标维度
+  intermediate_size: 11008             # MLP 中间层维度
+  num_hidden_layers: 32                # Transformer 层数
+  num_attention_heads: 32              # 注意力头数
+  hidden_act: "silu"                   # 激活函数
+  max_position_embeddings: 2048        # 最大位置长度
+  initializer_range: 0.02              # 参数初始化范围
+  rms_norm_eps: 1e-5                   # RMSNorm 的 eps
+  use_cache: True                      # 生成时是否使用 KV cache
+  pad_token_id: 0                      # pad token 的 id
+  bos_token_id: 1                      # 句子开始 token 的 id
+  eos_token_id: 2                      # 句子结束 token 的 id
+  tie_word_embeddings: False           # 输入输出词嵌入是否共享
+  path: meta-llama/Llama-2-7b-chat-hf  # HuggingFace 上的文本模型路径
+
+sar_vision:                            # SAR 视觉分支配置
+  arch: base                           # SAR 编码器结构类型
+  input_size: [192, 192]               # SAR 输入尺寸
+  n_queries: 256                       # SAR 分支查询 token 数量
+  in_chans: 2                          # 输入通道数
   # decoder Parameter
-  decoder:
-    layers: 12
-    heads: 12
-    mask_ratio: 0.6
-    mask_color: mean
-    hidden_size: 768
+  decoder:                             # SAR 解码器配置
+    layers: 12                         # 解码器层数
+    heads: 12                          # 解码器注意力头数
+    mask_ratio: 0.6                    # 掩码比例
+    mask_color: mean                   # 被掩码区域的填充值方式
+    hidden_size: 768                   # 解码器隐藏维度
   # loss Parameter
-  loss_weight: 1.0
-  reduction: none
-  activate: sigmoid
-  alpha: 0.2
-  focal_gamma: 1.0
-  residual: False
-  unmask_weight: 0.0
+  loss_weight: 1.0                     # SAR 分支损失权重
+  reduction: none                      # 损失聚合方式
+  activate: sigmoid                    # 输出激活函数
+  alpha: 0.2                           # focal 类损失的 alpha
+  focal_gamma: 1.0                     # focal 类损失的 gamma
+  residual: False                      # 是否使用残差连接
+  unmask_weight: 0.0                   # 非掩码区域损失权重
   # DINO Contrastive Learning Parameter
-  online_temp: 0.1
-  branch_temp: 0.07
-  warmup_branch_temp: 0.04
-  warmup_branch_temp_epochs: 2
-transform:
+  online_temp: 0.1                     # 在线分支温度系数
+  branch_temp: 0.07                    # 分支温度系数
+  warmup_branch_temp: 0.04             # 预热阶段分支温度
+  warmup_branch_temp_epochs: 2         # 分支温度预热轮数
+
+transform:                             # 图像变换配置
   # input_size: [192, 192]
-  input_size: [224, 224]
-  rand_aug: rand-m5-n2-mstd0.5-inc1
-eval:
-  dataset: AID
+  input_size: [224, 224]               # 训练/推理预处理尺寸
+  rand_aug: rand-m5-n2-mstd0.5-inc1    # 训练时的数据增强策略
+
+eval:                                  # 评估配置
+  dataset: AID                         # 评估数据集名称
 
 # training config
-dtype: float16
-bits: 16
-double_quant: True
-quant_type: nf4
-fp16: False
-bf16: True
-lora:
-  enable: False  # True for stage 2
-  lora_r: 128
-  lora_alpha: 256
-  lora_dropout: 0.05
-  lora_bias: none
+dtype: float16                         # 模型前向主要使用的数据类型
+bits: 16                               # 文本模型加载位宽，16 表示正常半精度/全精度
+double_quant: True                     # 4bit 量化时是否使用双重量化
+quant_type: nf4                        # 4bit 量化类型
+fp16: False                            # 是否启用 fp16
+bf16: True                             # 是否启用 bf16
+lora:                                  # LoRA 配置
+  enable: False                        # 是否启用 LoRA，stage 2 常用 True
+  lora_r: 128                          # LoRA 的秩
+  lora_alpha: 256                      # LoRA 缩放系数
+  lora_dropout: 0.05                   # LoRA dropout
+  lora_bias: none                      # LoRA 对 bias 的处理方式
 
 # optimizer
-optimizer: adanp
-lr: 0.0002
-wd: 0.
-epochs: 2
-max_grad_norm: 0.3
+optimizer: adanp                       # 优化器类型
+lr: 0.0002                             # 学习率
+wd: 0.                                 # 权重衰减
+epochs: 2                              # 训练轮数
+max_grad_norm: 0.3                     # 梯度裁剪阈值
 
 # scheduler
-schedule:
-  name: cosine
-  min_lr: 0.00002
-  warmup_epochs: 100
-  warmup_method: linear
-  warmup_factor: 0.01
-  decay_epochs: 30
-  decay_rate: 0.1
-  multisteps: []
-  gamma: 0.1
+schedule:                              # 学习率调度器配置
+  name: cosine                         # 调度策略
+  min_lr: 0.00002                      # 最小学习率
+  warmup_epochs: 100                   # 预热步数/轮数
+  warmup_method: linear                # 预热方式
+  warmup_factor: 0.01                  # 预热起始比例
+  decay_epochs: 30                     # 衰减间隔，当前 cosine 下基本未使用
+  decay_rate: 0.1                      # 衰减比例，当前 cosine 下基本未使用
+  multisteps: []                       # 多步衰减节点，当前未使用
+  gamma: 0.1                           # step 类衰减系数，当前 cosine 下基本未使用
 
-#test
 
-vision:
-  embedding_dim: 1024
-language:
-  embedding_dim: 4096
-vit_name: openai/clip-vit-large-patch14
-hf_model: False
+# vision:                                
+#   embedding_dim: 1024                  
+# language:                              
+#   embedding_dim: 4096                  
+hf_model: False                        # False 表示使用项目内置 transform/checkpoint 加载逻辑
+
+# Physics branch configuration
+physics:
+  enabled: false                       # 是否启用物理解码分支
+  out_channels: 1                      # 物理图输出通道数
+  loss_weight: 1.0                     # 训练时物理损失权重；普通推理不使用
+  edge_weight: 0.0                     # 边缘约束权重；普通推理不使用
+  tv_weight: 0.01                      # 总变分正则权重；普通推理不使用
+  consistency_weight: 0.05             # 多尺度一致性权重；普通推理不使用
+  spectral_weight: 0.0                 # 光谱约束权重；普通推理不使用
+  auto_gt_from_constraints: true       # 训练时是否从约束自动生成物理 GT；普通推理不使用
+  sar_sigma0_coeffs:                   # SAR 经验系数；auto_gt_from_constraints 使用
+    A: -10.0
+    B: 2.0
+    C: 0.05
+    D_VV: 0.0
+    D_VH: -3.0
+
+# Aquaculture segmentation (MOE) configuration
+aquaculture_seg:
+  enabled: false                       # 是否启用养殖区分割头
+  num_classes: 2                       # 分割类别数，例如 [背景, 养殖区]
+  loss_weight: 1.0                     # 分割总体损失权重；普通推理不使用
+  ce_weight: 1.0                       # 交叉熵损失权重；普通推理不使用
+  dice_weight: 0.0                     # Dice 损失权重；普通推理不使用
+  ignore_index: 255                    # 标注中忽略标签的索引值
+  include_context_expert: true         # 是否启用 ASPP/SPP 上下文专家
+  log_gate_stats: true                 # 是否记录门控权重统计
+  router_aux_loss_coef:                # 路由器正则项系数；训练时使用
+    entropy: 0.001
+    zloss: 0.001
+  adapters:                            # 分割专家适配器配置，默认整体关闭
+    enable: false
+    spectral:
+      enable: false
+      target_dim: 16
+    texture:
+      enable: false
+      target_dim: 8
+      depth: 2
+    spp:
+      enable: false
+      project_dim: 64
+      levels: [1, 2, 4]
+    modality_gate:
+      enable: false
+      optical_weight: 0.7
+      sar_weight: 0.3
+      cloudy_boost: 0.3
+
+
 
