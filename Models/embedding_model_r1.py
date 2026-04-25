@@ -1,68 +1,160 @@
-import ml_collections  # 导入ml_collections库，用于管理配置
-import torch  # 导入PyTorch核心库
-import torch.nn as nn  # 导入PyTorch的神经网络模块
-from typing import Dict, List, Optional, Tuple, Union
-from .common_arch import AttnPooler, LayerNorm, LayerNormFp32
+import ml_collections
+import torch
+import torch.nn as nn
+from typing import Dict, Optional
+
+from .common_arch import LayerNorm, LayerNormFp32, MoEProjection, PhysicalPromptEncoder
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 
 class EmbeddingModel(nn.Module):
     def __init__(self, config: ml_collections.ConfigDict):
-        """
-        初始化 EmbeddingModel 模型。
+        super().__init__()
 
-        参数:
-            config: 包含模型参数的配置字典，包括 vision.embedding_dim 和 language.embedding_dim
-        """
-        super(EmbeddingModel, self).__init__()
-
-        # 定义投影层
-        # self.projection = nn.Linear(config.vision.embedding_dim, config.language.embedding_dim)
-
-        # 使用LHRS的连接层
         if config.adjust_norm:
-            norm_layer = (
-                LayerNormFp32 if config.dtype in ("float16", "bfloat16") else LayerNorm
-            )
+            norm_layer = LayerNormFp32 if config.dtype in ("float16", "bfloat16") else LayerNorm
         else:
             norm_layer = LayerNorm
 
-        self.projection = AttnPooler(
+        moe_cfg = getattr(config, "moe_proj", ml_collections.ConfigDict())
+        phy_cfg = getattr(config, "physics", ml_collections.ConfigDict())
+        text_embed_dim = int(getattr(config.text, "hidden_size", getattr(config, "alignment_dim", 768)))
+        alignment_dim = int(getattr(config, "alignment_dim", 768))
+        physical_prompt_embed_dims = sorted({alignment_dim, text_embed_dim})
+
+        pool_scales = phy_cfg.get("prompt_pool_sizes", [1, 2, 4])
+        if hasattr(pool_scales, "to_list"):
+            pool_scales = pool_scales.to_list()
+        self.use_physical_prompt = bool(phy_cfg.get("prompt_enabled", True))
+        self.physical_prompt_encoder = PhysicalPromptEncoder(
+            in_channels=int(phy_cfg.get("prompt_in_channels", 1)),
+            embed_dim=getattr(config, "alignment_dim", 768),
+            pool_scales=pool_scales,
+        )
+
+        self.projection = MoEProjection(
+            num_experts=int(moe_cfg.get("num_experts", 4)),
             num_query=config.rgb_vision.attn_pooler.num_query,
             num_layers=config.rgb_vision.attn_pooler.num_layers,
             num_attention_heads=config.rgb_vision.attn_pooler.num_attn_heads,
-            encoder_hidden_size=config.vision.embedding_dim,
-            hidden_size=config.vision.embedding_dim,
+            encoder_hidden_size=getattr(config, "alignment_dim", 768),
+            hidden_size=getattr(config, "alignment_dim", 768),
             output_size=config.text.hidden_size,
+            task_dim=int(moe_cfg.get("task_dim", 256)),
+            text_embed_dim=text_embed_dim,
+            physical_prompt_embed_dims=physical_prompt_embed_dims,
+            include_physical_prompt=bool(moe_cfg.get("include_physical_prompt", True)),
             norm_layer=norm_layer,
             checkpoint=getattr(config, "use_checkpoint", False),
+            top_k=int(moe_cfg.get("top_k", 2)),
+            routing_strategy=str(moe_cfg.get("routing_strategy", "joint")),
+            task_expert_ratio=float(moe_cfg.get("task_expert_ratio", 0.5)),
         )
 
-    def forward(self, data: Dict, image_embedding):
-        """
-        前向传播，生成多模态嵌入。
+    def _build_physical_prompts(
+            self,
+            data: Dict,
+            device: torch.device,
+            dtype: torch.dtype
+    ) -> Optional[torch.Tensor]:
+        # 1) 优先使用已计算好的连续物理提示（例如由 LLM embedding 得到）
+        if "physical_prompt_embs" in data and data["physical_prompt_embs"] is not None:
+            embs = data["physical_prompt_embs"]
+            if torch.is_tensor(embs):
+                return embs.to(device=device, dtype=dtype)
+            return None
 
-        参数:
-            data: 包含输入数据（图像、经纬度等）的字典
-            image_embedding: 视觉模型输出的图像嵌入，形状为 (batch_size, vision_embedding_dim)
+        # 2) 退化回原有的 TSM 物理图像提示
+        if not self.use_physical_prompt:
+            return None
+        tsm = data.get("tsm", None)
+        if tsm is None or not torch.is_tensor(tsm):
+            return None
 
-        返回:
-            multimodal_embedding: 多模态嵌入，形状为 (batch_size, language_embedding_dim)
-        """
+        mask = data.get("mask", None)
+        tsm = tsm.to(device=device, dtype=dtype)
+        if mask is not None and torch.is_tensor(mask):
+            mask = mask.to(device=device, dtype=dtype)
+        else:
+            mask = None
+        prompts = self.physical_prompt_encoder(tsm, mask)
+        if prompts is not None and prompts.dtype != dtype:
+            prompts = prompts.to(dtype=dtype)
+        return prompts
 
-        # 通过投影层将多模态嵌入映射到语言嵌入维度
-        projected_multimodal_embedding = self.projection(image_embedding)
-        return projected_multimodal_embedding
+    def forward(self, data: Dict, image_embedding: torch.Tensor):
+        device = image_embedding.device
+        task_text_embs = data.get("task_text_embs", None)
+        if task_text_embs is not None and torch.is_tensor(task_text_embs):
+            task_text_embs = task_text_embs.to(device=device, dtype=image_embedding.dtype)
+        else:
+            task_text_embs = None
 
-    def encode_test(self, image_embedding):
-        """
-        纯图像编码测试。
+        element_text_embs = data.get("element_text_embs", None)
+        if element_text_embs is not None and torch.is_tensor(element_text_embs):
+            element_text_embs = element_text_embs.to(device=device, dtype=image_embedding.dtype)
+        else:
+            element_text_embs = None
+        task_text_mask = data.get("task_text_attention_mask", None)
+        if task_text_mask is not None and torch.is_tensor(task_text_mask):
+            task_text_mask = task_text_mask.to(device=device)
+        else:
+            task_text_mask = None
+        element_text_mask = data.get("element_text_attention_mask", None)
+        if element_text_mask is not None and torch.is_tensor(element_text_mask):
+            element_text_mask = element_text_mask.to(device=device)
+        else:
+            element_text_mask = None
 
-        参数:
-            image_embedding: 视觉模型输出的图像嵌入，形状为 (batch_size, vision_embedding_dim)
+        physical_prompts = self._build_physical_prompts(data, device=device, dtype=image_embedding.dtype)
+        physical_prompt_mask = data.get("physical_prompt_attention_mask", None)
+        if physical_prompt_mask is not None and torch.is_tensor(physical_prompt_mask):
+            physical_prompt_mask = physical_prompt_mask.to(device=device)
+        else:
+            physical_prompt_mask = None
 
-        返回:
-            multimodal_embedding: 多模态嵌入，形状为 (batch_size, language_embedding_dim)
-        """
-        # 通过投影层将图像嵌入映射到语言嵌入维度
-        projected_image_embedding = self.projection(image_embedding)
-        return projected_image_embedding
+        return self.projection(
+            image_embs=image_embedding,
+            physical_prompts=physical_prompts,
+            task_text_embs=task_text_embs,
+            element_text_embs=element_text_embs,
+            physical_prompt_mask=physical_prompt_mask,
+            task_text_mask=task_text_mask,
+            element_text_mask=element_text_mask,
+        )
+
+    def encode_test(
+            self,
+            image_embedding: torch.Tensor,
+            task_text_embs: Optional[torch.Tensor] = None,
+            element_text_embs: Optional[torch.Tensor] = None,
+    ):
+        if task_text_embs is not None:
+            task_text_embs = task_text_embs.to(image_embedding.device, dtype=image_embedding.dtype)
+        if element_text_embs is not None:
+            element_text_embs = element_text_embs.to(image_embedding.device, dtype=image_embedding.dtype)
+
+        return self.projection(
+            image_embs=image_embedding,
+            physical_prompts=None,
+            task_text_embs=task_text_embs,
+            element_text_embs=element_text_embs,
+        )
+
+    def get_aux_loss(self) -> torch.Tensor:
+        if hasattr(self.projection, "get_aux_loss"):
+            return self.projection.get_aux_loss()
+        return torch.tensor(0.0)
+
+    def get_gate_stats(self) -> Dict[str, torch.Tensor]:
+        if hasattr(self.projection, "get_gate_stats"):
+            return self.projection.get_gate_stats()
+        return {}
+
+    def get_last_routing(self) -> Dict[str, object]:
+        if hasattr(self.projection, "get_last_routing"):
+            return self.projection.get_last_routing()
+        return {}
