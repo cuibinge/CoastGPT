@@ -1,5 +1,7 @@
 import math
-from typing import Dict
+import os
+import re
+from typing import Dict, Optional, Tuple
 
 import ml_collections
 import torch
@@ -13,6 +15,416 @@ except Exception as e:
     open_clip = None
     _open_clip_import_error = e
 
+
+
+class CrossFrequencyAttention(nn.Module):
+   
+    def __init__(self, vit_dim, cnn_dim, num_heads=8):
+        super().__init__()
+        self.q_proj = nn.Linear(vit_dim, vit_dim)
+        self.k_proj = nn.Linear(cnn_dim, vit_dim)
+        self.v_proj = nn.Linear(cnn_dim, vit_dim)
+        
+        self.attn = nn.MultiheadAttention(embed_dim=vit_dim, num_heads=num_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(vit_dim)
+        self.norm2 = nn.LayerNorm(vit_dim)
+        
+        self.ffn = nn.Sequential(
+            nn.Linear(vit_dim, vit_dim * 4),
+            nn.GELU(),
+            nn.Linear(vit_dim * 4, vit_dim)
+        )
+
+    def forward(self, z_vit, z_cnn):
+        """
+        Args:
+            z_vit: [B, N_vit, C_vit] 浣庨璇箟瀹忚娴佸舰
+            z_cnn: [B, N_cnn, C_cnn] 楂橀绾圭悊寰娴佸舰
+        """
+        Q = self.q_proj(z_vit)
+        K = self.k_proj(z_cnn)
+        V = self.v_proj(z_cnn)
+
+        # 娉ㄦ剰鍔涜绠楋細Q (瀹忚) 妫€绱?K (寰)锛屾彁鍙?V (灞€閮ㄧ壒寰?
+        attn_out, _ = self.attn(query=Q, key=K, value=V)
+        
+        # 娈嬪樊杩炴帴锛氫繚鐣欏師濮嬩綆棰戞嫇鎵戠殑鍚屾椂娉ㄥ叆楂橀缁嗚妭
+        z_fused = self.norm1(z_vit + attn_out)
+        out = self.norm2(z_fused + self.ffn(z_fused))
+        return out
+class SpatialScaleFusion(nn.Module):
+    """
+    对应论文描述中的：
+    Gi = Conv1x1(Reshape(Gi))
+    Li = Conv1x1(Li)
+    Zraw = Gi ⊕ Li
+    Zi = DW-Conv3x3(GELU(Zraw))
+
+    输入：
+        vit_grid: [B, C_vit, H_g, W_g]
+        cnn_feat: [B, C_i, H_i, W_i]
+
+    输出：
+        z_i: [B, out_dim, H_i, W_i]
+    """
+
+    def __init__(self, vit_dim: int, cnn_dim: int, align_dim: int, out_dim: int):
+        super().__init__()
+
+        self.vit_align = nn.Conv2d(vit_dim, align_dim, kernel_size=1)
+        self.cnn_align = nn.Conv2d(cnn_dim, align_dim, kernel_size=1)
+
+        self.spatial_smooth = nn.Sequential(
+            nn.GELU(),
+            nn.Conv2d(
+                align_dim * 2,
+                align_dim * 2,
+                kernel_size=3,
+                padding=1,
+                groups=align_dim * 2,
+                bias=False,
+            ),
+            nn.Conv2d(
+                align_dim * 2,
+                out_dim,
+                kernel_size=1,
+                bias=True,
+            ),
+            nn.GroupNorm(1, out_dim),
+            nn.GELU(),
+        )
+
+    def forward(self, vit_grid: torch.Tensor, cnn_feat: torch.Tensor) -> torch.Tensor:
+        if vit_grid.dtype != cnn_feat.dtype:
+            vit_grid = vit_grid.to(dtype=cnn_feat.dtype)
+
+        vit_resized = F.interpolate(
+            vit_grid,
+            size=cnn_feat.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        g_i = self.vit_align(vit_resized)
+        l_i = self.cnn_align(cnn_feat)
+
+        z_raw = torch.cat([g_i, l_i], dim=1)
+        z_i = self.spatial_smooth(z_raw)
+
+        return z_i
+class HeterogeneousFusionBlock(nn.Module):
+    """
+    实现新的混合多尺度视觉 token 构建逻辑：
+
+    1. Stage1 / Stage3 / Stage4：
+       通过 ViT Query 做 Cross-Attention，压缩到 196 个 token。
+       再与原始 ViT token 在特征维拼接：
+       [B, 196, 768] × 4 -> [B, 196, 3072]
+
+    2. Stage2：
+       保留高分辨率 28×28 = 784 个 token。
+       每个 token 从 C8 投影到 3072 维：
+       [B, 784, C8] -> [B, 784, 3072]
+
+    3. 最后序列维拼接：
+       [B, 196, 3072] + [B, 784, 3072]
+       -> [B, 980, 3072]
+    """
+
+    def __init__(
+        self,
+        cnn_dims,
+        vit_dim,
+        semantic_grid_size=(14, 14),
+        detail_grid_size=(28, 28),
+    ):
+        super().__init__()
+
+        if len(cnn_dims) < 4:
+            raise ValueError("cnn_dims must provide 4 stage dimensions")
+
+        self.vit_dim = int(vit_dim)
+        self.out_dim = int(vit_dim) * 4
+
+        self.semantic_grid_size = tuple(semantic_grid_size) if semantic_grid_size is not None else None
+        self.detail_grid_size = tuple(detail_grid_size) if detail_grid_size is not None else None
+
+        c4_dim, c8_dim, c16_dim, c32_dim = [int(v) for v in cnn_dims[:4]]
+
+        # Stage1 / Stage3 / Stage4 先投影到 C_vit
+        self.pre_align_f4 = nn.Sequential(
+            nn.Linear(c4_dim, vit_dim),
+            nn.LayerNorm(vit_dim),
+        )
+        self.pre_align_f16 = nn.Sequential(
+            nn.Linear(c16_dim, vit_dim),
+            nn.LayerNorm(vit_dim),
+        )
+        self.pre_align_f32 = nn.Sequential(
+            nn.Linear(c32_dim, vit_dim),
+            nn.LayerNorm(vit_dim),
+        )
+
+        # ViT token 作为 Query，CNN token 作为 Key / Value
+        self.align_f4 = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=vit_dim)
+        self.align_f16 = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=vit_dim)
+        self.align_f32 = CrossFrequencyAttention(vit_dim=vit_dim, cnn_dim=vit_dim)
+
+        # ViT + Stage1 + Stage3 + Stage4 四路拼接
+        self.semantic_logits = nn.Parameter(torch.zeros(4))
+
+        self.semantic_ln = nn.LayerNorm(self.out_dim)
+        self.semantic_mlp = nn.Sequential(
+            nn.Linear(self.out_dim, self.out_dim),
+            nn.GELU(),
+            nn.Linear(self.out_dim, self.out_dim),
+        )
+
+        # Stage2 高分辨率细节分支：C8 -> 4*C_vit
+        self.detail_proj = nn.Sequential(
+            nn.Linear(c8_dim, self.out_dim),
+            nn.LayerNorm(self.out_dim),
+            nn.GELU(),
+            nn.Linear(self.out_dim, self.out_dim),
+        )
+
+        self.detail_ln = nn.LayerNorm(self.out_dim)
+
+        self._last_fusion_weights = None
+        self._last_token_info = {}
+
+    @staticmethod
+    def _add_2d_sincos_pos_embed(x: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        """
+        x: [B, H*W, C]
+        """
+        device, dtype = x.device, x.dtype
+        c = x.shape[-1]
+
+        quarter = max(c // 4, 1)
+
+        yy, xx = torch.meshgrid(
+            torch.arange(h, device=device),
+            torch.arange(w, device=device),
+            indexing="ij",
+        )
+
+        omega = torch.arange(quarter, device=device, dtype=dtype)
+        omega = 1.0 / (10000 ** (omega / quarter))
+
+        yy = yy.reshape(-1, 1).to(dtype) * omega
+        xx = xx.reshape(-1, 1).to(dtype) * omega
+
+        pos = torch.cat(
+            [
+                torch.sin(yy),
+                torch.cos(yy),
+                torch.sin(xx),
+                torch.cos(xx),
+            ],
+            dim=1,
+        )
+
+        if pos.shape[1] < c:
+            pad = torch.zeros(
+                pos.shape[0],
+                c - pos.shape[1],
+                device=device,
+                dtype=dtype,
+            )
+            pos = torch.cat([pos, pad], dim=1)
+
+        pos = pos[:, :c]
+
+        return x + pos.unsqueeze(0)
+
+    @staticmethod
+    def _resize_feature_map(
+        feat: torch.Tensor,
+        target_size: Optional[Tuple[int, int]],
+    ) -> torch.Tensor:
+        if target_size is None:
+            return feat
+
+        target_size = tuple(target_size)
+        if feat.shape[-2:] == target_size:
+            return feat
+
+        return F.interpolate(
+            feat,
+            size=target_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+
+    def _feat_to_tokens(
+        self,
+        feat: torch.Tensor,
+        target_size: Optional[Tuple[int, int]] = None,
+    ) -> torch.Tensor:
+        """
+        [B, C, H, W] -> [B, H*W, C]
+        """
+        feat = self._resize_feature_map(feat, target_size)
+
+        b, c, h, w = feat.shape
+        tokens = feat.flatten(2).transpose(1, 2).contiguous()
+        tokens = self._add_2d_sincos_pos_embed(tokens, h=h, w=w)
+
+        return tokens
+
+    def forward(
+        self,
+        vit_tokens: torch.Tensor,
+        cnn_feats: Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Args:
+            vit_tokens:
+                [B, 196, C_vit]
+
+            cnn_feats:
+                c4, c8, c16, c32
+                c4  -> Stage1
+                c8  -> Stage2，高分辨率细节分支
+                c16 -> Stage3
+                c32 -> Stage4
+
+        Returns:
+            visual_tokens:
+                [B, 980, 4*C_vit]
+        """
+
+        c4, c8, c16, c32 = cnn_feats
+
+        # ==================================================
+        # A. Stage1 / Stage3 / Stage4：交叉注意力语义融合
+        # ==================================================
+
+        c4_tok = self._feat_to_tokens(c4)
+        c16_tok = self._feat_to_tokens(c16)
+        c32_tok = self._feat_to_tokens(c32)
+
+        flat_c4 = self.pre_align_f4(c4_tok)
+        flat_c16 = self.pre_align_f16(c16_tok)
+        flat_c32 = self.pre_align_f32(c32_tok)
+
+        F4 = self.align_f4(vit_tokens, flat_c4)
+        F16 = self.align_f16(vit_tokens, flat_c16)
+        F32 = self.align_f32(vit_tokens, flat_c32)
+
+        weights = torch.softmax(self.semantic_logits, dim=0)
+
+        semantic_tokens = torch.cat(
+            [
+                vit_tokens * weights[0],
+                F4 * weights[1],
+                F16 * weights[2],
+                F32 * weights[3],
+            ],
+            dim=-1,
+        )
+
+        semantic_tokens = semantic_tokens + self.semantic_mlp(
+            self.semantic_ln(semantic_tokens)
+        )
+
+        # semantic_tokens: [B, 196, 3072]，当 C_vit=768
+
+        # ==================================================
+        # B. Stage2：保留 28×28 高分辨率细节 token
+        # ==================================================
+
+        detail_tokens = self._feat_to_tokens(
+            c8,
+            target_size=self.detail_grid_size,
+        )
+
+        detail_tokens = self.detail_proj(detail_tokens)
+        detail_tokens = self.detail_ln(detail_tokens)
+
+        # detail_tokens: [B, 784, 3072]，当 detail_grid_size=(28,28)
+
+        # ==================================================
+        # C. 序列维拼接
+        # ==================================================
+
+        visual_tokens = torch.cat(
+            [semantic_tokens, detail_tokens],
+            dim=1,
+        )
+
+        self._last_fusion_weights = weights.detach()
+        self._last_token_info = {
+            "semantic_tokens": int(semantic_tokens.shape[1]),
+            "detail_tokens": int(detail_tokens.shape[1]),
+            "total_tokens": int(visual_tokens.shape[1]),
+            "channel_dim": int(visual_tokens.shape[-1]),
+        }
+
+        return visual_tokens
+class PhysicalGuidedAlign(nn.Module):
+    """Use physical prompt tokens to re-align fused visual tokens."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        max_phys_tokens: int = 64,
+        physical_in_dim: Optional[int] = None,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.max_phys_tokens = max_phys_tokens
+        self.physical_in_dim = int(physical_in_dim) if physical_in_dim is not None else int(dim)
+        if self.physical_in_dim == self.dim:
+            self.phys_proj = nn.Identity()
+        else:
+            self.phys_proj = nn.Linear(self.physical_in_dim, self.dim)
+        self.q_norm = nn.LayerNorm(dim)
+        self.kv_norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
+        self.gate = nn.Sequential(
+            nn.LayerNorm(dim * 2),
+            nn.Linear(dim * 2, dim),
+            nn.GELU(),
+            nn.Linear(dim, 1),
+        )
+        self._last_stats = {}
+
+    def _project_phys(self, x: torch.Tensor) -> torch.Tensor:
+        if x.size(-1) != self.physical_in_dim:
+            raise ValueError(
+                f"physical token dim {x.size(-1)} mismatches expected {self.physical_in_dim}. "
+                "Set rgb_vision.physical_prompt_dim to match physical prompt embedding dim."
+            )
+        return self.phys_proj(x)
+
+    def forward(self, visual_tokens: torch.Tensor, physical_tokens: Optional[torch.Tensor]) -> torch.Tensor:
+        if physical_tokens is None:
+            return visual_tokens
+        if physical_tokens.numel() == 0:
+            return visual_tokens
+
+        physical_tokens = self._project_phys(physical_tokens)
+        if physical_tokens.size(1) > self.max_phys_tokens:
+            physical_tokens = physical_tokens[:, : self.max_phys_tokens, :]
+
+        q = self.q_norm(physical_tokens)
+        kv = self.kv_norm(visual_tokens)
+        attn_out, attn_w = self.attn(query=q, key=kv, value=kv)
+
+        phys_summary = attn_out.mean(dim=1, keepdim=True).expand(-1, visual_tokens.size(1), -1)
+        gate = torch.sigmoid(self.gate(torch.cat([visual_tokens, phys_summary], dim=-1)))
+        out = visual_tokens + gate * phys_summary
+
+        with torch.no_grad():
+            entropy = -(attn_w.clamp_min(1e-8) * attn_w.clamp_min(1e-8).log()).sum(dim=-1).mean()
+            self._last_stats = {
+                "phys_align_entropy": entropy.detach(),
+                "phys_align_gate_mean": gate.mean().detach(),
+            }
+        return out
 
 class DualVisionEncoder(nn.Module):
     def __init__(self, config: ml_collections.ConfigDict):
@@ -49,8 +461,17 @@ class DualVisionEncoder(nn.Module):
             # Enable RoPE if available in checkpoint
             self._enable_vit_rope(state)
             missing = self.global_encoder.load_state_dict(state, strict=False)
-            if isinstance(missing, torch.nn.modules.module._IncompatibleKeys):
-                warnings.warn(f"Loaded DINOv3 ViT weights with missing: {missing.missing_keys}, unexpected: {missing.unexpected_keys}")
+            self._log_state_dict_mismatch(
+                model_name="DINOv3 ViT",
+                incompatible=missing,
+                expected_missing_exact={"pos_embed", "head.weight", "head.bias"},
+                expected_unexpected_prefixes=("storage_tokens", "mask_token", "rope_embed", "local_cls_norm"),
+                expected_unexpected_regex=(
+                    r"^blocks\.\d+\.attn\.qkv\.bias_mask$",
+                    r"^blocks\.\d+\.ls1\.gamma$",
+                    r"^blocks\.\d+\.ls2\.gamma$",
+                ),
+            )
         except Exception as e:
             raise RuntimeError(f"Failed to initialize DINOv3 ViT via timm: {e}")
 
@@ -82,8 +503,10 @@ class DualVisionEncoder(nn.Module):
             # Remap common DINO ConvNeXt key patterns to timm ConvNeXt naming to maximize match
             state = self._remap_dino_convnext_to_timm(state)
             missing = self.local_encoder.load_state_dict(state, strict=False)
-            if isinstance(missing, torch.nn.modules.module._IncompatibleKeys):
-                warnings.warn(f"Loaded local ConvNeXt weights with missing: {missing.missing_keys}, unexpected: {missing.unexpected_keys}")
+            self._log_state_dict_mismatch(
+                model_name="DINOv3 ConvNeXt",
+                incompatible=missing,
+            )
         else:
             raise RuntimeError(f"Unknown local_source '{self.local_source}'. Expected 'openclip' or 'dino'.")
 
@@ -98,6 +521,134 @@ class DualVisionEncoder(nn.Module):
         # Projection heads (lazy init)
         self.local_proj = None
         self.fusion_proj = None
+
+        self.physical_align_heads = int(rgb_cfg.get("physical_align_heads", 8))
+        self.physical_align_max_tokens = int(rgb_cfg.get("physical_align_max_tokens", 64))
+        # 强制语义分支为 14×14 = 196 tokens
+        self.semantic_grid_size = tuple(rgb_cfg.get("semantic_grid_size", [14, 14]))
+        
+        # 强制 Stage2 高分辨率分支为 28×28 = 784 tokens
+        self.detail_grid_size = tuple(rgb_cfg.get("detail_grid_size", [28, 28]))
+        
+        # False: 最终输出 [B, 980, 3072]
+        # True:  最终输出 [B, 980, 768]
+        self.output_project_to_embedding = bool(
+            rgb_cfg.get("output_project_to_embedding", False)
+        )
+        self.physical_prompt_dim = int(
+            rgb_cfg.get(
+                "physical_prompt_dim",
+                getattr(getattr(config, "text", ml_collections.ConfigDict()), "hidden_size", self.embedding_dim * 4),
+            )
+        )
+        self.vit_dim_cfg = int(rgb_cfg.get("vit_dim", 0)) or None
+        cnn_dims_cfg = rgb_cfg.get("cnn_dims", None)
+        self.cnn_dims_cfg = [int(v) for v in cnn_dims_cfg] if cnn_dims_cfg else None
+
+        self.hetero_fusion = None
+        self.physical_guided_align = None
+        self.final_proj = None
+        self._fusion_vit_dim = None
+        self._fusion_cnn_dims = None
+
+        vit_dim_guess = self.vit_dim_cfg or self._infer_global_dim()
+        cnn_dims_guess = self.cnn_dims_cfg or self._infer_local_dims()
+        if vit_dim_guess is not None and cnn_dims_guess is not None and len(cnn_dims_guess) >= 4:
+            self._build_alignment_modules(
+                vit_dim=vit_dim_guess,
+                cnn_dims=cnn_dims_guess[:4],
+                device=next(self.global_encoder.parameters()).device,
+                dtype=next(self.global_encoder.parameters()).dtype,
+            )
+
+    @staticmethod
+    def _is_main_rank() -> bool:
+        try:
+            return int(os.environ.get("RANK", "0")) == 0
+        except Exception:
+            return True
+
+    @staticmethod
+    def _filter_mismatch_keys(
+        keys,
+        expected_exact=(),
+        expected_prefixes=(),
+        expected_regex=(),
+    ):
+        expected_exact = set(expected_exact or [])
+        prefixes = tuple(expected_prefixes or ())
+        regexes = [re.compile(p) for p in (expected_regex or ())]
+        kept = []
+        for k in keys or []:
+            if k in expected_exact:
+                continue
+            if prefixes and any(str(k).startswith(p) for p in prefixes):
+                continue
+            if regexes and any(r.match(str(k)) for r in regexes):
+                continue
+            kept.append(k)
+        return kept
+
+    def _log_state_dict_mismatch(
+        self,
+        model_name: str,
+        incompatible,
+        expected_missing_exact=(),
+        expected_missing_prefixes=(),
+        expected_missing_regex=(),
+        expected_unexpected_exact=(),
+        expected_unexpected_prefixes=(),
+        expected_unexpected_regex=(),
+    ) -> None:
+        if not isinstance(incompatible, torch.nn.modules.module._IncompatibleKeys):
+            return
+        if not self._is_main_rank():
+            return
+
+        missing = self._filter_mismatch_keys(
+            incompatible.missing_keys,
+            expected_exact=expected_missing_exact,
+            expected_prefixes=expected_missing_prefixes,
+            expected_regex=expected_missing_regex,
+        )
+        unexpected = self._filter_mismatch_keys(
+            incompatible.unexpected_keys,
+            expected_exact=expected_unexpected_exact,
+            expected_prefixes=expected_unexpected_prefixes,
+            expected_regex=expected_unexpected_regex,
+        )
+
+        if not missing and not unexpected:
+            return
+
+        # Keep logs compact in distributed training.
+        max_show = 8
+        msg = (
+            f"{model_name} weight mismatch after load_state_dict(strict=False). "
+            f"missing={len(missing)}, unexpected={len(unexpected)}"
+        )
+        if missing:
+            msg += f", missing_sample={missing[:max_show]}"
+        if unexpected:
+            msg += f", unexpected_sample={unexpected[:max_show]}"
+        warnings.warn(msg)
+
+    def _add_2d_sincos_pos_embed(self, x: torch.Tensor, h: int, w: int):
+        """x: [B, H*W, C] add 2D sine-cos position."""
+        device, dtype = x.device, x.dtype
+        c = x.shape[-1]
+        y, x_coord = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device), indexing='ij')
+        omega = torch.arange(c // 4, device=device, dtype=dtype) / (c // 4)
+        omega = 1. / (10000 ** (omega / (c // 4)))
+        y = y.reshape(-1, 1) * omega
+        x_coord = x_coord.reshape(-1, 1) * omega
+        pos = torch.cat([torch.sin(y), torch.cos(y), torch.sin(x_coord), torch.cos(x_coord)], dim=1)  # [H*W, C]
+        if pos.shape[1] < c:
+            pad = torch.zeros((pos.shape[0], c - pos.shape[1]), device=device, dtype=dtype)
+            pos = torch.cat([pos, pad], dim=1)
+        pos = pos[:, :c]
+        x = x + pos.unsqueeze(0)
+        return x
 
     def _map_dino_name(self, name: str) -> str:
         mapping = {
@@ -210,7 +761,7 @@ class DualVisionEncoder(nn.Module):
             # zero out absolute pos_embed if present (we use RoPE)
             if hasattr(self.global_encoder, 'pos_embed') and isinstance(self.global_encoder.pos_embed, torch.nn.Parameter):
                 with torch.no_grad():
-                    pe = self.global_encoder.pos_embed
+                    pe=self.global_encoder.pos_embed
                     if pe.data.shape[1] >= seq_len:
                         pe.data.zero_()
 
@@ -270,6 +821,105 @@ class DualVisionEncoder(nn.Module):
         except Exception as e:
             warnings.warn(f"Failed to enable RoPE: {e}")
 
+    def _infer_global_dim(self) -> Optional[int]:
+        for attr in ("num_features", "embed_dim", "hidden_dim"):
+            value = getattr(self.global_encoder, attr, None)
+            if isinstance(value, int) and value > 0:
+                return value
+        return None
+
+    def _infer_local_dims(self) -> Optional[list]:
+        if self.local_source == "dino":
+            feature_info = getattr(self.local_encoder, "feature_info", None)
+            if feature_info is not None and hasattr(feature_info, "channels"):
+                channels = feature_info.channels()
+                if channels:
+                    return [int(c) for c in channels[:4]]
+        local_dim = getattr(self.local_encoder, "num_features", None)
+        if isinstance(local_dim, int) and local_dim > 0:
+            return [local_dim, local_dim, local_dim, local_dim]
+        return None
+
+    def _build_alignment_modules(
+        self,
+        vit_dim: int,
+        cnn_dims: list,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        vit_dim = int(vit_dim)
+        cnn_dims = [int(c) for c in cnn_dims[:4]]
+    
+        if len(cnn_dims) < 4:
+            raise ValueError("cnn_dims must provide 4 stage dimensions")
+    
+        fused_dim = vit_dim * 4
+    
+        self.hetero_fusion = HeterogeneousFusionBlock(
+            cnn_dims=cnn_dims,
+            vit_dim=vit_dim,
+            semantic_grid_size=self.semantic_grid_size,
+            detail_grid_size=self.detail_grid_size,
+        ).to(device=device, dtype=dtype)
+    
+        self.physical_guided_align = PhysicalGuidedAlign(
+            dim=fused_dim,
+            num_heads=self.physical_align_heads,
+            max_phys_tokens=self.physical_align_max_tokens,
+            physical_in_dim=self.physical_prompt_dim,
+        ).to(device=device, dtype=dtype)
+    
+        if self.output_project_to_embedding:
+            self.final_proj = nn.Linear(
+                fused_dim,
+                self.embedding_dim,
+            ).to(device=device, dtype=dtype)
+        else:
+            self.final_proj = nn.Identity().to(device=device, dtype=dtype)
+    
+        self._fusion_vit_dim = vit_dim
+        self._fusion_cnn_dims = cnn_dims
+
+    def _ensure_alignment_modules(self, z_vit: torch.Tensor, l_feats_raw) -> None:
+        inferred_vit_dim = z_vit.shape[-1]
+        inferred_cnn_dims = [int(f.shape[1]) for f in l_feats_raw[:4]]
+        target_vit_dim = self.vit_dim_cfg or inferred_vit_dim
+        target_cnn_dims = self.cnn_dims_cfg or inferred_cnn_dims
+
+        if self.vit_dim_cfg is not None and self.vit_dim_cfg != inferred_vit_dim:
+            warnings.warn(
+                f"Configured rgb_vision.vit_dim={self.vit_dim_cfg} mismatches backbone output {inferred_vit_dim}; "
+                f"falling back to inferred dim."
+            )
+            target_vit_dim = inferred_vit_dim
+
+        if self.cnn_dims_cfg is not None and list(self.cnn_dims_cfg[:4]) != list(inferred_cnn_dims[:4]):
+            warnings.warn(
+                f"Configured rgb_vision.cnn_dims={self.cnn_dims_cfg[:4]} mismatches backbone output {inferred_cnn_dims[:4]}; "
+                f"falling back to inferred dims."
+            )
+            target_cnn_dims = inferred_cnn_dims
+
+        device = z_vit.device
+        dtype = z_vit.dtype
+        need_rebuild = self.hetero_fusion is None or self.final_proj is None or self.physical_guided_align is None
+        if not need_rebuild:
+            if self._fusion_vit_dim != target_vit_dim or self._fusion_cnn_dims != target_cnn_dims[:4]:
+                warnings.warn(
+                    f"Rebuilding fusion modules due to dim change: "
+                    f"vit {self._fusion_vit_dim}->{target_vit_dim}, "
+                    f"cnn {self._fusion_cnn_dims}->{target_cnn_dims[:4]}"
+                )
+                need_rebuild = True
+
+        if need_rebuild:
+            self._build_alignment_modules(target_vit_dim, target_cnn_dims, device=device, dtype=dtype)
+            return
+
+        self.hetero_fusion = self.hetero_fusion.to(device=device, dtype=dtype)
+        self.physical_guided_align = self.physical_guided_align.to(device=device, dtype=dtype)
+        self.final_proj = self.final_proj.to(device=device, dtype=dtype)
+
     def _ensure_fusion_proj(self, in_channels: int) -> None:
         if self.fusion_proj is None:
             self.fusion_proj = nn.Conv2d(in_channels=in_channels, out_channels=self.embedding_dim, kernel_size=1)
@@ -282,98 +932,123 @@ class DualVisionEncoder(nn.Module):
         self.local_proj = self.local_proj.to(device=local_feats.device, dtype=local_feats.dtype)
 
     def _get_global_grid(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        # Expect a ViT backbone producing tokens or feature map; try forward_features
+        def _to_grid(t: torch.Tensor):
+            if not isinstance(t, torch.Tensor):
+                return None
+            if t.dim() == 4:
+                return t
+            if t.dim() == 3:
+                b, n, c = t.shape
+                s1 = int(math.sqrt(max(n - 1, 1)))
+                if s1 * s1 == n - 1:
+                    t = t[:, 1:, :]
+                    n -= 1
+                s = int(math.sqrt(max(n, 1)))
+                if s * s == n:
+                    return t.reshape(b, s, s, c).permute(0, 3, 1, 2).contiguous()
+                return t.transpose(1, 2).unsqueeze(-1).contiguous()
+            if t.dim() == 2:
+                return t.unsqueeze(-1).unsqueeze(-1)
+            return None
+
         try:
-            feats = self.global_encoder.forward_features(pixel_values)
-            if isinstance(feats, torch.Tensor):
-                # Some timm models return [B, C, H, W]
-                if feats.dim() == 4:
-                    return feats
-                # Some return patch tokens [B, N, C]
-                if feats.dim() == 3:
-                    b, n, c = feats.shape
-                    # Try to infer grid size from input_size & patch size
-                    ps = getattr(self.global_encoder.patch_embed, 'patch_size', 16)
-                    patch = ps[0] if isinstance(ps, (tuple, list)) else int(ps)
-                    gh, gw = self.input_size[0] // patch, self.input_size[1] // patch
-                    # If a cls token exists, drop it
-                    if hasattr(self.global_encoder, 'cls_token') and n == gh * gw + 1:
-                        feats = feats[:, 1:, :]
-                        n -= 1
-                    s = int(math.sqrt(n))
-                    if s * s == n:
-                        return feats.reshape(b, s, s, c).permute(0, 3, 1, 2).contiguous()
-            if isinstance(feats, dict):
-                for k in ["x_norm_patchtokens", "x_norm", "last_hidden_state"]:
-                    if k in feats and isinstance(feats[k], torch.Tensor):
-                        t = feats[k]
-                        if t.dim() == 3:
-                            b, n, c = t.shape
-                            s = int(math.sqrt(n))
-                            if s * s == n:
-                                return t.reshape(b, s, s, c).permute(0, 3, 1, 2).contiguous()
-                        if t.dim() == 4:
-                            return t
+            enc_dtype = next(self.global_encoder.parameters()).dtype
         except Exception:
-            pass
-        # Robust fallback: manually run ViT patch embedding and blocks to obtain patch tokens
+            enc_dtype = pixel_values.dtype
+        x_in = pixel_values.to(enc_dtype) if pixel_values.dtype != enc_dtype else pixel_values
+
+        last_error = None
         try:
-            x = pixel_values
-            # Patch embed
+            feats = self.global_encoder.forward_features(x_in)
+            if isinstance(feats, dict):
+                for k in [
+                    "x_norm_patchtokens",
+                    "x_norm",
+                    "last_hidden_state",
+                    "x_prenorm",
+                    "x_cls_token",
+                    "pooled",
+                    "features",
+                ]:
+                    if k in feats:
+                        g = _to_grid(feats[k])
+                        if g is not None:
+                            return g
+                for v in feats.values():
+                    g = _to_grid(v)
+                    if g is not None:
+                        return g
+            elif isinstance(feats, (tuple, list)):
+                for v in feats:
+                    g = _to_grid(v)
+                    if g is not None:
+                        return g
+            else:
+                g = _to_grid(feats)
+                if g is not None:
+                    return g
+        except Exception as e:
+            last_error = e
+
+        try:
+            feats = self.global_encoder(x_in)
+            if isinstance(feats, dict):
+                for v in feats.values():
+                    g = _to_grid(v)
+                    if g is not None:
+                        return g
+            elif isinstance(feats, (tuple, list)):
+                for v in feats:
+                    g = _to_grid(v)
+                    if g is not None:
+                        return g
+            else:
+                g = _to_grid(feats)
+                if g is not None:
+                    return g
+        except Exception as e:
+            last_error = e
+
+        try:
+            x = x_in
             if hasattr(self.global_encoder, 'patch_embed'):
                 x = self.global_encoder.patch_embed(x)
-            # To tokens [B, N, C]
             if isinstance(x, torch.Tensor) and x.dim() == 4:
-                b, c, gh, gw = x.shape
                 x = x.flatten(2).transpose(1, 2)
-            elif isinstance(x, torch.Tensor) and x.dim() == 3:
-                b, n, c = x.shape
-                gh = int(math.sqrt(n))
-                gw = gh
-            else:
-                # fall back to model(x)
-                x = self.global_encoder(pixel_values)
-                if not (isinstance(x, torch.Tensor) and x.dim() == 3):
-                    raise RuntimeError("manual ViT token path failed")
-                b, n, c = x.shape
-                gh = int(math.sqrt(n))
-                gw = gh
-            # Prepend cls if model defines it
+            elif not (isinstance(x, torch.Tensor) and x.dim() == 3):
+                raise RuntimeError("manual ViT token path failed")
+
             added_cls = False
             if hasattr(self.global_encoder, 'cls_token') and isinstance(self.global_encoder.cls_token, torch.nn.Parameter):
                 cls = self.global_encoder.cls_token.expand(x.shape[0], -1, -1)
                 x = torch.cat((cls, x), dim=1)
                 added_cls = True
-            # Positional drop/add (pos_embed is zeroed when RoPE enabled)
             if hasattr(self.global_encoder, 'pos_embed'):
                 pe = self.global_encoder.pos_embed
-                if isinstance(pe, torch.nn.Parameter) or isinstance(pe, torch.Tensor):
-                    if pe.shape[1] == x.shape[1]:
-                        x = x + pe
+                if isinstance(pe, (torch.nn.Parameter, torch.Tensor)) and pe.shape[1] == x.shape[1]:
+                    x = x + pe
             if hasattr(self.global_encoder, 'pos_drop'):
                 x = self.global_encoder.pos_drop(x)
-            # Blocks
             if hasattr(self.global_encoder, 'blocks'):
                 for blk in self.global_encoder.blocks:
                     x = blk(x)
-            # Final norm
             norm_layer = getattr(self.global_encoder, 'norm', None)
             if norm_layer is None:
                 norm_layer = getattr(self.global_encoder, 'fc_norm', None)
             if norm_layer is not None:
                 x = norm_layer(x)
-            # Drop cls token if we added it
-            if added_cls and x.dim() == 3 and x.shape[1] == gh * gw + 1:
+            if added_cls and x.dim() == 3:
                 x = x[:, 1:, :]
-            # Reshape to grid
-            if x.dim() == 3:
-                b, n, c = x.shape
-                s = int(math.sqrt(n))
-                if s * s == n:
-                    return x.reshape(b, s, s, c).permute(0, 3, 1, 2).contiguous()
-        except Exception:
-            pass
-        raise RuntimeError("Unable to obtain grid features from DINOv3 global encoder")
+            g = _to_grid(x)
+            if g is not None:
+                return g
+        except Exception as e:
+            last_error = e
+
+        warnings.warn(
+            f"Falling back to pooled global grid because DINOv3 global extraction failed: {last_error}"
+        )
+        return x_in.mean(dim=(-2, -1), keepdim=True)
 
     def _local_forward_features(self, x: torch.Tensor) -> torch.Tensor:
         # Try known APIs to get feature maps from OpenCLIP ConvNeXt visual
@@ -439,51 +1114,101 @@ class DualVisionEncoder(nn.Module):
         else:
             feats = self.local_encoder(pixel_values)
             return feats  # timm features_only list
-
     def encode(self, x: torch.Tensor):
-        pixel_values = F.interpolate(x, size=self.input_size, mode="bilinear", align_corners=False)
-        g_grid = self._get_global_grid(pixel_values)
-        l_feats = self._get_local_pyramid(pixel_values)
-
-        self._build_local_proj(l_feats)
-        l_proj = self.local_proj(l_feats)
-
-        # Align local to global grid
-        g_h, g_w = g_grid.shape[-2], g_grid.shape[-1]
-        l_aligned = F.interpolate(l_proj, size=(g_h, g_w), mode="bilinear", align_corners=False)
-
-        fused = torch.cat([g_grid, l_aligned], dim=1)
-        self._ensure_fusion_proj(fused.shape[1])
-        # Align fusion proj to fused tensor device & dtype
-        self.fusion_proj = self.fusion_proj.to(device=fused.device, dtype=fused.dtype)
-        fused = self.fusion_proj(fused)
-        b, c, h, w = fused.shape
-        seq = fused.view(b, c, h * w).permute(0, 2, 1).contiguous()
-        return seq
-
-    def encode_with_spatial(self, x: torch.Tensor):
-        """Return both sequence tokens for language branch and spatial features for decoders."""
-        pixel_values = F.interpolate(x, size=self.input_size, mode="bilinear", align_corners=False)
-        g_grid = self._get_global_grid(pixel_values)
-        l_feats_concat = self._get_local_pyramid(pixel_values)
-        l_feats_raw = self._get_local_pyramid_raw(pixel_values)
-
-        self._build_local_proj(l_feats_concat)
-        l_proj = self.local_proj(l_feats_concat)
-
-        # Align local to global grid
-        g_h, g_w = g_grid.shape[-2], g_grid.shape[-1]
-        l_aligned = F.interpolate(l_proj, size=(g_h, g_w), mode="bilinear", align_corners=False)
-
-        fused = torch.cat([g_grid, l_aligned], dim=1)
-        self._ensure_fusion_proj(fused.shape[1])
-        self.fusion_proj = self.fusion_proj.to(device=fused.device, dtype=fused.dtype)
-        fused = self.fusion_proj(fused)
-        b, c, h, w = fused.shape
-        seq = fused.view(b, c, h * w).permute(0, 2, 1).contiguous()
-
-        return seq, fused, l_feats_raw
-
+        return self.encode_with_spatial(x)[0]
     def forward(self, x: Dict[str, torch.Tensor]):
         pixel_values = x["rgb"]
         return self.encode(pixel_values)
+
+    def encode_with_spatial(
+        self,
+        x: torch.Tensor,
+        physical_prompt_embs: Optional[torch.Tensor] = None,
+    ):
+        # Ascend NPU: bilinear upsample does not support bfloat16.
+        if x.device.type == "npu" and x.dtype == torch.bfloat16:
+            x = x.to(torch.float16)
+        pixel_values = F.interpolate(x, size=self.input_size, mode="bilinear", align_corners=False)
+
+        global_values = pixel_values
+        local_values = pixel_values
+        try:
+            g_dtype = next(self.global_encoder.parameters()).dtype
+            if global_values.dtype != g_dtype:
+                global_values = global_values.to(g_dtype)
+        except Exception:
+            pass
+        try:
+            l_dtype = next(self.local_encoder.parameters()).dtype
+            if local_values.dtype != l_dtype:
+                local_values = local_values.to(l_dtype)
+        except Exception:
+            pass
+
+        g_grid = self._get_global_grid(global_values)  # [B, C, H, W]
+
+        # 强制 ViT 语义分支为 14×14，因此 z_vit 是 196 个 token
+        if self.semantic_grid_size is not None:
+            g_grid = F.interpolate(
+                g_grid,
+                size=self.semantic_grid_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        
+        z_vit = g_grid.flatten(2).transpose(1, 2).contiguous()  # [B, 196, C_vit]
+
+        try:
+            l_feats_raw = self._get_local_pyramid_raw(local_values)
+        except Exception:
+            l_feats_raw = self._get_local_pyramid_raw(local_values.to(torch.float16))
+        l_feats_raw = [
+            f.to(dtype=z_vit.dtype) if torch.is_tensor(f) and f.dtype != z_vit.dtype else f
+            for f in l_feats_raw
+        ]
+        if len(l_feats_raw) == 3:
+            l_feats_raw = list(l_feats_raw) + [F.avg_pool2d(l_feats_raw[-1], kernel_size=2, stride=2)]
+
+        self._ensure_alignment_modules(z_vit, l_feats_raw)
+
+        # 新版 HeterogeneousFusionBlock 内部完成：
+        # 1. Stage1 / Stage3 / Stage4 的 Cross-Attention
+        # 2. ViT + Stage1 + Stage3 + Stage4 的特征维拼接
+        # 3. Stage2 的 28×28 高分辨率 token 保留
+        # 4. 语义 token 与高分辨率 token 的序列维拼接
+        fused = self.hetero_fusion(
+            vit_tokens=z_vit,
+            cnn_feats=tuple(l_feats_raw[:4]),
+        )
+        
+        # fused: [B, 980, 3072]，当 C_vit=768
+        fused = self.physical_guided_align(fused, physical_prompt_embs)
+        
+        # 若 output_project_to_embedding=False:
+        # seq: [B, 980, 3072]
+        #
+        # 若 output_project_to_embedding=True:
+        # seq: [B, 980, 768]
+        seq = self.final_proj(fused)
+        
+        return seq, g_grid, tuple(l_feats_raw[:4])
+    def get_alignment_stats(self) -> Dict[str, torch.Tensor]:
+        stats = {}
+    
+        if self.hetero_fusion is not None and hasattr(self.hetero_fusion, "_last_fusion_weights"):
+            w = self.hetero_fusion._last_fusion_weights
+            if w is not None:
+                for i, v in enumerate(w):
+                    stats[f"fusion_scale_{i}_weight"] = v
+    
+        if self.hetero_fusion is not None and hasattr(self.hetero_fusion, "_last_token_info"):
+            for k, v in self.hetero_fusion._last_token_info.items():
+                stats[f"fusion_{k}"] = torch.tensor(v)
+    
+        if self.physical_guided_align is not None and hasattr(self.physical_guided_align, "_last_stats"):
+            stats.update(self.physical_guided_align._last_stats)
+    
+        return stats
+
+
+
