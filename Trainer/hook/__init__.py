@@ -1,4 +1,4 @@
-from .checkpoint_hook import EpochCheckpointerHook, IterCheckpointerHook
+from .checkpoint_hook import CheckpointerHook, EpochCheckpointerHook, IterCheckpointerHook
 from .CleanEmbedGradHook import CleanEmbedGradHook
 from .deepspeed_hook import DeepSpeedHook
 from .dino_loss_warmup_hook import DINOLossWarmUp

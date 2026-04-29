@@ -284,7 +284,7 @@ def main():
         work_dir=config.output,            # 输出目录
         log_period=1,                      # 日志记录频率（每多少个迭代记录一次）
         save_ckpt_by="iter",               # 模型保存频率单位（按迭代次数）
-        ckpt_period=250,                   # 模型保存频率（每多少个迭代保存一次）
+        ckpt_period=20,                   # 模型保存频率（每多少个迭代保存一次）
         
         
         accelerator=config.accelerator,    # 训练加速器类型（如NPU）

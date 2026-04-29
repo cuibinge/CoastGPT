@@ -13,8 +13,6 @@ import sys
 from pathlib import Path
 import logging
 import os
-import re
-
 import ml_collections.config_dict
 import numpy as np
 import torch
@@ -22,7 +20,7 @@ import torch.backends.cudnn as cudnn  # CUDA优化
 import torch.distributed as dist  # 分布式训练支持
 import wandb  # 实验跟踪工具
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -35,11 +33,10 @@ from Trainer.utils.distribute import (
     is_main_process,
 )
 from Dataset import DataCollatorForVGSupervisedDataset, VGEvalDataset  # 视觉定位数据集和数据处理
-from Dataset.conversation import default_conversation  # 默认对话模板
+from Dataset.build_transform import build_vlp_transform
 from Models.coastgpt import CoastGPT  # 主要模型
 
 from tqdm import tqdm  # 进度条显示
-from transformers import CLIPImageProcessor  # 图像预处理
 
 # 数据类型映射
 type_dict = {
@@ -175,8 +172,8 @@ def main(config: ml_collections.ConfigDict):
     dtype = type_dict[config.dtype]
     model.to(dtype)
 
-    # 加载CLIP图像处理器用于图像预处理
-    vis_transform = CLIPImageProcessor.from_pretrained("/root/autodl-tmp/clip-vit-large-patch14")
+    # 按当前配置构建视觉预处理，避免硬编码外部路径
+    vis_transform = build_vlp_transform(config, is_train=False)
 
     # 创建视觉定位评估数据集
     dataset = VGEvalDataset(
@@ -206,7 +203,8 @@ def main(config: ml_collections.ConfigDict):
         else:
             # 标准加载方法
             ckpt = torch.load(config.model_path, map_location="cpu")
-            msg = model.load_state_dict(ckpt["model"], strict=False)
+            state_dict = ckpt["model"] if "model" in ckpt else ckpt
+            msg = model.load_state_dict(state_dict, strict=False)
         if msg is not None:
             logger.info(f"After loading, missing keys: {msg.missing_keys}, unexpected keys: {msg.unexpected_keys}")
             logger.info(str(model))
@@ -216,9 +214,9 @@ def main(config: ml_collections.ConfigDict):
         if config.is_distribute:
             device = torch.device(getattr(config, "local_rank", 0))
         elif (
-                "CUDA_VISABLE_DEVICES" in os.environ.keys() and len(os.environ["CUDA_VISABLE_DEVICES"].split(",")) == 1
+                "CUDA_VISIBLE_DEVICES" in os.environ.keys() and len(os.environ["CUDA_VISIBLE_DEVICES"].split(",")) == 1
         ):
-            device = torch.device("cuda:" + os.environ["CUDA_VISABLE_DEVICES"])
+            device = torch.device("cuda:" + os.environ["CUDA_VISIBLE_DEVICES"])
         else:
             device = torch.device("cuda")
     else:
@@ -233,7 +231,7 @@ def main(config: ml_collections.ConfigDict):
                 data_loader, unit_scale=config.batch_size, desc="Evaluating"
         ):
             # 将数据移动到相应设备
-            image = image.to(device)
+            image = image.to(dtype).to(device)
             input_ids = input_ids.to(device)
             attention_mask = attention_mask.to(device)
 
