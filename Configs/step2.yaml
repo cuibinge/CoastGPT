@@ -112,3 +112,33 @@ language:
   embedding_dim: 4096
 vit_name: openai/clip-vit-large-patch14
 tune_multimodal: True
+
+# Aquaculture segmentation (MOE) configuration
+aquaculture_seg:
+  enabled: false           # Stage 2 默认关闭；需要时改为 true
+  num_classes: 2           # 类别数：如 [背景, 养殖区]
+  loss_weight: 1.0         # 分割总体损失的权重
+  ce_weight: 1.0           # 交叉熵损失权重
+  dice_weight: 1.0         # Dice 损失权重
+  ignore_index: 255        # 标注中忽略标签的索引值
+  include_context_expert: true  # 启用 ASPP/SPP 上下文专家
+  log_gate_stats: true     # 记录门控权重统计（mean、Top-1 占比）
+  # 适配器配置（安全默认值：整体关闭）
+  adapters:
+    enable: false
+    spectral:
+      enable: false
+      target_dim: 16
+    texture:
+      enable: false
+      target_dim: 8
+      depth: 2
+    spp:
+      enable: false
+      project_dim: 64
+      levels: [1, 2, 4]
+    modality_gate:
+      enable: false
+      optical_weight: 0.7
+      sar_weight: 0.3
+      cloudy_boost: 0.3
