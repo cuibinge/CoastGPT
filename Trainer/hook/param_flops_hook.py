@@ -4,6 +4,7 @@ import torch
 from thop import clever_format, profile
 
 from .logger_hook import HookBase
+import torch_npu
 
 logger = logging.getLogger("train")
 

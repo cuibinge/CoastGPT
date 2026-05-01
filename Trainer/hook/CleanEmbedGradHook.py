@@ -2,6 +2,7 @@ import torch
 
 from .hookbase import HookBase
 
+import torch_npu
 
 class CleanEmbedGradHook(HookBase):
     def __init__(self, save_embed_id):

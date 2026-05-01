@@ -1,5 +1,3 @@
-
-#源于LHRS
 import logging
 import os
 import os.path as osp
@@ -17,6 +15,7 @@ from torch.nn.parallel import DataParallel, DistributedDataParallel
 from torch.utils.data import DataLoader
 
 from .hook import (
+    CheckpointerHook,
     DeepSpeedHook,
     EpochCheckpointerHook,
     Fp16OptimizerHook,
@@ -35,6 +34,7 @@ from .utils import (
     is_main_process,
     symlink,
 )
+import torch_npu
 
 logger = logging.getLogger("train")
 
@@ -111,9 +111,11 @@ class Trainer:
         elif accelerator == "mps":
             self.device = torch.device("mps")
             self.autocast_type = "cpu"
+        elif accelerator == "npu":
+            self.device = torch.device("npu")
+            self.autocast_type = "npu"
         else:
             raise NotImplementedError
-
         self._hooks: List[HookBase] = []
         self._data_iter = iter(data_loader)
         self._max_num_checkpoints = max_num_checkpoints
@@ -122,6 +124,17 @@ class Trainer:
         self._enable_amp = enable_amp
         self._cumulative_iters = cumulative_iters
         self._is_distributed = is_distributed
+        self._debug_phase_timing = os.environ.get("COASTGPT_DEBUG_PHASE_TIMING", "0").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        try:
+            self._debug_phase_iters = int(os.environ.get("COASTGPT_DEBUG_PHASE_ITERS", "20"))
+        except Exception:
+            self._debug_phase_iters = 20
+        self._last_phase_timing: Dict[str, float] = {}
 
     @property
     def registered_hook_names(self) -> List[str]:
@@ -249,10 +262,35 @@ class Trainer:
         for h in hooks:
             assert isinstance(h, HookBase)
             h.trainer = weakref.proxy(self)
-            if self._hooks and isinstance(self._hooks[-1], LoggerHook):
-                self._hooks.insert(len(self._hooks) - 1, h)
+            self._hooks.append(h)
+        self._reorder_hooks()
+
+    def _reorder_hooks(self) -> None:
+        """
+        Keep hook execution order sane:
+        1. optimizer/deepspeed and scheduler hooks first
+        2. logging hooks after state updates
+        3. checkpoint hooks last
+
+        This matters because checkpoint saving must happen after DeepSpeed
+        backward/step has finished on every rank.
+        """
+        if not self._hooks:
+            return
+
+        normal_hooks: List[HookBase] = []
+        logger_hooks: List[HookBase] = []
+        checkpoint_hooks: List[HookBase] = []
+
+        for hook in self._hooks:
+            if isinstance(hook, CheckpointerHook):
+                checkpoint_hooks.append(hook)
+            elif isinstance(hook, LoggerHook):
+                logger_hooks.append(hook)
             else:
-                self._hooks.append(h)
+                normal_hooks.append(hook)
+
+        self._hooks = normal_hooks + logger_hooks + checkpoint_hooks
 
     def build_ckpt_hook(self):
         if self.save_ckpt_by == "epoch":
@@ -296,10 +334,38 @@ class Trainer:
         logger.info(f"Saving checkpoint to {file_path}")
 
         if self.deepspeed:
-            self.model.save_checkpoint(self.ckpt_dir, file_name, client_state=data)
-            if isinstance(self.model.language.text_encoder, PeftModel):
-                text_path = os.path.join(self.ckpt_dir, "TextLoRA")
-                self.model.language.text_encoder.save_pretrained(text_path)
+            try:
+                import torch_npu
+                torch_npu.npu.synchronize()
+            except Exception:
+                pass
+            from .utils import is_main_process
+            import torch.distributed as dist
+
+            try:
+                # DeepSpeed checkpoint save is a distributed operation.
+                # Every rank must enter this call together; gating it to rank 0
+                # causes HCCL collective mismatches and save-time deadlocks.
+                self.model.save_checkpoint(self.ckpt_dir, file_name, client_state=data)
+            except Exception as e:
+                logger.error(
+                    "[Torch] DeepSpeed save_checkpoint failed on rank %s: %s",
+                    get_rank(),
+                    e,
+                )
+                raise
+
+            # Save LoRA adapters once after the distributed checkpoint write finishes.
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            if is_main_process():
+                base_model = self.model.module if hasattr(self.model, "module") else self.model
+                language_module = getattr(base_model, "language", getattr(base_model, "text", None))
+                if language_module is not None and isinstance(language_module.text_encoder, PeftModel):
+                    text_path = os.path.join(self.ckpt_dir, "TextLoRA")
+                    language_module.text_encoder.save_pretrained(text_path)
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
         else:
             torch.save(data, file_path)
 
@@ -318,7 +384,34 @@ class Trainer:
         assert (checkpoint is not None) ^ (path != "")
 
         if self.deepspeed:
-            _, checkpoint = self.model.load_checkpoint(path)
+            # DeepSpeed tag-based resume (directory path)
+            if path and os.path.isdir(path):
+                _, checkpoint = self.model.load_checkpoint(path)
+            else:
+                # Fallback resume from locally saved file (torch.save)
+                if path:
+                    logger.info(f"Loading fallback checkpoint from {path} ...")
+                    checkpoint = torch.load(path, map_location="cpu")
+                else:
+                    checkpoint = None
+                if checkpoint is None:
+                    return
+                # Load model weights into the underlying module
+                base_model = self.model.module if hasattr(self.model, "module") else self.model
+                if hasattr(base_model, "custom_load_state_dict"):
+                    incompatible = base_model.custom_load_state_dict(path, strict=False)
+                else:
+                    incompatible = base_model.load_state_dict(checkpoint["model"], strict=False)
+                if incompatible is not None and getattr(incompatible, "missing_keys", []):
+                    logger.warning(
+                        "Encounter missing keys when loading model weights (DS fallback):\n"
+                        f"{incompatible.missing_keys}"
+                    )
+                if incompatible is not None and getattr(incompatible, "unexpected_keys", []):
+                    logger.warning(
+                        "Encounter unexpected keys when loading model weights (DS fallback):\n"
+                        f"{incompatible.unexpected_keys}"
+                    )
         else:
             if path:
                 logger.info(f"Loading checkpoint from {path} ...")
@@ -451,15 +544,27 @@ class Trainer:
         start = time.perf_counter()
         batch = next(self._data_iter)
         data_time = time.perf_counter() - start
+        to_device_time = 0.0
+        forward_time = 0.0
 
         #####################
         # 2. Calculate loss #
         #####################
+        move_start = time.perf_counter()
+        batch = self.put_input_to_device(batch)
+        to_device_time = time.perf_counter() - move_start
         with torch.autocast(
             device_type=self.autocast_type, enabled=self._enable_amp, dtype=self.dtype
         ):
-            batch = self.put_input_to_device(batch)
+            forward_start = time.perf_counter()
             self.loss_dict = self.model(batch)
+            forward_time = time.perf_counter() - forward_start
+
+        self._last_phase_timing = {
+            "fetch_batch_time": data_time,
+            "to_device_time": to_device_time,
+            "forward_time": forward_time,
+        }
 
         if isinstance(self.loss_dict, torch.Tensor):
             self.loss_dict = {"total_loss": self.loss_dict}
@@ -473,6 +578,14 @@ class Trainer:
             time.perf_counter() - iter_start_time,
             lr_this_iter,
         )
+        if self._debug_phase_timing and self.cur_iter < self._debug_phase_iters:
+            logger.info(
+                "[phase][iter %s] fetch_batch=%.4fs to_device=%.4fs forward=%.4fs",
+                self.cur_iter,
+                data_time,
+                to_device_time,
+                forward_time,
+            )
 
     def train(self, load_checkpoint: str = None) -> None:
         """
@@ -491,14 +604,18 @@ class Trainer:
         self._call_hooks("after_train")
 
     def put_input_to_device(self, modal_input: Union[torch.Tensor, List, Dict, Tuple]):
+        if modal_input is None:
+            return None
         if isinstance(modal_input, tuple):
-            modal_input = tuple([item.to(device=self.device) for item in modal_input])
-        elif isinstance(modal_input, Dict):
-            modal_input = {
-                key: item.to(device=self.device) for key, item in modal_input.items()
+            return tuple(self.put_input_to_device(item) for item in modal_input)
+        if isinstance(modal_input, list):
+            return [self.put_input_to_device(item) for item in modal_input]
+        if isinstance(modal_input, Dict):
+            return {
+                key: self.put_input_to_device(item) for key, item in modal_input.items()
             }
-        else:
-            modal_input = modal_input.to(self.device)
+        if hasattr(modal_input, "to"):
+            return modal_input.to(device=self.device)
         return modal_input
 
     def sub_classes_train(self):

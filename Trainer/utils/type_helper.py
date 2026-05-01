@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torchvision
 from PIL import Image
+import torch_npu
 
 
 def to_numpy(data, ToCHW=True):

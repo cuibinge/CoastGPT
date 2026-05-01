@@ -9,6 +9,7 @@ from PIL import Image
 from torch.utils.data import ConcatDataset, Dataset
 
 from .transform import *
+import torch_npu
 
 
 # 定义基础数据集类，继承自 torch.utils.data.Dataset

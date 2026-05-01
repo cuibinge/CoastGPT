@@ -5,7 +5,7 @@ import logging
 import ml_collections
 import torch.nn as nn
 from timm.optim.optim_factory import create_optimizer_v2
-
+import torch_npu
 # 创建一个名为 'train' 的日志记录器
 logger = logging.getLogger("train")
 

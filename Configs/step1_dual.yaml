@@ -43,6 +43,7 @@ rgb_vision:
   # required: path to DINOv3 ViT-L/16 checkpoint (.pth/.pt)
   global_ckpt_path: './dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth'
   input_size: [224, 224]
+  output_project_to_embedding: true
   # Physical prompt embedding dim (LLaMA2-7B token embedding is 4096)
   physical_prompt_dim: 4096
   patch_dropout: 0.

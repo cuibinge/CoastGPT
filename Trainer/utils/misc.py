@@ -11,6 +11,7 @@ import torch
 from tabulate import tabulate
 
 logger = logging.getLogger("train")
+import torch_npu
 
 
 def auto_resume_helper(output_dir):
@@ -63,15 +64,15 @@ def collect_env() -> str:
     env_info.append(("Python", sys.version.replace("\n", "")))
     env_info.append(("Numpy", np.__version__))
 
-    cuda_available = torch.cuda.is_available()
-    env_info.append(("CUDA available", cuda_available))
+    #     cuda_available = torch.cuda.is_available()
+    #     env_info.append(("CUDA available", cuda_available))
 
-    if cuda_available:
-        devices = defaultdict(list)
-        for k in range(torch.cuda.device_count()):
-            devices[torch.cuda.get_device_name(k)].append(str(k))
-        for name, device_ids in devices.items():
-            env_info.append(("GPU " + ",".join(device_ids), name))
+    #     if cuda_available:
+    #         devices = defaultdict(list)
+    #         for k in range(torch.cuda.device_count()):
+    #             devices[torch.cuda.get_device_name(k)].append(str(k))
+    #         for name, device_ids in devices.items():
+    #             env_info.append(("GPU " + ",".join(device_ids), name))
 
     env_info.append(("PyTorch", torch.__version__))
 

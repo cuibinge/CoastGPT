@@ -14,12 +14,11 @@ from typing import Dict, List
 import ml_collections.config_dict
 import numpy as np
 import torch
-import wandb
 import torch.backends.cudnn as cudnn  # CUDA优化
 import torch.distributed as dist  # 分布式训练支持
 import wandb  # 实验跟踪工具
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -27,25 +26,16 @@ from Trainer import init_distributed
 from Trainer.utils import ConfigArgumentParser, setup_logger, str2bool
 from Dataset.build_loader import build_zero_shot_loader
 from Dataset.conversation import default_conversation
-# 从自定义数据加载器构建函数导入
-from Dataset.build_loader import build_zero_shot_loader
-# 从对话模板导入默认对话设置
-from Dataset.conversation import default_conversation
-# 导入CoastGPT模型
 from Models.coastgpt import CoastGPT
 from Models import (
     DEFAULT_IM_END_TOKEN,
     DEFAULT_IM_START_TOKEN,
     DEFAULT_IMAGE_TOKEN,
     IMAGE_TOKEN_INDEX,
-    # build_model,
     tokenizer_image_token,
 )
-# 图像处理器
-from transformers import CLIPImageProcessor
-# 评估指标
 from sklearn.metrics import balanced_accuracy_score, classification_report
-from tqdm import tqdm  # 进度条
+from tqdm import tqdm
 
 # 数据类型映射
 type_dict = {
@@ -197,7 +187,8 @@ def main(config: ml_collections.ConfigDict):
         else:
             # 标准加载方法
             ckpt = torch.load(config.model_path, map_location="cpu")
-            msg = model.load_state_dict(ckpt["model"], strict=False)
+            state_dict = ckpt["model"] if "model" in ckpt else ckpt
+            msg = model.load_state_dict(state_dict, strict=False)
         if msg is not None:
             logger.info(f"After loading, missing keys: {msg.missing_keys}, unexpected keys: {msg.unexpected_keys}")
             logger.info(str(model))
@@ -207,9 +198,9 @@ def main(config: ml_collections.ConfigDict):
         if config.is_distribute:
             device = torch.device(getattr(config, "local_rank", 0))
         elif (
-                "CUDA_VISABLE_DEVICE" in os.environ.keys() and len(os.environ["CUDA_VISABLE_DEVICES"].split(",")) == 1
+                "CUDA_VISIBLE_DEVICES" in os.environ.keys() and len(os.environ["CUDA_VISIBLE_DEVICES"].split(",")) == 1
         ):
-            device = torch.device("cuda:" + os.environ["CUDA_VISABLE_DEVICES"])
+            device = torch.device("cuda:" + os.environ["CUDA_VISIBLE_DEVICES"])
         else:
             device = torch.device("cuda")
     else:

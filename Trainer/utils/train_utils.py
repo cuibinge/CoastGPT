@@ -3,7 +3,7 @@ from typing import Sequence
 
 import torch
 import torch.nn as nn
-
+import torch_npu
 
 def accuracy_at_k(
     outputs: torch.Tensor, targets: torch.Tensor, top_k: Sequence[int] = (1, 5)

@@ -25,6 +25,8 @@ from io import BytesIO
 from transformers import TextStreamer
 import math
 import cv2
+import torch_npu
+
 
 
 # 定义一个函数，用于按比例缩放边界框
