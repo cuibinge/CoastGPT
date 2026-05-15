@@ -97,6 +97,9 @@ CoastGPT/
 ```
 
 ---
+## Model Download
+
+Pretrained models are available on Hugging Face: [cuibinge/CoastGPT](https://huggingface.co/cuibinge/CoastGPT)
 
 ## Preparation
 
