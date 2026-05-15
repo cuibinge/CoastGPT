@@ -2,6 +2,10 @@
 
 CoastGPT is a multimodal remote-sensing project for coastal intelligence tasks, including captioning, VQA, visual grounding, and classification.
 
+## Model Download
+
+Pretrained models are available on Hugging Face: [cuibinge/CoastGPT](https://huggingface.co/cuibinge/CoastGPT)
+
 ## Quick Start
 
 ### 1) Environment setup
@@ -18,11 +22,7 @@ Note: the correct install command is `pip install -r requirement.txt`.
 
 ### 2) Optional smoke test
 
-```bash
-python Tools/smoke_test_semantic_routing.py
-```
-
-If you see `SMOKE_TEST_PASS`, core data-collation and semantic-routing modules are functioning.
+The legacy segmentation-routing smoke test has been removed. Use the Stage-3 dataset builder and training entrypoint below as the supported path.
 
 ### 3) Stage-1 training (alignment)
 
@@ -60,16 +60,86 @@ Training checkpoints are saved to:
 - `<OUTPUT_DIR>/checkpoints/`
 - final file: `<OUTPUT_DIR>/checkpoints/FINAL.pt`
 
-### 5) Quick inference after training
+### 5) Stage-3 training (GF2 -> GeoJSON -> ArcGIS)
+
+Stage-3 now targets direct `GeoJSON FeatureCollection` generation for end-to-end localization and ArcGIS editing. This path removes the segmentation branch and coordinate-bin Geo-Tokens. Use the `[DET]` tag in prompts to request GeoJSON feature extraction.
 
 ```bash
-python Inference.py -c Configs/step2_dual.yaml \
+deepspeed --num_nodes=1 --num_gpus=8 train_stage_three.py \
+  -c Configs/step3_dual.yaml \
   --model-path <STAGE2_OUTPUT_DIR>/checkpoints/FINAL.pt \
+  --output <STAGE3_OUTPUT_DIR> \
+  --batch-size 4 \
+  --workers 2 \
+  --raw-data-root GF2 \
+  --gf2-sizes 512 \
+  --gf2-image-subdir Image_FalseColor \
+  --auto-build-geojson-data True \
+  --geojson-output-root GF2/stage3_geojson_512_falsecolor \
+  --geojson-priority True \
+  --accelerator npu \
+  --enable-amp True \
+  --use-checkpoint
+```
+
+If you only want to rebuild the GF2 Stage-3 dataset first:
+
+```bash
+python Tools/build_gf2_geojson_dataset.py \
+  --gf2-root GF2 \
+  --sizes 512 \
+  --image-subdir Image_FalseColor \
+  --compact-answer
+```
+
+### 6) Quick inference after training
+
+```bash
+python Inference.py -c Configs/step3_dual.yaml \
+  --model-path <STAGE3_OUTPUT_DIR>/checkpoints/FINAL.pt \
   --image-file Images/test.png \
   --accelerator gpu
 ```
 
-### 6) Evaluation examples
+Use a prompt such as:
+
+```text
+[DET] Generate an editable GeoJSON FeatureCollection for ArcGIS from this image patch. Return JSON only.
+```
+
+If you want to normalize model output into an ArcGIS-ready file:
+
+```bash
+python Tools/geojson_to_arcgis.py --input output.txt --output output/result.geojson
+```
+
+For Stage-3 batch inference + automatic `predictions.jsonl` export + evaluation:
+
+```bash
+python Tools/run_geojson_batch_eval.py -c Configs/step3_dual.yaml \
+  --model-path <STAGE3_OUTPUT_DIR>/checkpoints/FINAL.pt \
+  --dataset-json <STAGE3_DATA_ROOT>/GF2_geojson_val.json \
+  --output-dir output/geojson_eval \
+  --accelerator gpu \
+  --max-new-tokens 2048
+```
+
+This command writes:
+
+- `output/geojson_eval/predictions.jsonl`
+- `output/geojson_eval/eval_summary.json`
+- `output/geojson_eval/normalized_geojson/` for ArcGIS-ready predictions that parsed successfully
+
+If you already have `predictions.jsonl` and only want to re-run evaluation:
+
+```bash
+python Tools/run_geojson_batch_eval.py \
+  --dataset-json <STAGE3_DATA_ROOT>/GF2_geojson_val.json \
+  --output-dir output/geojson_eval \
+  --skip-inference True
+```
+
+### 7) Evaluation examples
 
 Classification:
 
