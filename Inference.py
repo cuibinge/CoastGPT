@@ -3,6 +3,7 @@ import os
 import re as _re
 from io import BytesIO
 from typing import Optional, Tuple
+from pathlib import Path
 
 import ml_collections
 import requests
@@ -401,7 +402,6 @@ def _postprocess_geojson(text: str) -> str:
                         pass
         return stripped
 
-CONTINUE_MARKER = " <CONTINUE>"
 MAX_MULTITURN_ROUNDS = 20
 
 
@@ -422,7 +422,6 @@ def _merge_feature_collections(json_strings):
 
     Concatenates all features arrays. Preserves CRS from first collection if present.
     """
-    import json as _json
     all_features = []
     crs = None
     for js in json_strings:
@@ -449,7 +448,6 @@ def _inverse_transform_coordinates(geojson_str, tile_transform):
         pixel_width, pixel_height: resolution per pixel
         image_size: [width, height] in pixels
     """
-    import json as _json
     x_min = float(tile_transform["x_min"])
     y_max = float(tile_transform["y_max"])
     pixel_w = float(tile_transform["pixel_width"])
@@ -490,8 +488,6 @@ def _inverse_transform_coordinates(geojson_str, tile_transform):
 
 def _load_coord_transform(transform_path, image_key):
     """Load tile transform for a specific image from coord_transform_train.json."""
-    import json as _json
-    from pathlib import Path
     path = Path(transform_path)
     if not path.exists():
         return None
@@ -952,10 +948,14 @@ def main(config: ml_collections.ConfigDict):
         ):
             merged_geojson = _merge_feature_collections(all_geojson_parts)
             print(f"\n[Inference] Merged {len(all_geojson_parts)} parts -> {len(merged_geojson)} chars")
+        elif len(all_geojson_parts) == 1:
+            merged_geojson = all_geojson_parts[0]
+        else:
+            merged_geojson = None
 
+        if merged_geojson is not None:
             coord_transform_path = getattr(config, "coord_transform_path", None)
             if coord_transform_path and config.image_file:
-                from pathlib import Path
                 img_name = Path(config.image_file).name
                 tile_transform = _load_coord_transform(
                     coord_transform_path, img_name
@@ -978,9 +978,8 @@ def main(config: ml_collections.ConfigDict):
                 if len(merged_geojson) > 500:
                     print(f"... ({len(merged_geojson)} chars total)")
         else:
-            # Non-geojson or single-turn: outputs already has the final value
+            # Non-geojson: outputs already has the final value
             conv.messages[-1][-1] = outputs
-
         # Optionally save predictions.json compatible with Tools.decode_loc_geojson
         if getattr(config, "save_predictions", None):
             import json as __json
