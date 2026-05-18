@@ -191,13 +191,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--multiturn",
         action="store_true",
-        help="启用多轮对话模式，非最后一轮末尾追加 <CONTINUE> 标记",
+        help="Enable multi-turn conversation mode, append <CONTINUE> marker to non-final answers",
     )
     parser.add_argument(
         "--max-chars-per-turn",
         type=int,
         default=3000,
-        help="多轮模式下每轮答案最大字符数",
+        help="Maximum characters per turn in multi-turn mode",
     )
     return parser.parse_args()
 
@@ -725,16 +725,15 @@ def build_conversations(
 
 
 def build_multiturn_conversations(
-    sub_collections,
-    target_name,
-    first_prompt,
-    compact_answer=True,
-):
-    """将拆分的子 FeatureCollection 列表构建为多轮对话。
+    sub_collections: List[Dict],
+    first_prompt: str,
+    compact_answer: bool = True,
+) -> List[Dict[str, str]]:
+    """Build multi-turn conversations from split sub FeatureCollections.
 
-    第一轮：完整任务 prompt + 第一组 features
-    后续轮次：简短延续 prompt + 对应 features
-    非最后一轮答案末尾追加 CONTINUE_MARKER。
+    First turn: full task prompt + first set of features
+    Subsequent turns: short continuation prompt + corresponding features
+    Non-final turns append CONTINUE_MARKER to the answer.
     """
     convs = []
     for i, sub in enumerate(sub_collections):
@@ -791,7 +790,7 @@ def build_dataset(
     merge_by_properties: bool = True,
     split_by_answer_budget: bool = True,
     prompt_variants: int = 1,
-    multiturn: bool = True,
+    multiturn: bool = False,
     max_chars_per_turn: int = 3000,
     normalize_coords: bool = False,
     quantize_coords: int = 0,
@@ -891,18 +890,29 @@ def build_dataset(
 
                 base_sample_id = f"{sensor_name}_{image_path.stem}"
                 if multiturn and len(sub_collections) > 1:
-                    # 多轮：一个样本，多个对话轮次
+                    # Encode coordinates for multi-turn output
+                    encoded_subs = []
+                    for sc in sub_collections:
+                        if tile_transform is not None:
+                            encoded_sub = encode_feature_collection(
+                                sc,
+                                transform=tile_transform,
+                                quantize_bins=int(quantize_coords) if quantize_coords > 0 else None,
+                            )
+                        else:
+                            encoded_sub = sc
+                        encoded_subs.append(encoded_sub)
+
                     target_name = infer_target_name(feature_collection)
                     convs = build_multiturn_conversations(
-                        sub_collections=sub_collections,
-                        target_name=target_name,
+                        sub_collections=encoded_subs,
                         first_prompt=DEFAULT_PROMPTS[0].replace(
                             "target features", f"{target_name} features"
                         ),
-                        compact_answer=True,
+                        compact_answer=compact_answer,
                     )
                     answer_chars = max(
-                        len(dumps_feature_collection(sc, compact=True)) for sc in sub_collections
+                        len(dumps_feature_collection(sc, compact=True)) for sc in encoded_subs
                     )
                     coord_encoding = (
                         "loc_tokens"
@@ -932,7 +942,7 @@ def build_dataset(
                     samples.append(sample_record)
                     compressed_char_lengths.append(answer_chars)
                 else:
-                    # 单轮：保留原有逻辑，每个 sub_collection 独立样本
+                    # Single-turn: keep original logic, each sub_collection is an independent sample
                     for part_idx, sub_collection in enumerate(sub_collections, start=1):
                         answer_collection = sub_collection
                         if tile_transform is not None:
@@ -999,7 +1009,7 @@ def build_dataset(
                                     sample_record["quantize_bins"] = int(quantize_coords)
                             samples.append(sample_record)
 
-    # 保存坐标变换参数，供推理时坐标反算使用
+    # Save coordinate transform parameters for inference coordinate de-normalization
     coord_transforms = {}
     for sample in samples:
         if "tile_transform" in sample:
