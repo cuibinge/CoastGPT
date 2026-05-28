@@ -24,8 +24,8 @@ def polygon_to_bbox(polygon: List[Tuple[float, float]]) -> Optional[List[int]]:
         return None
     xs = [p[0] for p in polygon]
     ys = [p[1] for p in polygon]
-    x1, x2 = int(np.floor(min(xs))), int(np.ceil(max(xs))) + 1
-    y1, y2 = int(np.floor(min(ys))), int(np.ceil(max(ys))) + 1
+    x1, x2 = int(np.floor(min(xs))), int(np.ceil(max(xs)))
+    y1, y2 = int(np.floor(min(ys))), int(np.ceil(max(ys)))
     return [x1, y1, x2, y2]
 
 
