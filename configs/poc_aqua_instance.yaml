@@ -36,7 +36,7 @@ model:
       num_layers: 6
 
   # Checkpoint to load vision weights from
-  vision_checkpoint: ./FINAL.pt
+  vision_checkpoint: ./output/stage2/checkpoints/iter_2879_consolidated.pt
 
   fpn:
     in_channels: [128, 256, 512, 1024]

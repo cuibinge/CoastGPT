@@ -27,6 +27,8 @@ def parse_args():
     p.add_argument("--size", default="256", help="Tile size to include (Size_256)")
     p.add_argument("--max-samples", type=int, default=0, help="0 = use all")
     p.add_argument("--split", type=float, default=0.8, help="Train/val split ratio")
+    p.add_argument("--split-mode", default="group", choices=["group", "random"],
+                   help="group=split by source image, random=split by tile")
     p.add_argument("--output", default=None, help="Output directory for manifest JSONs")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -269,6 +271,22 @@ def split_train_val(samples: List[Dict], split: float, seed: int):
     return train, val, bad
 
 
+def split_train_val_random(samples: List[Dict], split: float, seed: int):
+    """Split randomly by tile, ignoring split_group."""
+    import random
+    rng = random.Random(seed)
+
+    good = [s for s in samples if not s.get("bad_reason")]
+    rng.shuffle(good)
+
+    n_train = max(1, int(len(good) * split))
+    train = good[:n_train]
+    val = good[n_train:]
+    bad = [s for s in samples if s.get("bad_reason")]
+
+    return train, val, bad
+
+
 def validate_feature_pixels(label_data: dict, georef: dict, wgs84_to_pixel_fn,
                             width: int = 224, height: int = 224):
     """
@@ -371,7 +389,8 @@ def main():
         print(f"  {suspicious_count} sample(s) flagged for georef review.")
 
     # Re-split after potential new bad samples
-    train, val, bad = split_train_val(all_samples, args.split, args.seed)
+    split_fn = split_train_val_random if args.split_mode == "random" else split_train_val
+    train, val, bad = split_fn(all_samples, args.split, args.seed)
 
     output_dir = Path(args.output) if args.output else Path("data/poc_aqua")
     output_dir.mkdir(parents=True, exist_ok=True)
