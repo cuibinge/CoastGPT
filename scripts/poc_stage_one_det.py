@@ -511,7 +511,10 @@ def main():
 
     # ---- Step 1: Build frozen vision encoder ----
     print("\n--- Step 1: Building DualVisionEncoder ---")
-    vis_cfg = ConfigDict({"rgb_vision": cfg["model"]["rgb_vision"]})
+    vis_cfg = ConfigDict({
+        "rgb_vision": cfg["model"]["rgb_vision"],
+        "alignment_dim": cfg["model"].get("alignment_dim", 768),
+    })
     vision = build_vision_encoder(vis_cfg, cfg["model"]["vision_checkpoint"])
     vision = vision.to(device)
     vision.eval()

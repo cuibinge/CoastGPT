@@ -15,6 +15,9 @@ data:
   num_workers: 2
 
 model:
+  # Must match the checkpoint's alignment_dim (default 768 → stage2 uses 1024)
+  alignment_dim: 1024
+
   # Vision encoder config (needed to construct DualVisionEncoder)
   rgb_vision:
     arch: dual
