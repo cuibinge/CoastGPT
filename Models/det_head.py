@@ -129,6 +129,12 @@ class DualVisionFPNBackboneAdapter(nn.Module):
         for p in self.vision.parameters():
             p.requires_grad = False
 
+    def train(self, mode: bool = True):
+        """Override to keep vision encoder permanently in eval mode."""
+        super().train(mode)
+        self.vision.eval()
+        return self
+
     def forward(self, images: torch.Tensor) -> OrderedDict:
         """
         Args:

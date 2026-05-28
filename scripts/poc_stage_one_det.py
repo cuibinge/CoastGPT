@@ -432,9 +432,11 @@ def validate(
             for img in images
         ]
 
-        # Build pred list for save_overlay_grid (masks: [N,1,H,W] -> [N,H,W])
+        # Build pred list for save_overlay_grid, filtering by score_thresh
+        # to match GeoJSON export threshold
         pred_dicts = []
         for out in outputs_cpu:
+            keep = out["scores"] >= score_thresh
             masks_sq = (
                 out["masks"].squeeze(1)
                 if out["masks"].ndim == 4
@@ -442,9 +444,9 @@ def validate(
             )
             pred_dicts.append(
                 {
-                    "boxes": out["boxes"],
-                    "masks": masks_sq,
-                    "scores": out["scores"],
+                    "boxes": out["boxes"][keep],
+                    "masks": masks_sq[keep],
+                    "scores": out["scores"][keep],
                 }
             )
 
