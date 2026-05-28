@@ -18,7 +18,7 @@ def resize_georef(
     original_size: Tuple[int, int],
     target_size: Tuple[int, int],
     original_transform: List[float],
-):
+) -> Tuple[List[float], Tuple[float, float]]:
     """
     Compute model_transform after image resize.
     Uses orig_affine * Affine.scale(sx, sy) for rotation/shear compatibility.
@@ -41,7 +41,7 @@ def resize_georef(
     orig_affine = Affine(*original_transform)
     model_affine = orig_affine * Affine.scale(sx, sy)
 
-    return list(model_affine)[:6], (sx, sy)
+    return [model_affine.a, model_affine.b, model_affine.c, model_affine.d, model_affine.e, model_affine.f], (sx, sy)
 
 
 def wgs84_to_pixel(
@@ -55,7 +55,10 @@ def wgs84_to_pixel(
         model_transform: list[float] of 6 affine coefficients
         source_crs: str, e.g. "EPSG:4326"
     """
-    if georef.get("source_crs") == "EPSG:4326":
+    if Affine is None:
+        raise ImportError("affine library required: pip install affine")
+
+    if georef.get("source_crs", "").strip().upper() == "EPSG:4326":
         # Direct WGS84 -> pixel (no CRS transform needed)
         model_affine = Affine(*georef["model_transform"])
         inv_affine = ~model_affine
@@ -73,7 +76,10 @@ def pixel_to_wgs84(
     """
     Convert model pixel (col, row) -> WGS84 (lon, lat).
     """
-    if georef.get("source_crs") == "EPSG:4326":
+    if Affine is None:
+        raise ImportError("affine library required: pip install affine")
+
+    if georef.get("source_crs", "").strip().upper() == "EPSG:4326":
         model_affine = Affine(*georef["model_transform"])
         return [model_affine * (col, row) for col, row in coords_pixel]
     else:
