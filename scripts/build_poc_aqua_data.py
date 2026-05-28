@@ -32,6 +32,62 @@ def parse_args():
     return p.parse_args()
 
 
+def gf_tile_bounds_from_geotiff(
+    orig_tif_path: Path,
+    original_size: int = 256,
+) -> Optional[Dict]:
+    """
+    Read tile georef from a GeoTIFF file using tifffile.
+
+    Reads ModelPixelScaleTag (GSD) and ModelTiepointTag (origin).
+    These are the authoritative tile bounds — NOT derived from filename or object polygons.
+    """
+    try:
+        import tifffile
+    except ImportError:
+        return None
+
+    try:
+        with tifffile.TiffFile(str(orig_tif_path)) as tif:
+            page = tif.pages[0]
+            scale_tag = page.tags.get('ModelPixelScaleTag')
+            tiepoint_tag = page.tags.get('ModelTiepointTag')
+
+            if scale_tag is None or tiepoint_tag is None:
+                return None
+
+            gsd_x = float(scale_tag.value[0])
+            gsd_y = float(scale_tag.value[1])
+            tie_x = float(tiepoint_tag.value[3])  # top-left lon
+            tie_y = float(tiepoint_tag.value[4])  # top-left lat
+
+            w = page.shape[1]
+            h = page.shape[0]
+    except Exception:
+        return None
+
+    tile_min_lon = tie_x
+    tile_max_lat = tie_y
+    tile_max_lon = tie_x + w * gsd_x
+    tile_min_lat = tie_y - h * abs(gsd_y)
+
+    return {
+        "source_crs": "EPSG:4326",
+        "original_size": [w, h],
+        "model_input_size": [224, 224],
+        "original_transform": [
+            gsd_x, 0.0, tile_min_lon,
+            0.0, -abs(gsd_y), tile_max_lat,
+        ],
+        "tile_bounds_wgs84": [
+            tile_min_lon, tile_min_lat, tile_max_lon, tile_max_lat,
+        ],
+        "gsd_x": gsd_x,
+        "gsd_y": gsd_y,
+        "georef_source": "geotiff",
+    }
+
+
 def gf_tile_bounds_from_tile_name(
     label_filename: str,
     original_size: int = 256,
@@ -46,7 +102,8 @@ def gf_tile_bounds_from_tile_name(
     The tile origin (E, N) represents the source image corner.
     Tile bounds = origin + row/col * 256 * GSD.
 
-    This filename-derived transform is only a provisional estimate.
+    This is a FALLBACK used when GeoTIFF (ModelPixelScaleTag) is not available.
+    The filename-derived transform is only a provisional estimate.
     It must pass feature pixel in-bounds validation and GT overlay inspection
     before being used for training.
     """
@@ -149,10 +206,16 @@ def scan_sensor(data_root: Path, sensor: str, size: str) -> List[Dict]:
         if not isinstance(features, list):
             bad_reason = "features_not_list"
 
-        # Derive tile georef
-        tile_georef = gf_tile_bounds_from_tile_name(
-            label_path.name, original_size=int(size)
-        )
+        # Derive tile georef: prefer GeoTIFF, fall back to filename
+        orig_stem = stem.replace("_True_WFQ", "_Orig_WFQ")
+        orig_tif_path = sensor_dir / f"Size_{size}" / "Image_Orig" / f"{orig_stem}.tif"
+
+        if orig_tif_path.exists():
+            tile_georef = gf_tile_bounds_from_geotiff(orig_tif_path, original_size=int(size))
+        else:
+            tile_georef = gf_tile_bounds_from_tile_name(
+                label_path.name, original_size=int(size)
+            )
 
         if tile_georef is None:
             bad_reason = "missing_tile_bounds"
