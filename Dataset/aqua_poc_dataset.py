@@ -63,6 +63,16 @@ class AquaPoCDataset(torch.utils.data.Dataset):
         if not isinstance(self.samples, list):
             raise ValueError(f"Manifest must be a JSON list, got {type(self.samples)}")
 
+        required_fields = ["image_path", "label_path", "original_size",
+                           "original_transform", "source_crs", "sample_id"]
+        for i, s in enumerate(self.samples):
+            missing = [k for k in required_fields if k not in s]
+            if missing:
+                raise KeyError(
+                    f"Manifest sample {i} ({s.get('sample_id', '?')}) "
+                    f"missing required fields: {missing}"
+                )
+
     def __len__(self) -> int:
         return len(self.samples)
 
@@ -71,7 +81,12 @@ class AquaPoCDataset(torch.utils.data.Dataset):
 
         # ---- 1. Load and preprocess image ----
         img_path = self.data_root / sample["image_path"]
-        image = Image.open(img_path).convert("RGB")
+        try:
+            image = Image.open(img_path).convert("RGB")
+        except (OSError, IOError) as e:
+            raise RuntimeError(
+                f"Failed to load image for {sample.get('sample_id', idx)}: {img_path}"
+            ) from e
         image = image.resize((self.image_size, self.image_size), Image.BILINEAR)
         image_tensor = torch.from_numpy(np.array(image, dtype=np.float32) / 255.0)
         image_tensor = image_tensor.permute(2, 0, 1)  # [H, W, C] -> [C, H, W]
@@ -98,8 +113,13 @@ class AquaPoCDataset(torch.utils.data.Dataset):
         labels: List[int] = []
 
         if label_path.exists():
-            with open(label_path, "r", encoding="utf-8") as f:
-                geojson = json.load(f)
+            try:
+                with open(label_path, "r", encoding="utf-8") as f:
+                    geojson = json.load(f)
+            except (json.JSONDecodeError, OSError) as e:
+                raise RuntimeError(
+                    f"Failed to load label for {sample.get('sample_id', idx)}: {label_path}"
+                ) from e
             features = geojson.get("features", [])
 
             for feature in features:
@@ -122,9 +142,11 @@ class AquaPoCDataset(torch.utils.data.Dataset):
                         self._add_instance(pixel_rings, boxes, masks_list, labels)
 
                 # Skip other geometry types (Point, LineString, etc.)
-        else:
-            # Label file not found - treat as negative sample
-            raw_num_features = max(raw_num_features, 1)  # force error trigger below
+        elif raw_num_features > 0:
+            raise RuntimeError(
+                f"Sample {sample.get('sample_id', idx)}: manifest claims "
+                f"{raw_num_features} features but label file is missing: {label_path}"
+            )
 
         # ---- 4. Filter empty instances ----
         valid_indices = []
@@ -152,7 +174,7 @@ class AquaPoCDataset(torch.utils.data.Dataset):
             target = {
                 "boxes": torch.tensor(boxes, dtype=torch.float32),  # [N, 4] xyxy
                 "labels": torch.tensor(labels, dtype=torch.int64),  # [N]
-                "masks": masks_stacked.to(torch.uint8),            # [N, H, W]
+                "masks": masks_stacked,                               # [N, H, W] uint8
                 "image_id": torch.tensor([idx], dtype=torch.int64),
                 "area": torch.tensor(
                     [int(m.sum()) for m in masks_list], dtype=torch.float32
