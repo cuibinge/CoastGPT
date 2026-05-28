@@ -29,19 +29,6 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 
-def _shoelace_area_wgs84(ring: List[Tuple[float, float]]) -> float:
-    """Shoelace area in WGS84 degrees."""
-    n = len(ring)
-    if n < 3:
-        return 0.0
-    area = 0.0
-    for i in range(n):
-        x1, y1 = ring[i]
-        x2, y2 = ring[(i + 1) % n]
-        area += x1 * y2 - x2 * y1
-    return abs(area) / 2.0
-
-
 def _close_ring(ring: List[Tuple[float, float]], eps: float = 1e-12) -> List[Tuple[float, float]]:
     """Ensure the ring is closed (first == last)."""
     if len(ring) < 1:
@@ -139,8 +126,8 @@ def validate_geojson(
         feature_collection: GeoJSON FeatureCollection dict.
         tile_bounds_wgs84: Optional [min_lon, min_lat, max_lon, max_lat] for
             coordinate bounds checking.
-        min_area_px: Minimum polygon area (pixel^2). Only used when shapely is
-            available to validate WGS84-area against an approximate threshold.
+        min_area_px: Minimum polygon area (pixel^2). Passed through to
+            callers; not directly enforced in validation.
         bounds_eps: Tolerance for bounds checking (degrees).
     """
     result: Dict[str, Any] = {
@@ -218,18 +205,14 @@ def validate_geojson(
         geom = feat.get("geometry")
         if not isinstance(geom, dict):
             result["errors"].append(f"Feature[{idx}] missing 'geometry' or not a dict")
-            feat_ok = False
-            if feat_ok:
-                continue  # cannot validate further without geometry
-            else:
-                continue
+            continue
 
         # geometry.type == Polygon
         if geom.get("type") != "Polygon":
             result["errors"].append(
                 f"Feature[{idx}] geometry.type must be 'Polygon', got {geom.get('type')!r}"
             )
-            feat_ok = False
+            continue
 
         # coordinates are valid
         coords = geom.get("coordinates")

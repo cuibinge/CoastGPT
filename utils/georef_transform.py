@@ -58,7 +58,7 @@ def wgs84_to_pixel(
     if Affine is None:
         raise ImportError("affine library required: pip install affine")
 
-    if georef.get("source_crs", "").strip().upper() == "EPSG:4326":
+    if (georef.get("source_crs") or "").strip().upper() == "EPSG:4326":
         # Direct WGS84 -> pixel (no CRS transform needed)
         model_affine = Affine(*georef["model_transform"])
         inv_affine = ~model_affine
@@ -79,7 +79,7 @@ def pixel_to_wgs84(
     if Affine is None:
         raise ImportError("affine library required: pip install affine")
 
-    if georef.get("source_crs", "").strip().upper() == "EPSG:4326":
+    if (georef.get("source_crs") or "").strip().upper() == "EPSG:4326":
         model_affine = Affine(*georef["model_transform"])
         return [model_affine * (col, row) for col, row in coords_pixel]
     else:

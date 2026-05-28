@@ -111,24 +111,29 @@ def mask_to_polygon(
     """
     try:
         import cv2 as cv
-        contours, _ = cv.findContours(
+        result = cv.findContours(
             mask.astype(np.uint8),
             cv.RETR_EXTERNAL,
             cv.CHAIN_APPROX_SIMPLE,
         )
+        contours = result[0] if len(result) == 2 else result[1]
+
+        def _cnt_to_poly(cnt):
+            """Convert OpenCV contour to [(col, row), ...] polygon."""
+            return [(float(pt[0][0]), float(pt[0][1])) for pt in cnt]
+
         polygons = []
         for cnt in contours:
             if len(cnt) < 3:
                 continue
-            # cv returns (row, col) -> convert to (col, row)
-            poly = [(float(pt[0][0]), float(pt[0][1])) for pt in cnt]
+            poly = _cnt_to_poly(cnt)
             if simplify_epsilon > 0:
                 approx = cv.approxPolyDP(
                     cnt, simplify_epsilon, closed=True
                 )
                 if len(approx) < 3:
                     continue
-                poly = [(float(pt[0][0]), float(pt[0][1])) for pt in approx]
+                poly = _cnt_to_poly(approx)
             polygons.append(poly)
         return sorted(polygons, key=lambda p: _polygon_area(p), reverse=True)
     except ImportError:
