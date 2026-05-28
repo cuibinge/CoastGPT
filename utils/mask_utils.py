@@ -24,8 +24,8 @@ def polygon_to_bbox(polygon: List[Tuple[float, float]]) -> Optional[List[int]]:
         return None
     xs = [p[0] for p in polygon]
     ys = [p[1] for p in polygon]
-    x1, x2 = int(np.floor(min(xs))), int(np.ceil(max(xs)))
-    y1, y2 = int(np.floor(min(ys))), int(np.ceil(max(ys)))
+    x1, x2 = int(np.floor(min(xs))), int(np.ceil(max(xs))) + 1
+    y1, y2 = int(np.floor(min(ys))), int(np.ceil(max(ys))) + 1
     return [x1, y1, x2, y2]
 
 
@@ -90,6 +90,8 @@ def rasterize_multipolygon(
     For MultiPolygon -> individual instances, call rasterize_polygon per polygon.
     This merges all into one mask.
     """
+    if Image is None:
+        raise ImportError("PIL required for rasterization")
     mask = Image.new("L", (width, height), 0)
     draw = ImageDraw.Draw(mask)
     for poly in polygons:
@@ -104,27 +106,28 @@ def mask_to_polygon(
 ) -> List[List[Tuple[float, float]]]:
     """
     Extract polygon(s) from binary mask via contour detection.
-    Uses OpenCV if available, otherwise PIL edge tracing.
+    Uses OpenCV if available, otherwise falls back to a bbox-rectangle polygon.
     Returns list of polygons (outer rings only, sorted by area desc).
     """
     try:
-        import cv2
-        contours, _ = cv2.findContours(
+        import cv2 as cv
+        contours, _ = cv.findContours(
             mask.astype(np.uint8),
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE,
+            cv.RETR_EXTERNAL,
+            cv.CHAIN_APPROX_SIMPLE,
         )
         polygons = []
         for cnt in contours:
             if len(cnt) < 3:
                 continue
-            # cv2 returns (row, col) -> convert to (col, row)
+            # cv returns (row, col) -> convert to (col, row)
             poly = [(float(pt[0][0]), float(pt[0][1])) for pt in cnt]
             if simplify_epsilon > 0:
-                import cv2 as cv
                 approx = cv.approxPolyDP(
                     cnt, simplify_epsilon, closed=True
                 )
+                if len(approx) < 3:
+                    continue
                 poly = [(float(pt[0][0]), float(pt[0][1])) for pt in approx]
             polygons.append(poly)
         return sorted(polygons, key=lambda p: _polygon_area(p), reverse=True)
