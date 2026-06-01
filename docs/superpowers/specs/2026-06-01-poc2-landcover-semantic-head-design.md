@@ -157,13 +157,55 @@ L_sem = CE(ignore_index=255) + Dice(observed_classes_only)
 ### 8.2 size-stratified eval
 per-size (128/256/512) 拆分评估，输出以上指标
 
-### 8.3 high-res ablation
-512 tile 对比 224×224 vs 原始分辨率 rasterize 的 per-class IoU，
-量化细窄地物（沟渠、农村道路、城镇村道路用地）的精度损失
+### 8.3 high-res ablation（label-only analysis，不参与训练）
+
+不改变 baseline 模型和训练，纯粹在 label 侧做对比分析：
+
+1. 对每个 512 tile，构造两份 GT mask：
+   - **224 rasterize**：GeoJSON → WGS84→pixel 224×224 → rasterize（baseline 当前做法）
+   - **512 native rasterize**：GeoJSON → WGS84→pixel 512×512 → rasterize（ground truth reference）
+2. 将 baseline 模型在 224×224 输出的 pred mask upsample 回 512×512
+3. 分别在两份 GT 上计算 per-class IoU
+4. 量化差异，重点看细窄地物：沟渠、农村道路、城镇村道路用地
+
+目的：量化 224 rasterize 造成的分辨率损失上限，为后续是否启用多分辨率训练提供数据依据。
 
 ### 8.4 可视化
 - image / GT / pred / GT+pred overlay
 - polygonize → GeoJSON → geometry validity check
+
+---
+
+### 8.5 metrics.json 结构
+
+训练结束后输出 `metrics.json`，除全局指标外增加两个细分字段：
+
+```json
+{
+  "overall": {
+    "observed_pixel_mIoU": 0.0,
+    "per_class_IoU": {"沟渠": 0.0, "农村道路": 0.0, ...},
+    "per_class_recall": {"沟渠": 0.0, "农村道路": 0.0, ...},
+    "fg_bg_confusion_rate": 0.0
+  },
+  "by_original_size": {
+    "128": {"observed_pixel_mIoU": 0.0, "per_class_IoU": {...}, "n_samples": 0},
+    "256": {"observed_pixel_mIoU": 0.0, "per_class_IoU": {...}, "n_samples": 0},
+    "512": {"observed_pixel_mIoU": 0.0, "per_class_IoU": {...}, "n_samples": 0}
+  },
+  "rasterization_ablation_512": {
+    "description": "512 tile: 224 rasterize vs 512 native rasterize per-class IoU delta",
+    "n_tiles": 0,
+    "per_class_IoU_delta": {
+      "沟渠": 0.0,
+      "农村道路": 0.0,
+      "城镇村道路用地": 0.0
+    },
+    "mean_delta_all_classes": 0.0,
+    "mean_delta_narrow_classes": 0.0
+  }
+}
+```
 
 ---
 
@@ -201,7 +243,7 @@ per-size (128/256/512) 拆分评估，输出以上指标
 | 11 | 小规模 train/val |
 | 12 | Overlay + GeoJSON 输出 |
 | 13 | 完整 PoC-2 baseline 训练 |
-| 14 | Size-stratified eval + high-res ablation |
+| 14 | Size-stratified eval (by_original_size) + high-res ablation (label-only, 不训练) |
 
 ---
 
