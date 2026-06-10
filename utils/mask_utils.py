@@ -49,19 +49,23 @@ def bbox_from_mask(mask: np.ndarray) -> Optional[List[int]]:
 
 def rasterize_polygon(
     polygon: List[Tuple[float, float]],
-    width: int = 224,
-    height: int = 224,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
     holes: Optional[List[List[Tuple[float, float]]]] = None,
 ) -> np.ndarray:
     """
     Rasterize a single polygon to binary mask using PIL.
     Args:
         polygon: outer ring [(col, row), ...]
-        width, height: output mask size
+        width, height: output mask size. Defaults to 224.
         holes: optional list of hole rings
     Returns:
         np.ndarray[H, W] of dtype uint8
     """
+    if width is None:
+        width = 224
+    if height is None:
+        height = 224
     if Image is None:
         raise ImportError("PIL required for rasterization")
 
@@ -82,14 +86,18 @@ def rasterize_polygon(
 
 def rasterize_multipolygon(
     polygons: List[List[Tuple[float, float]]],
-    width: int = 224,
-    height: int = 224,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
 ) -> np.ndarray:
     """
     Rasterize multiple polygons to a single mask.
     For MultiPolygon -> individual instances, call rasterize_polygon per polygon.
     This merges all into one mask.
     """
+    if width is None:
+        width = 224
+    if height is None:
+        height = 224
     if Image is None:
         raise ImportError("PIL required for rasterization")
     mask = Image.new("L", (width, height), 0)
@@ -165,6 +173,53 @@ def _pil_mask_to_polygon(mask: np.ndarray) -> List[List[Tuple[float, float]]]:
         (float(x2), float(y2)),
         (float(x1), float(y2)),
     ]]
+
+
+def binary_mask_to_instances(
+    binary_mask: "np.ndarray",
+    min_area: int = 8,
+    connectivity: int = 4,
+):
+    """
+    Convert a binary semantic mask into instance masks by connected components.
+
+    Args:
+        binary_mask: np.ndarray[H, W], values can be 0/255 or 0/1.
+        min_area: minimum component area in pixels.
+        connectivity: 4 or 8. Use 4 if diagonal touching should not merge
+            instances, 8 if they should.
+
+    Returns:
+        instance_masks: list[np.ndarray[H, W]], each mask is 0/1 uint8.
+        boxes: list[[x1, y1, x2, y2]], xyxy with x2/y2 exclusive.
+        areas: list[float], mask area in pixels.
+    """
+    import cv2
+
+    mask = (binary_mask > 0).astype(np.uint8)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask,
+        connectivity=connectivity,
+    )
+
+    instance_masks = []
+    boxes = []
+    areas_list = []
+
+    for label_id in range(1, num_labels):
+        x, y, w, h, area = stats[label_id]
+
+        if area < min_area:
+            continue
+
+        inst_mask = (labels == label_id).astype(np.uint8)
+
+        instance_masks.append(inst_mask)
+        boxes.append([int(x), int(y), int(x + w), int(y + h)])
+        areas_list.append(float(area))
+
+    return instance_masks, boxes, areas_list
 
 
 def filter_small_polygons(

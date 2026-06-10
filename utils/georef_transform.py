@@ -5,7 +5,7 @@ Conventions:
 - coords_pixel: (col, row) in model pixel space (224x224), pixel corner 0-indexed
 - transform: GDAL-order affine [a, b, c, d, e, f]
 """
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 import numpy as np
 
 try:
@@ -110,10 +110,14 @@ def round_trip_check(
 
 def clip_pixel_coords(
     coords_pixel: List[Tuple[float, float]],
-    width: int = 224,
-    height: int = 224,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
 ) -> List[Tuple[float, float]]:
     """Clip pixel coordinates to image bounds [0, width) x [0, height)."""
+    if width is None:
+        width = 224
+    if height is None:
+        height = 224
     return [
         (max(0.0, min(width - 1e-9, col)), max(0.0, min(height - 1e-9, row)))
         for col, row in coords_pixel

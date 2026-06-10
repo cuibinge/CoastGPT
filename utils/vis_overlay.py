@@ -79,13 +79,13 @@ def _overlay_single(
     masks_np = None
     scores_np = None
     if boxes is not None and len(boxes) > 0:
-        boxes_np = boxes.cpu().numpy() if hasattr(boxes, "cpu") else np.array(boxes)
+        boxes_np = boxes.detach().cpu().numpy() if hasattr(boxes, "detach") else np.array(boxes)
     if masks is not None and len(masks) > 0:
-        masks_np = masks.cpu().numpy() if hasattr(masks, "cpu") else np.array(masks)
+        masks_np = masks.detach().cpu().numpy() if hasattr(masks, "detach") else np.array(masks)
 
     # Draw masks on numpy array FIRST (under boxes)
     if masks_np is not None:
-        _draw_masks(img, masks_np[:5], mask_color, alpha=0.3)
+        _draw_masks(img, masks_np, mask_color, alpha=0.3)
 
     # Create PIL image and draw boxes + text
     img_pil = Image.fromarray(img)
@@ -94,7 +94,7 @@ def _overlay_single(
     if boxes_np is not None:
         _draw_boxes(draw, boxes_np, box_color)
         if scores is not None:
-            scores_np = scores.cpu().numpy() if hasattr(scores, "cpu") else np.array(scores)
+            scores_np = scores.detach().cpu().numpy() if hasattr(scores, "detach") else np.array(scores)
             for box, score in zip(boxes_np, scores_np):
                 draw.text(
                     (box[0], max(0, box[1] - 8)),
@@ -205,7 +205,7 @@ def overlay_gt_pred_pixel(
     def _to_np(x):
         if x is None or len(x) == 0:
             return None
-        return x.cpu().numpy() if hasattr(x, "cpu") else np.array(x)
+        return x.detach().cpu().numpy() if hasattr(x, "detach") else np.array(x)
 
     gt_boxes_np = _to_np(target.get("boxes"))
     gt_masks_np = _to_np(target.get("masks"))
@@ -215,9 +215,9 @@ def overlay_gt_pred_pixel(
 
     # Draw GT masks first (green), then pred masks (red) on numpy array
     if gt_masks_np is not None:
-        _draw_masks(img, gt_masks_np[:5], (0, 255, 0), alpha=0.3)
+        _draw_masks(img, gt_masks_np, (0, 255, 0), alpha=0.3)
     if pred_masks_np is not None:
-        _draw_masks(img, pred_masks_np[:5], (255, 0, 0), alpha=0.3)
+        _draw_masks(img, pred_masks_np, (255, 0, 0), alpha=0.3)
 
     # Create PIL image and draw boxes + text
     img_pil = Image.fromarray(img)

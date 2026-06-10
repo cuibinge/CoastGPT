@@ -1,4 +1,5 @@
 from .hookbase import HookBase
+import torch_npu
 
 
 class DINOLossWarmUp(HookBase):

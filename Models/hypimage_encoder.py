@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from collections import OrderedDict
 from einops import rearrange, repeat
+import torch_npu
 
 # 3D卷积块，包含一个3x3x3卷积和BatchNorm层
 def conv3x3x3(in_channel, out_channel):

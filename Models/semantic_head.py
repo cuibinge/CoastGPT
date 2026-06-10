@@ -13,7 +13,7 @@ Architecture:
     → bilinear upsample to (output_size)
 """
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -33,7 +33,7 @@ class LandcoverSemanticHead(nn.Module):
         self,
         in_channels: int = 256,
         num_classes: int = 25,
-        output_size: Tuple[int, int] = (224, 224),
+        output_size: Optional[Tuple[int, int]] = None,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -100,8 +100,14 @@ class LandcoverSemanticHead(nn.Module):
         x = self.cls_conv(x)    # [B, num_classes, 56, 56]
 
         # Upsample to target output size
+        if self.output_size is not None:
+            upsample_size = self.output_size
+        else:
+            # P1 is at H/4, so input size = P1 spatial * 4
+            upsample_size = (p1.shape[2] * 4, p1.shape[3] * 4)
+
         logits = F.interpolate(
-            x, size=self.output_size, mode='bilinear', align_corners=False
+            x, size=upsample_size, mode='bilinear', align_corners=False
         )
         return logits
 
@@ -113,7 +119,7 @@ if __name__ == "__main__":
     model = LandcoverSemanticHead(
         in_channels=256,
         num_classes=num_classes,
-        output_size=(224, 224),
+        output_size=None,
     )
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -128,5 +134,5 @@ if __name__ == "__main__":
     print(f"Input:  P1={list(p1.shape)}, P2={list(p2.shape)}, P3={list(p3.shape)}, P4={list(p4.shape)}")
     print(f"Output: {list(logits.shape)}")
 
-    assert list(logits.shape) == [B, num_classes, 224, 224], f"Unexpected shape: {logits.shape}"
+    assert list(logits.shape) == [B, num_classes, 56*4, 56*4], f"Unexpected shape: {logits.shape}"
     print("LandcoverSemanticHead shape check passed.")

@@ -27,7 +27,7 @@ from utils.georef_transform import (
     round_trip_check,
     wgs84_to_pixel,
 )
-from utils.mask_utils import bbox_from_mask, rasterize_polygon
+from utils.mask_utils import bbox_from_mask, binary_mask_to_instances, rasterize_polygon
 
 
 class AquaPoCDataset(torch.utils.data.Dataset):
@@ -79,24 +79,16 @@ class AquaPoCDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> dict:
         sample = self.samples[idx]
 
-        # ---- 1. Load and preprocess image ----
-        img_path = self.data_root / sample["image_path"]
-        try:
-            image = Image.open(img_path).convert("RGB")
-        except (OSError, IOError) as e:
-            raise RuntimeError(
-                f"Failed to load image for {sample.get('sample_id', idx)}: {img_path}"
-            ) from e
-        image = image.resize((self.image_size, self.image_size), Image.BILINEAR)
-        image_tensor = torch.from_numpy(np.array(image, dtype=np.float32) / 255.0)
-        image_tensor = image_tensor.permute(2, 0, 1)  # [H, W, C] -> [C, H, W]
-
-        # ---- 2. Compute model_transform after resize ----
+        # ---- 1. Determine effective image size ----
         original_size = sample["original_size"]  # [width, height]
+        if self.image_size == 0:
+            effective_size = tuple(original_size)  # use native resolution
+        else:
+            effective_size = (self.image_size, self.image_size)
         original_transform = sample["original_transform"]
         model_transform, resize_scale = resize_georef(
             tuple(original_size),
-            (self.image_size, self.image_size),
+            effective_size,
             original_transform,
         )
         georef = {
@@ -104,7 +96,100 @@ class AquaPoCDataset(torch.utils.data.Dataset):
             "model_transform": model_transform,
         }
 
-        # ---- 3. Parse GeoJSON label ----
+        # ---- 2. Load and preprocess image ----
+        img_path = self.data_root / sample["image_path"]
+        try:
+            image = Image.open(img_path).convert("RGB")
+        except (OSError, IOError) as e:
+            raise RuntimeError(
+                f"Failed to load image for {sample.get('sample_id', idx)}: {img_path}"
+            ) from e
+        image = image.resize(effective_size, Image.BILINEAR)
+        image_tensor = torch.from_numpy(np.array(image, dtype=np.float32) / 255.0)
+        image_tensor = image_tensor.permute(2, 0, 1)  # [H, W, C] -> [C, H, W]
+
+        # ---- 3. Build target: binary mask preferred, GeoJSON fallback ----
+        binary_path = (
+            self.data_root / sample["binary_label_path"]
+            if sample.get("binary_label_path")
+            else None
+        )
+        if binary_path is not None and binary_path.exists():
+            target = self._build_target_from_binary_mask(binary_path, idx, effective_size)
+        else:
+            target = self._build_target_from_geojson(sample, georef, idx, effective_size)
+
+        # ---- 4. Build meta dict ----
+        meta = {
+            "image_path": str(img_path),
+            "source_crs": sample["source_crs"],
+            "original_transform": original_transform,
+            "model_transform": model_transform,
+            "original_size": original_size,
+            "model_input_size": list(effective_size),
+            "resize_scale": list(resize_scale),
+            "sample_id": sample["sample_id"],
+            "tile_bounds_wgs84": sample.get("tile_bounds_wgs84"),
+            "sensor": sample.get("sensor"),
+            "source_image_id": sample.get("source_image_id"),
+            "label_source": sample.get("label_source", "geojson_answer"),
+            "binary_label_path": sample.get("binary_label_path"),
+            "label_path": sample.get("label_path"),
+        }
+
+        # ---- 5. Return ----
+        return {"image": image_tensor, "target": target, "meta": meta}
+
+    # ------------------------------------------------------------------
+    # Target builders
+    # ------------------------------------------------------------------
+
+    def _build_target_from_binary_mask(
+        self, binary_path: Path, image_id: int, effective_size: Tuple[int, int],
+        min_area: int = 8, connectivity: int = 4
+    ) -> dict:
+        """Build Mask R-CNN target from a Binary_WFQ.tif mask."""
+        W, H = effective_size
+        binary = Image.open(binary_path).convert("L")
+        binary = binary.resize((W, H), Image.NEAREST)
+        binary_np = np.array(binary)
+
+        instance_masks, boxes, areas = binary_mask_to_instances(
+            binary_np, min_area=min_area, connectivity=connectivity
+        )
+
+        N = len(instance_masks)
+        if N == 0:
+            return {
+                "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                "labels": torch.zeros((0,), dtype=torch.int64),
+                "masks": torch.zeros(
+                    (0, H, W), dtype=torch.uint8
+                ),
+                "image_id": torch.tensor([image_id], dtype=torch.int64),
+                "area": torch.zeros((0,), dtype=torch.float32),
+                "iscrowd": torch.zeros((0,), dtype=torch.int64),
+            }
+
+        masks_tensor = torch.tensor(np.stack(instance_masks), dtype=torch.uint8)
+        return {
+            "boxes": torch.tensor(boxes, dtype=torch.float32),
+            "labels": torch.ones((N,), dtype=torch.int64),
+            "masks": masks_tensor,
+            "image_id": torch.tensor([image_id], dtype=torch.int64),
+            "area": torch.tensor(areas, dtype=torch.float32),
+            "iscrowd": torch.zeros((N,), dtype=torch.int64),
+        }
+
+    def _build_target_from_geojson(
+        self, sample: dict, georef: dict, idx: int, effective_size: Tuple[int, int]
+    ) -> dict:
+        """Build Mask R-CNN target from GeoJSON polygon labels (fallback path).
+
+        Parses GeoJSON features, converts WGS84 coordinates to pixel space
+        via georef, rasterizes polygons, and extracts bboxes.
+        """
+        W, H = effective_size
         label_path = self.data_root / sample["label_path"]
         raw_num_features = sample.get("num_features", 0)
 
@@ -130,55 +215,44 @@ class AquaPoCDataset(torch.utils.data.Dataset):
                 coords = geom.get("coordinates")
 
                 if geom_type == "Polygon":
-                    # coords = [outer_ring, hole1, hole2, ...]
                     rings = coords
-                    pixel_rings = self._polygon_to_pixel(rings, georef)
-                    self._add_instance(pixel_rings, boxes, masks_list, labels)
+                    pixel_rings = self._polygon_to_pixel(rings, georef, W, H)
+                    self._add_instance(pixel_rings, boxes, masks_list, labels, W, H)
 
                 elif geom_type == "MultiPolygon":
-                    # coords = [[outer1, hole1a, ...], [outer2, hole2a, ...], ...]
                     for polygon_rings in coords:
-                        pixel_rings = self._polygon_to_pixel(polygon_rings, georef)
-                        self._add_instance(pixel_rings, boxes, masks_list, labels)
+                        pixel_rings = self._polygon_to_pixel(polygon_rings, georef, W, H)
+                        self._add_instance(pixel_rings, boxes, masks_list, labels, W, H)
 
-                # Skip other geometry types (Point, LineString, etc.)
         elif raw_num_features > 0:
             raise RuntimeError(
                 f"Sample {sample.get('sample_id', idx)}: manifest claims "
                 f"{raw_num_features} features but label file is missing: {label_path}"
             )
 
-        # ---- 4. Filter empty instances ----
-        valid_indices = []
-        for i, m in enumerate(masks_list):
-            if m.sum() > 0:
-                valid_indices.append(i)
-
+        # Filter empty instances
+        valid_indices = [i for i, m in enumerate(masks_list) if m.sum() > 0]
         boxes = [boxes[i] for i in valid_indices]
         masks_list = [masks_list[i] for i in valid_indices]
         labels = [labels[i] for i in valid_indices]
 
-        # ---- 5. Non-empty features but all masks empty -> ValueError ----
         if raw_num_features > 0 and len(masks_list) == 0:
             raise ValueError(
                 f"Sample {sample['sample_id']} has {raw_num_features} features "
                 f"but no valid rasterized instances. Check georef or label data."
             )
 
-        # ---- 6. Build target dict (torchvision Mask R-CNN format) ----
         N = len(masks_list)
         if N > 0:
-            # Stack masks: list of [H,W] -> [N, H, W]
             masks_stacked = torch.stack(masks_list, dim=0)
-
             target = {
-                "boxes": torch.tensor(boxes, dtype=torch.float32),  # [N, 4] xyxy
-                "labels": torch.tensor(labels, dtype=torch.int64),  # [N]
-                "masks": masks_stacked,                               # [N, H, W] uint8
+                "boxes": torch.tensor(boxes, dtype=torch.float32),
+                "labels": torch.tensor(labels, dtype=torch.int64),
+                "masks": masks_stacked,
                 "image_id": torch.tensor([idx], dtype=torch.int64),
                 "area": torch.tensor(
                     [int(m.sum()) for m in masks_list], dtype=torch.float32
-                ),  # [N]
+                ),
                 "iscrowd": torch.zeros(N, dtype=torch.int64),
             }
         else:
@@ -186,48 +260,31 @@ class AquaPoCDataset(torch.utils.data.Dataset):
                 "boxes": torch.empty((0, 4), dtype=torch.float32),
                 "labels": torch.empty((0,), dtype=torch.int64),
                 "masks": torch.empty(
-                    (0, self.image_size, self.image_size), dtype=torch.uint8
+                    (0, effective_size[1], effective_size[0]), dtype=torch.uint8
                 ),
                 "image_id": torch.tensor([idx], dtype=torch.int64),
                 "area": torch.empty((0,), dtype=torch.float32),
                 "iscrowd": torch.empty((0,), dtype=torch.int64),
             }
-
-        # ---- 7. Build meta dict ----
-        meta = {
-            "image_path": str(img_path),
-            "source_crs": sample["source_crs"],
-            "original_transform": original_transform,
-            "model_transform": model_transform,
-            "original_size": original_size,
-            "model_input_size": [self.image_size, self.image_size],
-            "resize_scale": list(resize_scale),
-            "sample_id": sample["sample_id"],
-            "tile_bounds_wgs84": sample.get("tile_bounds_wgs84"),
-            "sensor": sample.get("sensor"),
-            "source_image_id": sample.get("source_image_id"),
-        }
-
-        # ---- 8. Return ----
-        return {"image": image_tensor, "target": target, "meta": meta}
+        return target
 
     # ------------------------------------------------------------------
-    # Helper methods
+    # GeoJSON helper methods (shared by _build_target_from_geojson)
     # ------------------------------------------------------------------
 
     def _polygon_to_pixel(
         self,
         rings: List[List[List[float]]],
         georef: dict,
+        w: int,
+        h: int,
     ) -> List[List[Tuple[float, float]]]:
         """Convert GeoJSON Polygon rings from WGS84 to pixel space with clipping."""
         pixel_rings = []
         for ring in rings:
             coords_wgs84 = [(lon, lat) for lon, lat in ring]
             coords_pixel = wgs84_to_pixel(coords_wgs84, georef)
-            coords_pixel = clip_pixel_coords(
-                coords_pixel, self.image_size, self.image_size
-            )
+            coords_pixel = clip_pixel_coords(coords_pixel, w, h)
             pixel_rings.append(coords_pixel)
         return pixel_rings
 
@@ -237,18 +294,13 @@ class AquaPoCDataset(torch.utils.data.Dataset):
         boxes: List[List[int]],
         masks_list: List[torch.Tensor],
         labels: List[int],
+        w: int,
+        h: int,
     ) -> None:
-        """Rasterize polygon (outer + holes) and compute bbox.
-
-        Appends results to the mutable `boxes`, `masks_list`, and `labels`
-        lists in-place. If the rasterized mask is empty (no pixels), the
-        instance is silently skipped.
-        """
+        """Rasterize polygon (outer + holes) and compute bbox."""
         outer_ring = pixel_rings[0]
         holes = pixel_rings[1:] if len(pixel_rings) > 1 else None
-        mask = rasterize_polygon(
-            outer_ring, self.image_size, self.image_size, holes
-        )
+        mask = rasterize_polygon(outer_ring, w, h, holes)
         mask_tensor = torch.from_numpy(mask)
         bbox = bbox_from_mask(mask)
         if bbox is None:

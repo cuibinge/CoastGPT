@@ -12,7 +12,6 @@ from .build_transform import build_cls_transform, build_vlp_transform
 from .cap_dataset import (
     CaptionDatasetVQA,
     DataCollatorForSupervisedDataset,
-    InstructDataset,
     InstructDatasetWithTaskId,
     RS5MDataset,
 )
@@ -96,20 +95,32 @@ def build_vlp_loader(
                 root=config.data_path, transform=transform, **kwargs
             )
     elif is_train and config.stage >= 2:
-        if not config.weight_sample:
-            dataset = InstructDataset(
-                root=config.data_path,
-                transform=transform,
-                crop_size=config.transform.input_size[0],
-                **kwargs,
+        stage_value = int(getattr(config, "stage", 2))
+        geojson_priority = bool(getattr(config, "geojson_priority", stage_value >= 3))
+        # Forward Stage-3 GeoJSON quality knobs (defined in step3_dual.yaml).
+        # These are no-ops for Stage-2 unless explicitly set.
+        geojson_kwargs = {}
+        if hasattr(config, "geojson_prompt_variants"):
+            geojson_kwargs["geojson_prompt_variants"] = int(config.geojson_prompt_variants)
+        if hasattr(config, "geojson_max_answer_tokens"):
+            geojson_kwargs["geojson_max_answer_tokens"] = int(config.geojson_max_answer_tokens)
+        if hasattr(config, "repair_mojibake"):
+            geojson_kwargs["repair_mojibake"] = bool(config.repair_mojibake)
+        dataset = InstructDatasetWithTaskId(
+            root=config.data_path,
+            transform=transform,
+            crop_size=config.transform.input_size[0],
+            stage=stage_value,
+            geojson_priority=geojson_priority,
+            **geojson_kwargs,
+            **kwargs,
+        )
+        if len(dataset) == 0:
+            raise ValueError(
+                "Resolved instruction dataset is empty. "
+                f"data_path={config.data_path}. Please verify the instruction json root."
             )
-        else:
-            dataset = InstructDatasetWithTaskId(
-                root=config.data_path,
-                transform=transform,
-                crop_size=config.transform.input_size[0],
-                **kwargs,
-            )
+        if config.weight_sample:
             from torch.utils.data import WeightedRandomSampler
             from .utils import DistributedSamplerWrapper
 
@@ -125,7 +136,10 @@ def build_vlp_loader(
                 pin_memory=True,
                 drop_last=True,
                 collate_fn=DataCollatorForSupervisedDataset(
-                    tokenizer=kwargs["tokenizer"]
+                    tokenizer=kwargs["tokenizer"],
+                    physical_prompt_max_len=int(getattr(config, "physical_prompt_max_len", 64)),
+                    task_text_max_len=int(getattr(config, "task_text_max_len", 16)),
+                    element_text_max_len=int(getattr(config, "element_text_max_len", 16)),
                 ),
             )
             return loader
@@ -139,7 +153,10 @@ def build_vlp_loader(
                         config.batch_size,
                         partial=False,
                         collation_fn=DataCollatorForSupervisedDataset(
-                            tokenizer=kwargs["tokenizer"]
+                            tokenizer=kwargs["tokenizer"],
+                            physical_prompt_max_len=int(getattr(config, "physical_prompt_max_len", 64)),
+                            task_text_max_len=int(getattr(config, "task_text_max_len", 16)),
+                            element_text_max_len=int(getattr(config, "element_text_max_len", 16)),
                         ),
                     )
                 ]
@@ -182,7 +199,12 @@ def build_vlp_loader(
             config,
             dataset,
             is_train=is_train,
-            collate_fn=DataCollatorForSupervisedDataset(tokenizer=kwargs["tokenizer"]),
+            collate_fn=DataCollatorForSupervisedDataset(
+                tokenizer=kwargs["tokenizer"],
+                physical_prompt_max_len=int(getattr(config, "physical_prompt_max_len", 64)),
+                task_text_max_len=int(getattr(config, "task_text_max_len", 16)),
+                element_text_max_len=int(getattr(config, "element_text_max_len", 16)),
+            ),
         )
         logger.info(f"Build dataloader: Epoch length = {len(dataloader)}")
         return dataloader

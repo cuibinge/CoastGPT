@@ -1,7 +1,7 @@
 import os
 
 from .hookbase import HookBase
-
+import torch_npu
 
 class PlotSaver(HookBase):
     def __init__(self, suffix="png", save_interval=50):

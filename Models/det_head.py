@@ -10,7 +10,7 @@ Provides the detection head for PoC-1:
 """
 
 from collections import OrderedDict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -77,10 +77,34 @@ class DualVisionFPNBackboneAdapter(nn.Module):
         })
 
 
+def _build_anchor_sizes(
+    relative_scales: Tuple[Tuple[float, ...], ...],
+    input_h: int,
+    input_w: int,
+) -> Tuple[Tuple[int, ...], ...]:
+    """Convert relative anchor scales to absolute pixel sizes.
+
+    Args:
+        relative_scales: e.g. ((0.0714, 0.1429), (0.1429, 0.2857), (0.2857, 0.4286, 0.5714)).
+        input_h, input_w: Current input spatial dimensions.
+
+    Returns:
+        Absolute anchor sizes, e.g. ((16, 32), (32, 64), (64, 96, 128)) for 224 input.
+    """
+    base = min(input_h, input_w)
+    return tuple(
+        tuple(max(1, round(s * base)) for s in scales)
+        for scales in relative_scales
+    )
+
+
 def build_aqua_maskrcnn(
     backbone_adapter: DualVisionFPNBackboneAdapter,
     num_classes: int = 2,
-    anchor_sizes: Tuple[Tuple[int, ...], ...] = ((16, 32), (32, 64), (64, 96, 128)),
+    # New: relative anchor scales (preferred for resolution-agnostic training)
+    anchor_relative_scales: Optional[Tuple[Tuple[float, ...], ...]] = None,
+    # Old: absolute anchor sizes (backward compat)
+    anchor_sizes: Optional[Tuple[Tuple[int, ...], ...]] = None,
     aspect_ratios: Tuple[Tuple[float, ...], ...] = ((0.5, 1.0, 2.0, 3.0),) * 3,
     rpn_pre_nms_top_n_train: int = 512,
     rpn_post_nms_top_n_train: int = 128,
@@ -92,17 +116,40 @@ def build_aqua_maskrcnn(
     box_detections_per_img: int = 50,
     image_mean: List[float] = None,
     image_std: List[float] = None,
-    min_size: int = 224,
-    max_size: int = 224,
+    min_size: Optional[int] = None,
+    max_size: Optional[int] = None,
 ) -> MaskRCNN:
     """
     Build a torchvision Mask R-CNN with a custom FPN backbone adapter.
     num_classes includes background (2 for aquaculture + bg).
     """
+    if min_size is None:
+        min_size = 224
+    if max_size is None:
+        max_size = min_size
+
     if image_mean is None:
         image_mean = [0.0, 0.0, 0.0]
     if image_std is None:
         image_std = [1.0, 1.0, 1.0]
+
+    # Resolve anchor sizes: prefer relative scales if provided
+    if anchor_relative_scales is not None:
+        anchor_sizes = _build_anchor_sizes(anchor_relative_scales, min_size, min_size)
+    elif anchor_sizes is None:
+        # Legacy default (224 inputs)
+        anchor_sizes = ((16, 32), (32, 64), (64, 96, 128))
+
+    anchors_per_level = [
+        len(size_level) * len(ratio_level)
+        for size_level, ratio_level in zip(anchor_sizes, aspect_ratios)
+    ]
+    if len(set(anchors_per_level)) != 1:
+        raise ValueError(
+            "torchvision RPNHead requires every FPN level to have the same "
+            f"number of anchors per location, got {anchors_per_level}. "
+            "Use equal-length anchor sizes/aspect ratios per level."
+        )
 
     anchor_generator = AnchorGenerator(
         sizes=anchor_sizes,

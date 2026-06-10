@@ -2,6 +2,7 @@ from typing import List
 import albumentations as A
 import cv2
 from albumentations.pytorch.transforms import ToTensorV2
+import torch_npu
 
 
 

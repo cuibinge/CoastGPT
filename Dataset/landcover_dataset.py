@@ -1,8 +1,8 @@
 """
 LandcoverSemanticDataset: PyTorch Dataset for partial-label semantic segmentation.
 
-Loads land cover tiles, merges spatial overlaps, rasterizes GeoJSON features
-to 224x224 target masks with ignore_index=255 for unlabeled pixels.
+Loads land cover tiles, merges per-class binary TIFs to multi-class target masks
+with ignore_index=255 for unlabeled pixels.
 
 Split by source image (derived from filename) to prevent spatial leakage.
 """
@@ -24,43 +24,12 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from Dataset.landcover_tile_grouping import (
+    extract_source_image_key,
     scan_landcover_directories,
     group_tiles_by_spatial_key,
     build_merged_samples,
 )
-from Dataset.rasterize_geojson import rasterize_features_to_target
 from Dataset.landcover_label_map import IGNORE_INDEX, BACKGROUND_ID, num_classes
-
-
-# ---------------------------------------------------------------------------
-# Helper: extract split key from image filename
-# ---------------------------------------------------------------------------
-
-
-def _extract_source_image_key(image_path: str) -> str:
-    """Derive a source-image split key from the image filename.
-
-    Example filename:
-      GF1/公路用地_GF1_PMS2_E119.6_N34.6_20251109_连云区_R071C040_128_True_CK.jpg
-
-    Returns key like: "GF1_PMS2_E119.6_N34.6_20251109_连云区"
-    which groups tiles from the same satellite acquisition.
-    """
-    stem = Path(image_path).stem
-    parts = stem.split("_")
-    # Find the GF1 sensor prefix and collect through the location part
-    sensor_idx = next((i for i, p in enumerate(parts) if p in ("GF1", "GF2", "GF6")), None)
-    if sensor_idx is None:
-        return stem  # fallback
-
-    # Collect: sensor_satellite_lon_lat_date_location
-    key_parts = []
-    for p in parts[sensor_idx:]:
-        if p.startswith("R") and p[1:].isdigit():
-            break  # stop at tile grid like R071C040
-        key_parts.append(p)
-
-    return "_".join(key_parts)
 
 
 # ---------------------------------------------------------------------------
@@ -74,16 +43,18 @@ class LandcoverSemanticDataset(torch.utils.data.Dataset):
     Each sample returns:
         image: Tensor[3, 224, 224] float32, range [0, 1]
         target: Tensor[224, 224] int64, with IGNORE_INDEX=255 for unlabeled pixels
-        meta: dict with georef, sample_id, known_classes, etc.
+        meta: dict with sample_id, known_classes, etc.
     """
 
     def __init__(
         self,
         merged_samples: List[dict],
         image_size: int = 224,
+        cache_dir: Optional[str] = None,
     ):
         self.image_size = image_size
         self.samples = merged_samples
+        self.cache_dir = Path(cache_dir) if cache_dir else None
 
         if not self.samples:
             warnings.warn("LandcoverSemanticDataset initialized with 0 samples")
@@ -95,11 +66,14 @@ class LandcoverSemanticDataset(torch.utils.data.Dataset):
         sample = self.samples[idx]
 
         image = self._load_image(sample["image_path"])
-        target, _conflicts = rasterize_features_to_target(
-            sample["features"],
-            tuple(sample["tile_bounds_wgs84"]),
-            (self.image_size, self.image_size),
-        )
+
+        sample_id = sample["sample_id"]
+        cache_path = self.cache_dir / f"{sample_id}.pt" if self.cache_dir else None
+        if cache_path and cache_path.exists():
+            target = torch.load(str(cache_path), map_location="cpu")["target"]
+            target = target.numpy() if isinstance(target, torch.Tensor) else target
+        else:
+            target = self._build_target_from_tifs(sample)
 
         georef = self._build_georef(sample)
 
@@ -108,10 +82,9 @@ class LandcoverSemanticDataset(torch.utils.data.Dataset):
             "image_path": sample["image_path"],
             "known_classes": sample["known_classes"],
             "train_ids": sample["train_ids"],
-            "tile_bounds_wgs84": sample["tile_bounds_wgs84"],
             "original_size": sample["original_size"],
             "model_input_size": [self.image_size, self.image_size],
-            "source_crs": "EPSG:4326",
+            "source_crs": georef["source_crs"],
             "model_transform": georef["model_transform"],
             "sensor": sample.get("sensor", "GF1"),
         }
@@ -123,6 +96,28 @@ class LandcoverSemanticDataset(torch.utils.data.Dataset):
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _build_target_from_tifs(self, sample: dict) -> np.ndarray:
+        """Load per-class binary TIFs, resize, and merge into multi-class target.
+
+        Each class TIF is a single-channel uint8 image (0/255).
+        Resize to model input size with nearest-neighbor to preserve label boundaries.
+        Assign train_id where TIF > 0.
+        Unlabeled pixels remain IGNORE_INDEX (255).
+        Overlapping pixels: last write wins.
+        """
+        H = W = self.image_size
+        target = np.full((H, W), IGNORE_INDEX, dtype=np.uint8)
+
+        for ct in sample["class_tifs"]:
+            tif = Image.open(ct["tif_path"])
+            if tif.size != (self.image_size, self.image_size):
+                tif = tif.resize((W, H), Image.NEAREST)
+            binary = np.array(tif, dtype=np.uint8)
+            mask = binary > 0
+            target[mask] = ct["train_id"]
+
+        return target
+
     def _load_image(self, image_path: str) -> torch.Tensor:
         """Load and preprocess image: resize to model input, normalize to [0,1]."""
         img = Image.open(image_path).convert("RGB")
@@ -131,13 +126,17 @@ class LandcoverSemanticDataset(torch.utils.data.Dataset):
         return torch.from_numpy(arr).permute(2, 0, 1)
 
     def _build_georef(self, sample: dict) -> dict:
-        """Build georef dict for coordinate conversion."""
+        """Build georef dict for coordinate conversion (GeoJSON export)."""
         from Dataset.rasterize_geojson import compute_model_transform_from_bounds
 
-        model_transform = compute_model_transform_from_bounds(
-            tuple(sample["tile_bounds_wgs84"]),
-            (self.image_size, self.image_size),
-        )
+        bounds = sample.get("tile_bounds_wgs84")
+        if bounds is not None:
+            model_transform = compute_model_transform_from_bounds(
+                tuple(bounds), (self.image_size, self.image_size)
+            )
+        else:
+            model_transform = None
+
         return {
             "source_crs": "EPSG:4326",
             "model_transform": model_transform,
@@ -158,7 +157,6 @@ class LandcoverSemanticDataset(torch.utils.data.Dataset):
             sz = f"{s['original_size'][0]}x{s['original_size'][1]}"
             by_size[sz] = by_size.get(sz, 0) + 1
 
-        # Count per-class occurrences
         class_counts: Dict[str, int] = {}
         for s in self.samples:
             for cls_name in s["known_classes"]:
@@ -206,10 +204,9 @@ def split_by_source_image(
     Returns:
         (train_samples, val_samples) lists.
     """
-    # Collect unique source image keys
     key_to_samples: Dict[str, List[dict]] = {}
     for s in merged_samples:
-        key = _extract_source_image_key(s["image_path"])
+        key = extract_source_image_key(s["image_path"])
         key_to_samples.setdefault(key, []).append(s)
 
     keys = sorted(key_to_samples.keys())
@@ -237,7 +234,7 @@ def split_by_source_image(
 
 
 if __name__ == "__main__":
-    print("Building land cover dataset...")
+    print("Building land cover dataset from binary TIFs...")
     print("  Scanning directories...")
     raw = scan_landcover_directories()
     print(f"  Scanned {len(raw)} raw samples")
@@ -281,7 +278,10 @@ if __name__ == "__main__":
     batch = landcover_collate_fn([train_ds[i] for i in range(4)])
     imgs, tgts, metas = batch
     print(f"    images: {imgs.shape}, targets: {tgts.shape}, metas: {len(metas)}")
-    assert imgs.shape == (4, 3, 224, 224)
-    assert tgts.shape == (4, 224, 224)
+    assert imgs.shape[0] == 4 and imgs.shape[1] == 3
+    assert imgs.shape[2] == imgs.shape[3]  # square
+    assert tgts.shape[0] == 4
+    assert tgts.shape[1] == imgs.shape[2]  # same spatial dims
+    assert tgts.shape[2] == imgs.shape[3]
 
     print("\nAll landcover_dataset checks passed.")

@@ -20,6 +20,7 @@ from . import (
     IGNORE_INDEX,
     IMAGE_TOKEN_INDEX,
 )
+import torch_npu
 
 logger = logging.getLogger("train")
 type_dict = {
@@ -77,6 +78,11 @@ class LanguageModel(nn.Module):
         self.tune_im_start = config.tune_im_start
         self.tune_im_patch = config.tune_im_patch
         self.num_query = config.rgb_vision.attn_pooler.num_query
+        self.max_position_embeddings = int(getattr(config.text, "max_position_embeddings", 2048))
+        # One <image> placeholder is expanded into the visual token sequence.
+        # Keep text token budget conservative so the final multimodal sequence
+        # stays within the LLM context window on NPU.
+        self.max_text_tokens = max(256, self.max_position_embeddings - max(1, self.num_query - 1))
 
         compute_dtype = type_dict[config.dtype]
         bnb_model_from_pretrained_args = {}
@@ -89,8 +95,17 @@ class LanguageModel(nn.Module):
         ):
             device = torch.device("cuda:" + os.environ["CUDA_VISABLE_DEVICES"])
         else:
-            device = torch.device("cuda")
-        if config.bits in [4, 8]:
+            device = torch.device("npu")
+        request_kbit = config.bits in [4, 8]
+        use_kbit = request_kbit and device.type == "cuda"
+        if request_kbit and not use_kbit:
+            logger.warning(
+                "Requested bits=%s quantization on device '%s'. "
+                "bitsandbytes k-bit path is CUDA-only here; fallback to non-kbit loading.",
+                config.bits,
+                device.type,
+            )
+        if use_kbit:
             from transformers import BitsAndBytesConfig
 
             bnb_model_from_pretrained_args.update(
@@ -110,9 +125,13 @@ class LanguageModel(nn.Module):
                 )
             )
         else:
-            bnb_model_from_pretrained_args.update(
-                dict(device_map={"": device}, torch_dtype=compute_dtype)
-            )
+            # `device_map` on non-CUDA backends can be fragile; load first, then rely on outer `.to(device)`.
+            if device.type == "cuda":
+                bnb_model_from_pretrained_args.update(
+                    dict(device_map={"": device}, torch_dtype=compute_dtype)
+                )
+            else:
+                bnb_model_from_pretrained_args.update(dict(torch_dtype=compute_dtype))
 
         self.text_encoder = CustomLlamaForCausalLM.from_pretrained(
             config.text.path, **bnb_model_from_pretrained_args
@@ -120,7 +139,7 @@ class LanguageModel(nn.Module):
 
         self.tokenizer = self.init_tokenizer(config.text.path)
 
-        if config.bits in [4, 8]:
+        if use_kbit:
             from peft import prepare_model_for_kbit_training
 
             self.text_encoder.config.torch_dtype = (
@@ -165,7 +184,7 @@ class LanguageModel(nn.Module):
                     make_inputs_require_grad
                 )
 
-        if config.bits in [4, 8]:
+        if use_kbit:
             from peft.tuners.lora import LoraLayer
 
             for name, module in self.text_encoder.named_modules():
@@ -197,6 +216,7 @@ class LanguageModel(nn.Module):
 
         tokenizer = LlamaTokenizerFast.from_pretrained(tokenizer_name)
         tokenizer.pad_token_id = tokenizer.unk_token_id
+        tokenizer.model_max_length = int(self.max_text_tokens)
 
         if self.tune_im_patch:
             tokenizer.add_tokens([DEFAULT_IMAGE_PATCH_TOKEN], special_tokens=True)
@@ -264,8 +284,6 @@ class LanguageModel(nn.Module):
         attention_mask: Optional[Union[torch.Tensor, None]] = None,
         labels: torch.Tensor = None,
     ) -> Tuple[torch.Tensor]:
-        #    cl_loss_func: Callable = None,
-        #    cl_logit_scale: torch.Tensor = None) -> Tuple[torch.Tensor]:
         (
             input_ids,
             attention_mask,
@@ -279,6 +297,25 @@ class LanguageModel(nn.Module):
             image_embedding=image_embedding if image_embedding is not None else None,
             past_key_values=None,
         )
+        # Sanitize embeddings to avoid NaNs/Infs propagating into logits
+        if inputs_embeds is not None:
+            inputs_embeds = torch.nan_to_num(inputs_embeds)
+
+        # If all labels are IGNORE_INDEX, some backends can return NaN loss.
+        # Guard by short-circuiting to zero loss in that case.
+        valid_label_count = None
+        if labels is not None:
+            try:
+                valid_label_count = torch.count_nonzero(labels.ne(IGNORE_INDEX)).item()
+            except Exception:
+                # Fallback in case labels dtype/device cause issues
+                valid_label_count = int((labels != IGNORE_INDEX).sum().item())
+
+        if labels is not None and valid_label_count == 0:
+            logger.warning("All labels are IGNORE_INDEX for current batch; returning zero loss to avoid NaN.")
+            # Return a zero scalar loss tensor on the correct device/dtype
+            zero_loss = torch.zeros((), device=input_ids.device if input_ids is not None else inputs_embeds.device, dtype=torch.float32)
+            return zero_loss
 
         outputs = self.text_encoder(
             input_ids=input_ids,
@@ -286,7 +323,6 @@ class LanguageModel(nn.Module):
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             labels=labels,
-            output_hidden_states=True,
             use_cache=False,
             return_dict=True,
         )
@@ -302,7 +338,7 @@ class LanguageModel(nn.Module):
         **kwargs,
     ):
         modal_input = self.get_modal_input(x)
-        return self.decode(**self.encode(modal_input), image_embedding=multimodal_embedding, **kwargs)
+        return self.decode(**modal_input, image_embedding=multimodal_embedding, **kwargs)
 
 
     def prepare_inputs_for_multimodal(
@@ -313,6 +349,8 @@ class LanguageModel(nn.Module):
         past_key_values: Optional[Union[List[torch.Tensor], None]] = None,
         image_embedding: Optional[Union[torch.Tensor, None]] = None,
     ):
+        max_total_len = int(self.max_position_embeddings)
+
         if image_embedding is None or input_ids.shape[1] == 1:
             if (
                 past_key_values is not None
@@ -328,7 +366,6 @@ class LanguageModel(nn.Module):
 
         new_input_embeds = []
         new_labels = [] if labels is not None else None
-        cur_image_idx = 0
         for batch_idx, cur_input_ids in enumerate(input_ids):
             if (cur_input_ids == IMAGE_TOKEN_INDEX).sum() == 0:
                 # multimodal LLM, but the current sample is not multimodal
@@ -347,7 +384,6 @@ class LanguageModel(nn.Module):
                 new_input_embeds.append(cur_input_embeds)
                 if labels is not None:
                     new_labels.append(labels[batch_idx])
-                cur_image_idx += 1
                 continue
             image_token_indices = torch.where(cur_input_ids == IMAGE_TOKEN_INDEX)[
                 0
@@ -358,9 +394,13 @@ class LanguageModel(nn.Module):
                 cur_new_labels = []
                 assert cur_labels.shape == cur_input_ids.shape
             while image_token_indices.numel() > 0:
-                cur_image_features = image_embedding[
-                    cur_image_idx
-                ]  # cur_image_idx: batch idx
+                if batch_idx >= image_embedding.shape[0]:
+                    raise IndexError(
+                        f"batch_idx={batch_idx} out of bounds for image_embedding with size={image_embedding.shape[0]}"
+                    )
+                # One sample corresponds to one image feature tensor.
+                # If multiple <image> tokens appear in one sample, reuse the same feature.
+                cur_image_features = image_embedding[batch_idx]
                 image_token_start = image_token_indices[0]  # image index (-200)
                 if getattr(self, "tune_pooler", False) and getattr(
                     self, "tune_im_start", False
@@ -415,7 +455,6 @@ class LanguageModel(nn.Module):
                             )
                         )
                         cur_labels = cur_labels[image_token_start + 1 :]
-                cur_image_idx += 1
                 if getattr(self, "tune_pooler", False) and getattr(
                     self, "tune_im_start", False
                 ):
@@ -535,6 +574,13 @@ class LanguageModel(nn.Module):
                 )
                 assert attention_mask.shape == new_input_embeds.shape[:2]
 
+        if new_input_embeds.shape[1] > max_total_len:
+            new_input_embeds = new_input_embeds[:, :max_total_len, :]
+            if labels is not None and new_labels is not None:
+                new_labels = new_labels[:, :max_total_len]
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, :max_total_len]
+
         return None, attention_mask, past_key_values, new_input_embeds, new_labels
 
     def generate(
@@ -553,6 +599,37 @@ class LanguageModel(nn.Module):
         attention_mask=None,
         **kwargs,
     ):
+        def _sanitize_inputs_embeds(tensor: Optional[torch.Tensor], tag: str) -> Optional[torch.Tensor]:
+            if tensor is None or (not torch.is_tensor(tensor)) or (not tensor.is_floating_point()):
+                return tensor
+            finite_mask = torch.isfinite(tensor)
+            if not bool(finite_mask.all()):
+                bad_count = int((~finite_mask).sum().item())
+                warn_key = f"_warned_{tag}_nonfinite"
+                if not getattr(self, warn_key, False):
+                    logger.warning(
+                        "%s contains %d non-finite values; apply nan_to_num fallback for generation.",
+                        tag,
+                        bad_count,
+                    )
+                    setattr(self, warn_key, True)
+                tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1e4, neginf=-1e4)
+            try:
+                max_abs = float(tensor.detach().abs().max().item())
+            except Exception:
+                max_abs = 0.0
+            if max_abs > 1e4:
+                warn_key = f"_warned_{tag}_clamp"
+                if not getattr(self, warn_key, False):
+                    logger.warning(
+                        "%s has extreme magnitude max|x|=%.4e; clamp to [-1e4, 1e4] before generation.",
+                        tag,
+                        max_abs,
+                    )
+                    setattr(self, warn_key, True)
+                tensor = torch.clamp(tensor, min=-1e4, max=1e4)
+            return tensor
+
         conv = conversation_lib.default_conversation.copy()
 
         if input_ids is None:
@@ -590,7 +667,10 @@ class LanguageModel(nn.Module):
                     labels=None,
                     image_embedding=image_embedding,
                 )
-                outputs = self.text_encoder.generate(inputs_embeds=input_ids[1])
+                # legacy branch: tuple layout is
+                # (input_ids, attention_mask, past_key_values, inputs_embeds, labels)
+                safe_embeds = _sanitize_inputs_embeds(input_ids[3], "inputs_embeds_legacy")
+                outputs = self.text_encoder.generate(inputs_embeds=safe_embeds)
                 outputs = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
                 return outputs
@@ -608,6 +688,7 @@ class LanguageModel(nn.Module):
                 image_embedding=image_embedding,
                 past_key_values=None,
             )
+            inputs_embeds = _sanitize_inputs_embeds(inputs_embeds, "inputs_embeds")
             if input_ids is None:
                 outputs = self.text_encoder.generate(
                     inputs_embeds=inputs_embeds,
@@ -642,7 +723,18 @@ class LanguageModel(nn.Module):
 def tokenizer_image_token(
     prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors=None
 ):
-    prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split("<image>")]
+    max_len = getattr(tokenizer, "model_max_length", None)
+    use_truncation = isinstance(max_len, int) and 0 < max_len < 10**6
+    tokenize_kwargs = {}
+    if use_truncation:
+        tokenize_kwargs.update(
+            dict(
+                truncation=True,
+                max_length=int(max_len),
+                verbose=False,
+            )
+        )
+    prompt_chunks = [tokenizer(chunk, **tokenize_kwargs).input_ids for chunk in prompt.split("<image>")]
 
     def insert_separator(X, sep):
         return [ele for sublist in zip(X, [sep] * len(X)) for ele in sublist][:-1]
@@ -659,6 +751,9 @@ def tokenizer_image_token(
 
     for x in insert_separator(prompt_chunks, [image_token_index] * (offset + 1)):
         input_ids.extend(x[offset:])
+
+    if isinstance(max_len, int) and 0 < max_len < 10**6 and len(input_ids) > max_len:
+        input_ids = input_ids[:max_len]
 
     if return_tensors is not None:
         if return_tensors == "pt":

@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+import torch_npu
 
 MAX_VALUES_BY_DTYPE = {
     np.dtype("uint8"): 255,

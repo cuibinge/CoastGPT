@@ -30,7 +30,7 @@ from Dataset.landcover_label_map import IGNORE_INDEX, BACKGROUND_ID, dlmc_to_tra
 
 def compute_model_transform_from_bounds(
     tile_bounds_wgs84: Tuple[float, float, float, float],
-    model_size: Tuple[int, int] = (224, 224),
+    model_size: Optional[Tuple[int, int]] = None,
 ) -> List[float]:
     """Compute a GDAL-order affine transform from tile bounds.
 
@@ -41,11 +41,13 @@ def compute_model_transform_from_bounds(
 
     Args:
         tile_bounds_wgs84: (min_lon, min_lat, max_lon, max_lat).
-        model_size: (width, height) of model input.
+        model_size: (width, height) of model input. Defaults to (224, 224).
 
     Returns:
         GDAL affine [a, b, c, d, e, f] = [px_w, 0, min_lon, 0, -px_h, max_lat].
     """
+    if model_size is None:
+        model_size = (224, 224)
     min_lon, min_lat, max_lon, max_lat = tile_bounds_wgs84
     px_w = (max_lon - min_lon) / model_size[0]
     px_h = (max_lat - min_lat) / model_size[1]
@@ -55,7 +57,7 @@ def compute_model_transform_from_bounds(
 def rasterize_features_to_target(
     features: List[dict],
     tile_bounds_wgs84: Tuple[float, float, float, float],
-    target_size: Tuple[int, int] = (224, 224),
+    target_size: Optional[Tuple[int, int]] = None,
 ) -> Tuple[np.ndarray, List[str]]:
     """Rasterize a list of GeoJSON features to a partial-label target mask.
 
@@ -64,13 +66,15 @@ def rasterize_features_to_target(
             ``geometry`` (Polygon or MultiPolygon in WGS84) and
             ``properties.DLMC`` (class name string).
         tile_bounds_wgs84: (min_lon, min_lat, max_lon, max_lat).
-        target_size: (width, height) output mask dimensions.
+        target_size: (width, height) output mask dimensions. Defaults to (224, 224).
 
     Returns:
         target: np.ndarray[uint8] of shape (H, W). Values:
             0 = background, 1-24 = active class, 255 = ignore.
         conflicts: List of conflict descriptions (same pixel, different classes).
     """
+    if target_size is None:
+        target_size = (224, 224)
     model_transform = compute_model_transform_from_bounds(
         tile_bounds_wgs84, target_size
     )

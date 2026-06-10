@@ -51,8 +51,15 @@ def get_pretrain_param_groups(model, skip_list=(), skip_keywords=()):
         else:
             has_decay.append(param)
             has_decay_name.append(name)
-    # 返回参数分组列表，包含需要权重衰减和不需要权重衰减的参数组
-    return [{"params": has_decay}, {"params": no_decay, "weight_decay": 0.0}]
+    # 过滤空参数组，避免 DeepSpeed 在空组上计算梯度范数时报 dtype 异常
+    param_groups = []
+    if len(has_decay) > 0:
+        param_groups.append({"params": has_decay})
+    if len(no_decay) > 0:
+        param_groups.append({"params": no_decay, "weight_decay": 0.0})
+    if len(param_groups) == 0:
+        raise RuntimeError("No trainable parameters found for pretrain optimizer.")
+    return param_groups
 
 # 设置模型参数的权重衰减，区分需要权重衰减和不需要权重衰减的参数
 def set_weight_decay(model, skip_list=(), skip_keywords=()):
@@ -82,8 +89,15 @@ def set_weight_decay(model, skip_list=(), skip_keywords=()):
             logger.info(f"{name} has no weight decay")
         else:
             has_decay.append(param)
-    # 返回参数分组列表，包含需要权重衰减和不需要权重衰减的参数组
-    return [{"params": has_decay}, {"params": no_decay, "weight_decay": 0.0}]
+    # 过滤空参数组，避免下游优化器/ZeRO 在空组上出现异常
+    param_groups = []
+    if len(has_decay) > 0:
+        param_groups.append({"params": has_decay})
+    if len(no_decay) > 0:
+        param_groups.append({"params": no_decay, "weight_decay": 0.0})
+    if len(param_groups) == 0:
+        raise RuntimeError("No trainable parameters found for optimizer.")
+    return param_groups
 
 # 根据是否为预训练阶段获取模型的参数分组
 def get_param_group(model: nn.Module, is_pretrain: bool = True):

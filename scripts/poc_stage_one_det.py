@@ -37,6 +37,13 @@ from Models.det_head import (
     build_aqua_maskrcnn,
 )
 from Models.dual_vision_encoder import DualVisionEncoder
+from Trainer.utils.distribute import (
+    init_distributed,
+    is_main_process,
+    get_rank,
+    get_world_size,
+)
+from torch.utils.data.distributed import DistributedSampler
 from utils.geojson_builder import outputs_to_geojson, validate_geojson
 from utils.vis_overlay import save_overlay_grid
 
@@ -185,29 +192,31 @@ def smoke_test_npu_ops(device: torch.device) -> None:
     assert pooled.shape == (1, 256, 7, 7), f"Unexpected roi_align shape: {pooled.shape}"
     print("  roi_align: OK")
 
-    # MultiScaleRoIAlign
+    # MultiScaleRoIAlign expects List[Tensor[N,4]] (xyxy, no batch_idx)
     msroi = torchvision.ops.MultiScaleRoIAlign(
         featmap_names=["0"], output_size=7, sampling_ratio=2
     ).to(device)
-    pooled = msroi(OrderedDict([("0", feat)]), rois, [(14, 14)])
+    boxes_list = [rois[:, 1:]]  # strip batch index, wrap per image
+    pooled = msroi(OrderedDict([("0", feat)]), boxes_list, [(14, 14)])
     print("  MultiScaleRoIAlign: OK")
 
     print("All torchvision ops OK on", device)
 
 
-def smoke_test_maskrcnn(model: nn.Module, device: torch.device) -> None:
+def smoke_test_maskrcnn(model: nn.Module, device: torch.device, image_size: int = 224) -> None:
     """Full forward/backward smoke test with a synthetic image and one instance."""
-    print("Smoke-testing Mask R-CNN forward/backward...")
+    print(f"Smoke-testing Mask R-CNN forward/backward (size={image_size})...")
     model.train()
 
-    image = torch.randn(3, 224, 224, device=device)
-    target_mask = torch.zeros(1, 224, 224, dtype=torch.uint8, device=device)
-    target_mask[0, 50:150, 50:150] = 1
+    S = image_size
+    image = torch.randn(3, S, S, device=device)
+    target_mask = torch.zeros(1, S, S, dtype=torch.uint8, device=device)
+    target_mask[0, S//5:3*S//5, S//5:3*S//5] = 1
 
     images = [image]
     targets = [
         {
-            "boxes": torch.tensor([[50, 50, 150, 150]], dtype=torch.float32, device=device),
+            "boxes": torch.tensor([[S//5, S//5, 3*S//5, 3*S//5]], dtype=torch.float32, device=device),
             "labels": torch.tensor([1], dtype=torch.int64, device=device),
             "masks": target_mask,
             "image_id": torch.tensor([0], dtype=torch.int64, device=device),
@@ -294,6 +303,7 @@ def train_epoch(
     epoch: int,
     log_interval: int = 10,
     max_grad_norm: float = 1.0,
+    is_main: bool = True,
 ) -> float:
     """Run a single training epoch.
 
@@ -326,7 +336,7 @@ def train_epoch(
         total_loss_sum += total_loss.item()
         total_steps += 1
 
-        if (batch_idx + 1) % log_interval == 0:
+        if is_main and (batch_idx + 1) % log_interval == 0:
             avg_loss = total_loss_sum / total_steps
             loss_str = "  ".join(
                 f"{k}: {v.item():.3f}" for k, v in loss_dict.items()
@@ -337,7 +347,8 @@ def train_epoch(
             )
 
     avg_loss = total_loss_sum / max(total_steps, 1)
-    print(f"Epoch {epoch:3d} complete | Avg Loss: {avg_loss:.4f}")
+    if is_main:
+        print(f"Epoch {epoch:3d} complete | Avg Loss: {avg_loss:.4f}")
     return avg_loss
 
 
@@ -356,7 +367,8 @@ def validate(
     score_thresh: float = 0.5,
     mask_thresh: float = 0.5,
     min_area_px: float = 8.0,
-    max_batches: int = 3,
+    max_batches: int = 0,
+    is_main: bool = True,
 ) -> dict:
     """Run validation: inference, GeoJSON export, overlay generation.
 
@@ -386,7 +398,7 @@ def validate(
     num_batches_processed = 0
 
     for batch_idx, (images, targets, metas) in enumerate(dataloader):
-        if batch_idx >= max_batches:
+        if max_batches > 0 and batch_idx >= max_batches:
             break
 
         images_device = [img.to(device) for img in images]
@@ -466,11 +478,12 @@ def validate(
         "val_output_dir": str(val_output_dir),
     }
 
-    print(
-        f"Validation epoch {epoch}: "
-        f"GT boxes={total_gt_boxes}, Pred boxes={total_pred_boxes}, "
-        f"Batches={num_batches_processed}, GeoJSONs={len(all_geojson_paths)}"
-    )
+    if is_main:
+        print(
+            f"Validation epoch {epoch}: "
+            f"GT boxes={total_gt_boxes}, Pred boxes={total_pred_boxes}, "
+            f"Batches={num_batches_processed}, GeoJSONs={len(all_geojson_paths)}"
+        )
     return stats
 
 
@@ -495,10 +508,14 @@ def main():
     )
     args = parser.parse_args()
 
+    # ---- DDP init ----
+    rank, local_rank, world_size = init_distributed(accelerator=args.device)
+    distributed = world_size > 1
+
     # ---- Load config ----
     cfg = load_config(args.config)
-    device = resolve_device(args.device)
-    print(f"Using device: {device}")
+    device = torch.device(f"{args.device}:{local_rank}" if args.device in ("npu", "cuda") else args.device)
+    print(f"Using device: {device}, rank={rank}/{world_size}")
 
     output_dir = Path(cfg["experiment"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -532,12 +549,21 @@ def main():
     adapter = DualVisionFPNBackboneAdapter(vision, fpn).to(device)
 
     mrcnn_cfg = cfg["model"]["mask_rcnn"]
+    anchors_cfg = cfg["model"]["anchors"]
+    anchor_sizes = None
+    anchor_relative_scales = None
+    if anchors_cfg.get("mode") == "relative":
+        anchor_relative_scales = tuple(tuple(s) for s in anchors_cfg["scales"])
+    else:
+        anchor_sizes = tuple(tuple(s) for s in anchors_cfg["sizes"])
+
     model = build_aqua_maskrcnn(
         adapter,
         num_classes=mrcnn_cfg["num_classes"],
-        anchor_sizes=tuple(tuple(s) for s in cfg["model"]["anchors"]["sizes"]),
+        anchor_relative_scales=anchor_relative_scales,
+        anchor_sizes=anchor_sizes,
         aspect_ratios=tuple(
-            tuple(a) for a in cfg["model"]["anchors"]["aspect_ratios"]
+            tuple(a) for a in anchors_cfg["aspect_ratios"]
         ),
         rpn_pre_nms_top_n_train=mrcnn_cfg.get("rpn_pre_nms_top_n_train", 512),
         rpn_post_nms_top_n_train=mrcnn_cfg.get("rpn_post_nms_top_n_train", 128),
@@ -553,19 +579,27 @@ def main():
         max_size=mrcnn_cfg.get("max_size", 224),
     ).to(device)
 
+    if distributed:
+        model = nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank], find_unused_parameters=True
+        )
+        _base_model = model.module
+    else:
+        _base_model = model
+
     fpn_params = sum(p.numel() for p in fpn.parameters())
-    maskrcnn_params = sum(
-        p.numel() for p in model.parameters()
-    ) - fpn_params - sum(p.numel() for p in vision.parameters())
-    print(
-        f"FPN params: {fpn_params:,}  |  "
-        f"Mask R-CNN head params: {maskrcnn_params:,}"
-    )
+    maskrcnn_params = sum(p.numel() for p in _base_model.parameters()) - fpn_params
+    if is_main_process():
+        print(
+            f"FPN params: {fpn_params:,}  |  "
+            f"Mask R-CNN head params: {maskrcnn_params:,}"
+        )
 
     # ---- Step 3: Smoke tests ----
     print("\n--- Step 3: Running smoke tests ---")
     smoke_test_npu_ops(device)
-    smoke_test_maskrcnn(model, device)
+    smoke_size = int(mrcnn_cfg.get("min_size") or cfg["data"].get("image_size", 224) or 224)
+    smoke_test_maskrcnn(model, device, smoke_size)
 
     # ---- Step 4: Datasets ----
     print("\n--- Step 4: Loading datasets ---")
@@ -597,10 +631,12 @@ def main():
     print(f"  Train samples: {len(train_ds)}")
     print(f"  Val samples:   {len(val_ds)}")
 
+    train_sampler = DistributedSampler(train_ds, shuffle=True) if distributed else None
     train_loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=cfg["train"]["batch_size"],
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=data_cfg.get("num_workers", 2),
         collate_fn=poc_collate_fn,
         drop_last=True,
@@ -626,39 +662,129 @@ def main():
 
     # ---- Step 6: Training loop ----
     num_epochs = cfg["train"]["epochs"]
-    print(f"\n{'='*60}")
-    print(f"Starting training: {num_epochs} epochs")
-    print(f"Batch size: {cfg['train']['batch_size']}, Device: {device}")
-    print(f"Output directory: {output_dir}")
-    print(f"{'='*60}\n")
 
-    for epoch in range(1, num_epochs + 1):
-        train_loss = train_epoch(
-            model,
-            train_loader,
-            optimizer,
-            device,
-            epoch,
-            log_interval=cfg["train"].get("log_interval", 10),
-            max_grad_norm=cfg["train"].get("max_grad_norm", 1.0),
+    # Check for multi-size mode
+    multi_size_cfg = cfg.get("multi_size", None)
+    if multi_size_cfg and multi_size_cfg.get("enabled", False):
+        _train_multisize(cfg, model, device, output_dir, num_epochs,
+                         vision, fpn, adapter, distributed, optimizer)
+    else:
+        _train_single_size(model, train_loader, val_loader, train_sampler,
+                           optimizer, device, output_dir, num_epochs, cfg,
+                           distributed, fpn)
+
+
+def _run_epoch(model, train_loader, val_loader, optimizer, device,
+               output_dir, epoch, cfg, distributed, prefix=""):
+    """Run one epoch: train + optional validation."""
+    train_loss = train_epoch(
+        model, train_loader, optimizer, device, epoch,
+        log_interval=cfg["train"].get("log_interval", 10),
+        max_grad_norm=cfg["train"].get("max_grad_norm", 1.0),
+        is_main=is_main_process(),
+    )
+    if epoch == 1 or epoch % cfg["train"].get("val_interval", 1) == 0:
+        validate(
+            model, val_loader, device, str(output_dir), epoch,
+            score_thresh=cfg.get("eval", {}).get("score_thresh", 0.5),
+            mask_thresh=cfg.get("eval", {}).get("mask_thresh", 0.5),
+            min_area_px=cfg.get("eval", {}).get("min_area_px", 8.0),
+            is_main=is_main_process(),
         )
 
-        if epoch % cfg["train"].get("val_interval", 1) == 0:
-            val_stats = validate(
-                model,
-                val_loader,
-                device,
-                str(output_dir),
-                epoch,
-                score_thresh=cfg.get("eval", {}).get("score_thresh", 0.5),
-                mask_thresh=cfg.get("eval", {}).get("mask_thresh", 0.5),
-                min_area_px=cfg.get("eval", {}).get("min_area_px", 8.0),
+
+def _train_single_size(model, train_loader, val_loader, train_sampler,
+                       optimizer, device, output_dir, num_epochs, cfg,
+                       distributed, fpn):
+    """Standard single-resolution training loop."""
+    if is_main_process():
+        print(f"\n{'='*60}")
+        print(f"Starting single-size training: {num_epochs} epochs")
+        print(f"Output directory: {output_dir}")
+        print(f"{'='*60}\n")
+
+    for epoch in range(1, num_epochs + 1):
+        if distributed and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        _run_epoch(model, train_loader, val_loader, optimizer, device,
+                   output_dir, epoch, cfg, distributed)
+        if is_main_process() and epoch % cfg["train"].get("save_interval", 1) == 0:
+            _model = model.module if distributed else model
+            save_checkpoint(fpn, _model, optimizer, epoch, str(output_dir))
+
+    if is_main_process():
+        print(f"\nTraining complete. Outputs in {output_dir}")
+
+
+def _train_multisize(cfg, model, device, output_dir, num_epochs,
+                     vision, fpn, adapter, distributed, optimizer):
+    """Multi-size training: alternates epochs between size groups."""
+    data_cfg = cfg["data"]
+    ms_cfg = cfg["multi_size"]
+    sizes_cfg = ms_cfg["sizes"]
+
+    loaders = []
+    for sc in sizes_cfg:
+        train_ds = AquaPoCDataset(
+            manifest_path=str(_REPO_ROOT / sc["train_manifest"]),
+            data_root=data_cfg.get("data_root", "/home/ma-user/work/GeoJsonData"),
+            image_size=sc["image_size"],
+        )
+        val_ds = AquaPoCDataset(
+            manifest_path=str(_REPO_ROOT / sc["val_manifest"]),
+            data_root=data_cfg.get("data_root", "/home/ma-user/work/GeoJsonData"),
+            image_size=sc["image_size"],
+        )
+        train_sampler = DistributedSampler(train_ds, shuffle=True) if distributed else None
+        train_loader = torch.utils.data.DataLoader(
+            train_ds, batch_size=cfg["train"]["batch_size"],
+            shuffle=(train_sampler is None), sampler=train_sampler,
+            num_workers=data_cfg.get("num_workers", 2),
+            collate_fn=poc_collate_fn, drop_last=True,
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_ds, batch_size=cfg["train"]["batch_size"],
+            shuffle=False, num_workers=data_cfg.get("num_workers", 2),
+            collate_fn=poc_collate_fn,
+        )
+        loaders.append((sc["name"], sc["image_size"], sc["min_size"],
+                        sc.get("anchors"), train_sampler, train_loader, val_loader))
+        if is_main_process():
+            print(f"  [{sc['name']}] {len(train_ds)} train, {len(val_ds)} val, size={sc['image_size']}")
+
+    if is_main_process():
+        print(f"\n{'='*60}")
+        print(f"Starting multi-size training: {num_epochs} epochs, {len(sizes_cfg)} groups")
+        print(f"Output directory: {output_dir}")
+        print(f"{'='*60}\n")
+
+    for epoch in range(1, num_epochs + 1):
+        gi = (epoch - 1) % len(loaders)
+        name, img_sz, min_sz, anchor_sizes, train_sampler, train_loader, val_loader = loaders[gi]
+
+        _base_model = model.module if distributed else model
+        _base_model.transform.min_size = [min_sz]
+        _base_model.transform.max_size = min_sz
+        if anchor_sizes is not None:
+            from torchvision.models.detection.anchor_utils import AnchorGenerator
+            ratios = ((0.5, 1.0, 2.0, 3.0),) * len(anchor_sizes)
+            _base_model.rpn.anchor_generator = AnchorGenerator(
+                sizes=tuple(tuple(s) for s in anchor_sizes),
+                aspect_ratios=ratios,
             )
 
-        if epoch % cfg["train"].get("save_interval", 1) == 0:
-            save_checkpoint(fpn, model, optimizer, epoch, str(output_dir))
+        if distributed and train_sampler is not None:
+            train_sampler.set_epoch(epoch // len(loaders))
 
-    print(f"\nTraining complete. Outputs in {output_dir}")
+        _run_epoch(model, train_loader, val_loader, optimizer, device,
+                   output_dir, epoch, cfg, distributed, prefix=f"[{name}] ")
+
+        if is_main_process() and epoch % cfg["train"].get("save_interval", 1) == 0:
+            _model = model.module if distributed else model
+            save_checkpoint(fpn, _model, optimizer, epoch, str(output_dir))
+
+    if is_main_process():
+        print(f"\nTraining complete. Outputs in {output_dir}")
 
 
 if __name__ == "__main__":

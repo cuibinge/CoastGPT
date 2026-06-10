@@ -4,6 +4,11 @@ from timm.data import create_transform
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from torchvision import transforms
 from transformers import CLIPImageProcessor
+# 在不支持 NPU 的环境下忽略 torch_npu 导入错误
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    pass
 
 # 定义四通道数据的均值和标准差
 IMAGENET_FOUR_CHANNEL_DEFAULT_MEAN = IMAGENET_DEFAULT_MEAN + (0.5,)
@@ -32,8 +37,10 @@ def build_cls_transform(config, is_train=True, num_channels=3):
         raise ValueError(f"Unsupported number of channels: {num_channels}")
 
     if is_train:
+        input_size = getattr(config.transform, 'default_input_size', None) \
+                  or getattr(config.transform, 'input_size', [224, 224])
         transform = create_transform(
-            input_size=config.transform.input_size,
+            input_size=input_size,
             is_training=True,
             color_jitter=config.color_jitter,
             auto_augment=config.aa,
@@ -47,14 +54,19 @@ def build_cls_transform(config, is_train=True, num_channels=3):
         return transform
 
     t = []
-    crop_pct = 224 / 256
-    size = int(config.transform.input_size[0] / crop_pct)
-    t.append(
-        transforms.Resize(
-            size, interpolation=PIL.Image.BICUBIC
-        ),  # to maintain same ratio w.r.t. 224 images
-    )
-    t.append(transforms.CenterCrop(config.transform.input_size))
+    input_size = getattr(config.transform, 'default_input_size', None) \
+              or getattr(config.transform, 'input_size', [224, 224])
+
+    crop_pct = getattr(config.transform, 'crop_pct', None)
+    if crop_pct is not None:
+        resize_size = int(input_size[0] / crop_pct)
+    else:
+        resize_size = input_size[0]
+
+    t.append(transforms.Resize(resize_size, interpolation=PIL.Image.BICUBIC))
+
+    if crop_pct is not None:
+        t.append(transforms.CenterCrop(input_size))
 
     t.append(transforms.ToTensor())
     t.append(transforms.Normalize(mean, std))
@@ -86,9 +98,11 @@ def build_vlp_transform(config: ml_collections.ConfigDict, is_train: bool = True
         raise ValueError(f"Unsupported number of channels: {num_channels}")
 
     if is_train:
+        input_size = getattr(config.transform, 'default_input_size', None) \
+                  or getattr(config.transform, 'input_size', [224, 224])
         transform = create_transform(
             is_training=True,
-            input_size=config.transform.input_size,
+            input_size=input_size,
             auto_augment=config.transform.rand_aug,
             interpolation="bicubic",
             mean=mean,
@@ -97,14 +111,19 @@ def build_vlp_transform(config: ml_collections.ConfigDict, is_train: bool = True
         return transform
 
     t = []
-    crop_pct = 224 / 256
-    size = int(config.transform.input_size[0] / crop_pct)
-    t.append(
-        transforms.Resize(
-            size, interpolation=PIL.Image.BICUBIC
-        ),  # to maintain same ratio w.r.t. 224 images
-    )
-    t.append(transforms.CenterCrop(config.transform.input_size))
+    input_size = getattr(config.transform, 'default_input_size', None) \
+              or getattr(config.transform, 'input_size', [224, 224])
+
+    crop_pct = getattr(config.transform, 'crop_pct', None)
+    if crop_pct is not None:
+        resize_size = int(input_size[0] / crop_pct)
+    else:
+        resize_size = input_size[0]
+
+    t.append(transforms.Resize(resize_size, interpolation=PIL.Image.BICUBIC))
+
+    if crop_pct is not None:
+        t.append(transforms.CenterCrop(input_size))
 
     t.append(transforms.ToTensor())
     t.append(transforms.Normalize(mean, std))

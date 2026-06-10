@@ -21,15 +21,21 @@ logger = logging.getLogger("train")
 
 # 定义基于轮次（epoch）的训练器类，继承自 Trainer 类
 class EpochBasedTrainer(Trainer):
-    def __init__(self, max_epochs: int, **kwargs):
+    def __init__(self, max_epochs: int, max_iters_override: int = None, **kwargs):
         """
         Args:
             max_epochs (int): 总的训练轮次。
+            max_iters_override (int, optional): 若设置，则训练在达到该迭代数后提前结束。
         """
         # 调用父类的构造函数
         super().__init__(**kwargs)
         # 存储总的训练轮次
         self.max_epochs = max_epochs
+        self.max_iters_override = (
+            int(max_iters_override)
+            if max_iters_override is not None and int(max_iters_override) > 0
+            else None
+        )
 
         # 当前训练轮次，初始化为 0
         self.epoch = 0
@@ -58,7 +64,10 @@ class EpochBasedTrainer(Trainer):
     # 总的迭代次数的属性
     @property
     def max_iters(self) -> int:
-        return self.max_epochs * self.epoch_len
+        base_iters = self.max_epochs * self.epoch_len
+        if self.max_iters_override is None:
+            return base_iters
+        return min(base_iters, self.max_iters_override)
 
     # 当前的迭代次数的属性
     @property
@@ -122,6 +131,8 @@ class EpochBasedTrainer(Trainer):
         self.model.train()
         # 遍历当前轮次内的迭代次数
         for self.inner_iter in range(self.inner_iter, self.epoch_len):
+            if self.max_iters_override is not None and self.cur_iter >= self.max_iters_override:
+                break
         # for self.inner_iter in range(0, 10):
             # 调用 'before_iter' 钩子函数
             self._call_hooks("before_iter")
@@ -136,6 +147,16 @@ class EpochBasedTrainer(Trainer):
             self._call_hooks("after_iter")
         # 重新初始化数据迭代器
         self._data_iter = iter(self.data_loader)
+        # 复位 inner_iter，否则下一个 epoch 的 range(inner_iter, epoch_len)
+        # 只剩 1 步，导致 epoch 1+ 每轮只跑 1 个 iter（典型状态残留 bug）
+        self.inner_iter = 0
+        # 让 DistributedSampler 在每个 epoch 真的换 shuffle order
+        sampler = getattr(self.data_loader, "sampler", None)
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            try:
+                sampler.set_epoch(self.epoch + 1)
+            except Exception:
+                pass
 
     # 子类训练的方法
     def sub_classes_train(self):
@@ -143,8 +164,12 @@ class EpochBasedTrainer(Trainer):
         logger.info(
             f"Start training from epoch {self.start_epoch} to {self.max_epochs}."
         )
+        if self.max_iters_override is not None:
+            logger.info(f"Early-stop by max_iters_override={self.max_iters_override}.")
         # 遍历从开始轮次到结束轮次
         for self.epoch in range(self.start_epoch, self.max_epochs):
+            if self.max_iters_override is not None and self.cur_iter >= self.max_iters_override:
+                break
             # 调用 'before_epoch' 钩子函数
             self._call_hooks("before_epoch")
             # 训练一个轮次

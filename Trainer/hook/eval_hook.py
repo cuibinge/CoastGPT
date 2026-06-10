@@ -14,6 +14,7 @@ from ..utils.distribute import get_rank, get_world_size, is_distributed, is_main
 from .hookbase import HookBase
 from .knn_eval_hook import MetricLogger
 from .logger_hook import LoggerHook
+import torch_npu
 
 logger = logging.getLogger("train")
 

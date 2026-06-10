@@ -201,10 +201,10 @@ def _parse_option() -> ml_collections.ConfigDict:
     parser.add_argument("--opts", default=None, nargs="+")
 
     parser.add_argument("--image-file", type=str, default="../GeoJsonData/GF1/Size_128/Image_TrueColor/海水养殖区_GF1_PMS2_E119.4_N34.9_20170210_浅海区_R004C021_128_True_WFQ.jpg")
-    parser.add_argument("--model-path", type=str, default="./output/stage3/seg_multi/checkpoints/FINAL.pt")
+    parser.add_argument("--model-path", type=str, default="./output/stage3/mixed_v3/checkpoints/FINAL.pt")
     parser.add_argument("--seed", type=int, default=322)
     parser.add_argument("--temperature", type=float, default=0.4)
-    parser.add_argument("--max-new-tokens", type=int, default=512,
+    parser.add_argument("--max-new-tokens", type=int, default=4096,
                         help="Max new tokens per generation turn")
     parser.add_argument("--min-new-tokens", type=int, default=1)
     parser.add_argument("--do-sample", type=str2bool, default=True)
@@ -229,7 +229,7 @@ def _parse_option() -> ml_collections.ConfigDict:
         type=str,
         choices=["cpu", "npu", "gpu", "mps"],
     )
-    parser.add_argument("--use-checkpoint", default=False, type=str2bool)
+    # parser.add_argument("--use-checkpoint", default=False, type=str2bool)
 
     config = parser.parse_args(wandb=True)
     return ml_collections.config_dict.ConfigDict(config)
@@ -916,7 +916,10 @@ def main(config: ml_collections.ConfigDict):
             # Post-process GeoJSON part
             is_geojson = any(
                 marker in outputs
-                for marker in ('"Feature"', '"Polygon"', '"coordinates"', '"FeatureCollection"')
+                for marker in (
+                    '"Feature"', '"FeatureCollection"', '"Polygon"', '"MultiPolygon"',
+                    '"coordinates"', '"geometry"', '"properties"', '"DLMC"', '"name"'
+                )
             )
             if is_geojson:
                 outputs = _postprocess_geojson(outputs)

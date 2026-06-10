@@ -4,9 +4,8 @@ from typing import Iterator, Optional, Sized
 
 import torch
 from torch.utils.data import Sampler
-
 from .distribute import get_rank, get_world_size, sync_random_seed
-
+import torch_npu
 
 class InfiniteSampler(Sampler):
     """It's designed for iteration-based runner and yields a mini-batch indices

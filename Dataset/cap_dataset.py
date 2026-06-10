@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import re
+import numpy as np
 from dataclasses import dataclass
 from multiprocessing import Value
 from pathlib import Path
@@ -14,7 +15,7 @@ import torch
 import torchvision.transforms as T
 import transformers
 import webdataset as wds
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from torch.utils.data import get_worker_info
 from transformers import CLIPImageProcessor
 from webdataset.filters import _shuffle
@@ -33,12 +34,19 @@ from Models import (
     IMAGE_TOKEN_INDEX,
 )
 from . import conversation as conversation_lib
+from .constants import ELEMENT2ID, TASK2ID
+from utils.geojson_coordinate_utils import repair_mojibake_in_obj
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 _SHARD_SHUFFLE_SIZE = 2000
 _SHARD_SHUFFLE_INITIAL = 500
 _SAMPLE_SHUFFLE_SIZE = 5000
 _SAMPLE_SHUFFLE_INITIAL = 1000
 logger = logging.getLogger("train")
+_TIFF_FALLBACK_WARNED = set()
 
 
 def valid_path(path: Union[Path, str]) -> bool:
@@ -47,6 +55,85 @@ def valid_path(path: Union[Path, str]) -> bool:
     if not path.exists():
         return False
     return True
+
+
+def _normalize_remote_sensing_channel(channel: np.ndarray) -> np.ndarray:
+    """Normalize one raster band to uint8 with robust percentile scaling."""
+    channel = channel.astype(np.float32, copy=False)
+    invalid_mask = ~np.isfinite(channel) | (channel <= -1e9)
+    channel = channel.copy()
+    channel[invalid_mask] = np.nan
+
+    valid = channel[~np.isnan(channel)]
+    if valid.size == 0:
+        return np.zeros(channel.shape, dtype=np.uint8)
+
+    lo = float(np.percentile(valid, 2.0))
+    hi = float(np.percentile(valid, 98.0))
+    if hi <= lo:
+        lo = float(valid.min())
+        hi = float(valid.max())
+    if hi <= lo:
+        return np.zeros(channel.shape, dtype=np.uint8)
+
+    scaled = (channel - lo) / (hi - lo)
+    scaled = np.clip(scaled, 0.0, 1.0)
+    scaled = np.nan_to_num(scaled, nan=0.0)
+    return (scaled * 255.0).astype(np.uint8)
+
+
+def _load_tiff_as_rgb(path: Union[Path, str]) -> Image.Image:
+    try:
+        import tifffile
+    except ImportError as exc:
+        raise UnidentifiedImageError(
+            f"TIFF image requires tifffile fallback, but tifffile is unavailable: {path}"
+        ) from exc
+
+    raster = tifffile.imread(str(path))
+    raster = np.asarray(raster)
+    raster = np.squeeze(raster)
+
+    if raster.ndim == 2:
+        raster = np.repeat(raster[..., None], 3, axis=-1)
+    elif raster.ndim == 3 and raster.shape[0] <= 8 and raster.shape[-1] > 8:
+        raster = np.moveaxis(raster, 0, -1)
+
+    if raster.ndim != 3:
+        raise UnidentifiedImageError(f"Unsupported TIFF raster shape {raster.shape} for {path}")
+
+    channels = raster.shape[-1]
+    if channels >= 4:
+        # GF2 multi-spectral order is typically Blue, Green, Red, NIR.
+        rgb = raster[..., [2, 1, 0]]
+    elif channels == 3:
+        rgb = raster[..., :3]
+    elif channels == 2:
+        rgb = np.stack([raster[..., 0], raster[..., 1], raster[..., 1]], axis=-1)
+    elif channels == 1:
+        rgb = np.repeat(raster, 3, axis=-1)
+    else:
+        raise UnidentifiedImageError(f"Unsupported TIFF channel count {channels} for {path}")
+
+    rgb_uint8 = np.stack(
+        [_normalize_remote_sensing_channel(rgb[..., i]) for i in range(3)],
+        axis=-1,
+    )
+    return Image.fromarray(rgb_uint8, mode="RGB")
+
+
+def load_image_as_rgb(path: Union[Path, str]) -> Image.Image:
+    try:
+        return Image.open(path).convert("RGB")
+    except UnidentifiedImageError:
+        suffix = str(path).lower()
+        if suffix.endswith(".tif") or suffix.endswith(".tiff"):
+            warn_key = "__tiff_fallback__"
+            if warn_key not in _TIFF_FALLBACK_WARNED:
+                logger.warning("PIL failed to read TIFF, falling back to tifffile: %s", path)
+                _TIFF_FALLBACK_WARNED.add(warn_key)
+            return _load_tiff_as_rgb(path)
+        raise
 
 
 def pre_caption(caption, max_words=50):
@@ -106,6 +193,27 @@ class CaptionDataset(torch.utils.data.Dataset):
 
     def post_process(self):
         pass
+
+    def load_physics(self, idx: int):
+        """
+        加载与图像空间对齐的物理真值 (TSM) 与有效域掩码 (Mask)。
+        这部分数据必须在制作 CoastBench 时提前由定量遥感算法生成。
+        """
+        img_path = Path(self.img_list[idx])
+
+        # 假设物理真值存储在与图像同级的 TSM 文件夹或具有特定后缀
+        # 实际路径逻辑请根据你的 CoastBench 存储规范严格修改
+        tsm_path = img_path.parent / (img_path.stem + "_tsm.npy")
+        mask_path = img_path.parent / (img_path.stem + "_mask.npy")
+
+        if tsm_path.exists() and mask_path.exists():
+            # 加载并转换为张量，通常需要下采样到特征图的尺度 (如 F32 对应的尺度)
+            # 或者在这里保持原图尺寸，在损失函数计算前进行 F.interpolate
+            tsm_tensor = torch.from_numpy(np.load(tsm_path)).float()
+            mask_tensor = torch.from_numpy(np.load(mask_path)).float()
+            return tsm_tensor, mask_tensor
+        else:
+            return None, None
 
     def load_dataset(self):
         for i in range(len(self.img_dir)):
@@ -177,7 +285,7 @@ class CaptionDataset(torch.utils.data.Dataset):
         return len(self.cap_list)
 
     def load_image(self, idx: int):
-        x = Image.open(self.img_list[idx]).convert("RGB")
+        x = load_image_as_rgb(self.img_list[idx])
         if self.transform is not None:
             if isinstance(self.transform, CLIPImageProcessor):
                 x = self.transform(x, return_tensors="pt").pixel_values.squeeze()
@@ -192,17 +300,18 @@ class CaptionDataset(torch.utils.data.Dataset):
             captions = pre_caption(captions)
 
         x = self.load_image(idx)
-        return dict(rgb=x, text=captions)
+        tsm, mask = self.load_physics(idx)  # 新增物理数据加载
+        return dict(rgb=x, text=captions, tsm=tsm, mask=mask)
 
 
 class VGEvalDataset(CaptionDataset):
     def __init__(
-        self,
-        root: Union[Path, str] = ".data/rsicd",
-        target: Union[Path, str] = None,
-        transform: T.Compose = None,
-        tokenizer: transformers.PreTrainedTokenizer = None,
-        **kwargs,
+            self,
+            root: Union[Path, str] = ".data/rsicd",
+            target: Union[Path, str] = None,
+            transform: T.Compose = None,
+            tokenizer: transformers.PreTrainedTokenizer = None,
+            **kwargs,
     ):
         prompt_type = kwargs.pop("prompt_type", "llava_llama_2")
         conversation_lib.default_conversation = conversation_lib.conv_templates[prompt_type]
@@ -274,10 +383,10 @@ class VGEvalDataset(CaptionDataset):
 
 class CapEvalDataset(CaptionDataset):
     def __init__(
-        self,
-        root: Union[Path, str] = ".data/rsicd",
-        target: Union[Path, str] = None,
-        transform: T.Compose = None,
+            self,
+            root: Union[Path, str] = ".data/rsicd",
+            target: Union[Path, str] = None,
+            transform: T.Compose = None,
     ):
         if isinstance(root, str):
             root = Path(root)
@@ -332,7 +441,7 @@ class CapEvalDataset(CaptionDataset):
     def __getitem__(self, idx: int) -> Dict:
         super_result = super().__getitem__(idx)
         file_name = self.img_list[idx].name
-        raw_image = Image.open(self.img_list[idx]).convert("RGB")
+        raw_image = load_image_as_rgb(self.img_list[idx])
         raw_image = self.raw_transform(raw_image)
         super_result["filename"] = file_name
         super_result["raw_image"] = raw_image
@@ -397,18 +506,97 @@ class CaptionDatasetVQA(CaptionDataset):
 
 class InstructDataset(CaptionDataset):
     def __init__(
-        self,
-        tokenizer: transformers.PreTrainedTokenizer,
-        crop_size: int = 224,
-        **kwargs,
+            self,
+            tokenizer: transformers.PreTrainedTokenizer,
+            crop_size: int = 224,
+            **kwargs,
     ):
+        self.stage = int(kwargs.pop("stage", 2))
+        self.geojson_priority = bool(kwargs.pop("geojson_priority", self.stage >= 3))
+        # Number of prompt variants to keep for Stage-3 GeoJSON samples that
+        # were not pre-baked by the build script. Earlier code emitted three
+        # near-duplicate prompts sharing the same answer, which wastes training
+        # compute. Override via dataset config when more diversity is desired.
+        self.geojson_prompt_variants = int(kwargs.pop("geojson_prompt_variants", 1))
+        # Drop samples whose target answer (after tokenisation) exceeds this
+        # many tokens. Prevents truncated-answer training that systematically
+        # biases the model toward the start of long FeatureCollections. 0
+        # disables the filter.
+        self.geojson_max_answer_tokens = int(kwargs.pop("geojson_max_answer_tokens", 0))
+        self.repair_mojibake = bool(kwargs.pop("repair_mojibake", True))
         self.tune_im_start = kwargs.pop("tune_im_start", False)
         prompt_type = kwargs.pop("prompt_type", "llava_llama_2")
         conversation_lib.default_conversation = conversation_lib.conv_templates[prompt_type]
         self.tokenizer = tokenizer
         self.crop_size = crop_size
+        self._geojson_filtered_oversize = 0
 
         super().__init__(**kwargs)
+
+    @staticmethod
+    def _resolve_image_path(img_dir: Path, item: Dict):
+        if "name" in item:
+            raw_name = str(item["name"])
+        else:
+            raw_name = item.get("filename", "")
+            if isinstance(raw_name, list):
+                raw_name = raw_name[0] if raw_name else ""
+            raw_name = str(raw_name)
+        if not raw_name:
+            return None
+
+        lower_name = raw_name.lower()
+        has_img_ext = lower_name.endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
+        candidates = [img_dir / raw_name]
+        if not has_img_ext:
+            for ext in (".png", ".jpg", ".jpeg", ".tif", ".tiff"):
+                candidates.append(img_dir / f"{raw_name}{ext}")
+
+        for candidate in candidates:
+            if valid_path(candidate):
+                return candidate
+        return None
+
+    @staticmethod
+    def _pick_caption_from_feature(feature: Dict) -> str:
+        props = feature.get("properties", {}) if isinstance(feature, dict) else {}
+        for key in ("caption1", "caption2", "caption3"):
+            value = props.get(key, "")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    @staticmethod
+    def _infer_element_hint(text: str) -> str:
+        text_lower = text.lower()
+        for kw in (
+            "coastline",
+            "shoreline",
+            "tidal flat",
+            "mudflat",
+            "mariculture",
+            "aquaculture",
+            "mangrove",
+            "wind turbine",
+        ):
+            if kw in text_lower:
+                return kw
+        return "coastline"
+
+    def _build_auto_conv_for_feature(self, feature: Dict, sample_idx: int):
+        answer = self._pick_caption_from_feature(feature)
+        if not answer:
+            return None
+        element_hint = self._infer_element_hint(answer)
+        if sample_idx % 2 == 0:
+            question = (
+                f"Describe the image and summarize key {element_hint} related coastal elements."
+            )
+        else:
+            question = (
+                f"Extract the {element_hint} related targets from the image and give a concise summary."
+            )
+        return [{"Question": question, "Answer": answer}]
 
     def post_process(self):
         new_cap_list = []
@@ -438,6 +626,27 @@ class InstructDataset(CaptionDataset):
         self.cap_list = new_cap_list
         self.img_list = new_img_list
 
+    def load_physics(self, idx: int):
+        """
+        加载与图像空间对齐的物理真值 (TSM) 与有效域掩码 (Mask)。
+        这部分数据必须在制作 CoastBench 时提前由定量遥感算法生成。
+        """
+        img_path = Path(self.img_list[idx])
+
+        # 假设物理真值存储在与图像同级的 TSM 文件夹或具有特定后缀
+        # 实际路径逻辑请根据你的 CoastBench 存储规范严格修改
+        tsm_path = img_path.parent / (img_path.stem + "_tsm.npy")
+        mask_path = img_path.parent / (img_path.stem + "_mask.npy")
+
+        if tsm_path.exists() and mask_path.exists():
+            # 加载并转换为张量，通常需要下采样到特征图的尺度 (如 F32 对应的尺度)
+            # 或者在这里保持原图尺寸，在损失函数计算前进行 F.interpolate
+            tsm_tensor = torch.from_numpy(np.load(tsm_path)).float()
+            mask_tensor = torch.from_numpy(np.load(mask_path)).float()
+            return tsm_tensor, mask_tensor
+        else:
+            return None, None
+
     def load_dataset(self):
         for i in range(len(self.img_dir)):
             with open(self.json_dir[i], "rb") as f:
@@ -448,32 +657,48 @@ class InstructDataset(CaptionDataset):
 
             dataset_name = self.json_dir[i].stem
             for item in data:
+                conv_data = item.get("conv", None)
+                img_path = None
                 if dataset_name.endswith("RSVG"):
                     img_path = self.img_dir[i] / item["img"]
-                    item["conv"] = dict(Question=item["question"], Answer=item["answer"])
+                    conv_data = dict(
+                        Question=item["question"],
+                        Answer=item["answer"],
+                    )
                 elif dataset_name.endswith("DIOR"):
                     img_path = self.img_dir[i] / (item["img"] + ".jpg")
-                    item["conv"] = dict(Question=item["question"], Answer=item["answer"])
+                    conv_data = dict(
+                        Question=item["question"],
+                        Answer=item["answer"],
+                    )
                 elif "METERML" in dataset_name:
                     img_path = self.img_dir[i] / item["name"] / "naip.png"
                 elif "OSM" in dataset_name:
                     img_path = self.img_dir[i] / (item["filename"] + ".jpg")
                 else:
-                    if "name" in item.keys():
-                        img_path = self.img_dir[i] / item["name"]
-                    else:
-                        file_name = item["filename"]
-                        if isinstance(file_name, list):
-                            file_name = file_name[0]
-                        img_path = self.img_dir[i] / file_name
+                    img_path = self._resolve_image_path(self.img_dir[i], item)
+                    if conv_data is None:
+                        features = item.get("features", [])
+                        if isinstance(features, list) and len(features) > 0:
+                            first_feature = features[0]
+                            if (
+                                self.stage >= 3
+                                and self.geojson_priority
+                                and self._is_geojson_feature(first_feature)
+                            ):
+                                conv_data = self._build_stage3_geojson_convs(item)
+                            else:
+                                conv_data = self._build_auto_conv_for_feature(
+                                    first_feature, len(self.cap_list)
+                                )
 
-                if valid_path(img_path):
+                if img_path is not None and valid_path(img_path) and conv_data is not None:
                     self.img_list.append(img_path)
-                    if isinstance(item["conv"], List) and len(item["conv"]) > 10:
-                        conv = random.sample(item["conv"], 10)
+                    if isinstance(conv_data, List) and len(conv_data) > 10:
+                        conv = random.sample(conv_data, 10)
                         self.cap_list.append(conv)
                     else:
-                        self.cap_list.append(item["conv"])
+                        self.cap_list.append(conv_data)
 
     def load_image(self, idx: int):
         if idx >= len(self.img_list):
@@ -484,44 +709,635 @@ class InstructDataset(CaptionDataset):
 
     def __getitem__(self, idx: int) -> Dict:
         out_dict = super().__getitem__(idx)
+
+        # 文本特征的 Tokenize 预处理
         out_dict["text"] = preprocess_multimodal(out_dict["text"], tune_im_start=self.tune_im_start)
         out_dict["text"] = preprocess(out_dict["text"], self.tokenizer, has_image=True)
         out_dict["text"] = dict(
             input_ids=out_dict["text"]["input_ids"][0],
             labels=out_dict["text"]["labels"][0],
         )
+
+        # 边界条件防御与物理张量透传
         if idx >= len(self.img_list):
             out_dict["valid_image"] = False
+            # 对于纯文本或无效图像样本，物理先验必须严格置空
+            out_dict["tsm"] = None
+            out_dict["mask"] = None
         else:
             out_dict["valid_image"] = True
+            # 获取物理数据并显式挂载到输出字典中
+            tsm, mask = self.load_physics(idx)
+            out_dict["tsm"] = tsm
+            out_dict["mask"] = mask
 
         return out_dict
 
 
 class InstructDatasetWithTaskId(InstructDataset):
     WEIGHT_DICT = {
-        "OSM": 0.6,
-        "LLAVA": 1.0,
-        "geosignal": 0.50,
-        "RSITMD": 0.6,
-        "NWPU": 0.6,
-        "DOTA": 0.9,
-        "FAST": 1.0,
+        "GF_geojson_train": 15.0,
+        "GF_landclass_train": 0.5,
+        "NWPUDetail": 0.25,
+        "NWPU": 0.25,
+        "RSVG_DIOR": 1.0,
+        "RSVG": 1.0,
+        "HR": 1.0,
+        "METERML": 1.0,
+        "LR": 1.0,
+        "RSICD": 1.0,
+        "RSITMDDetail": 1.0,
+        "RSITMD": 1.0,
+        "UCM": 1.0,
+        "fMoW": 1.0,
+        "coord_transform": 1.0,
+        "GF_geojson_manifest": 1.0,
+        "geosignal": 15.0,
+    }
+
+    # 任务关键词映射到统一任务名（再由 TASK2ID 转为 ID）
+    TASK_KEYWORDS = {
+        "场景分类": [
+            "classify", "classification", "分类", "识别", "recognize", "distinguish",
+            "category", "label", "predict", "identify", "what type", "which class"
+        ],
+        "视觉问答": [
+            "question", "answer", "问答", "vqa", "qa", "why", "how", "what", "where", "when"
+        ],
+        "视觉定位": [
+            "locate", "location", "定位", "position", "where is", "bbox", "bounding box", "坐标"
+        ],
+        "描述": [
+            "describe", "description", "描述", "explain", "caption", "summarize",
+            "what do you see", "describe the", "tell me about", "visual content", "scene"
+        ],
+        "要素提取": [
+            "extract", "extraction", "要素提取", "segment", "segmentation", "mask",
+            "detect", "detection", "object", "target", "feature", "element"
+        ]
+    }
+
+    # 统一要素关键词映射到 ELEMENT2ID 的标准 key
+    ELEMENT_KEYWORDS = {
+        "网箱养殖区": ["网箱", "cage", "cage-culture", "cage farming", "aquaculture cage"],
+        "筏式养殖区": ["筏式", "raft", "raft-culture", "raft farming"],
+        "赤潮": ["赤潮", "red tide", "algal bloom"],
+        "浒苔": ["浒苔", "green tide", "ulva", "macroalgae"],
+        "海岸线": ["海岸线", "coastline", "shoreline"],
+        "风力发电机": ["风力发电机", "wind turbine", "windmill"],
+        "海上钻井平台": ["海上钻井平台", "offshore platform", "oil rig"],
+        "滩涂": ["滩涂", "tidal flat", "mudflat"],
+        "红树林湿地": ["红树林", "mangrove", "mangrove wetland"],
+        "土地覆盖": ["土地覆盖", "land cover", "land-use", "land use", "lc", "lulc"],
+    }
+
+    PHYSICAL_FIELD_ALIASES = {
+        "sensor": [
+            "sensor",
+            "sensor_id",
+            "platform",
+            "satellite",
+            "satellite_id",
+            "instrument",
+            "sat",
+            "source",
+        ],
+        "gsd": [
+            "gsd",
+            "ground_sample_distance",
+            "ground_sample_distance_m",
+            "ground_sampling_distance",
+            "spatial_resolution",
+            "resolution",
+            "pixel_size",
+        ],
+        "band": ["band", "bands", "channel", "channels", "spectral", "spectrum", "modality"],
+        "time": [
+            "time",
+            "timestamp",
+            "date",
+            "acquisition_time",
+            "acquisition_date",
+            "datetime",
+            "datetime_local",
+            "temporal_info",
+            "solar_term",
+            "part_of_day",
+        ],
     }
 
     def __init__(self, **kwargs):
         self.sample_weight = []
+        self.task_ids = []       # 存储每个样本的任务ID
+        self.category_ids = []   # 存储每个样本的地物类别ID（复用为 element_id）
+        self.task_texts = []     # 存储每个样本任务文本
+        self.element_texts = []  # 存储每个样本要素文本
+        self.sample_phys_meta = []
         super().__init__(**kwargs)
+
+    @staticmethod
+    def _to_text(value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (list, tuple)):
+            parts = [str(v).strip() for v in value if str(v).strip()]
+            return ", ".join(parts)
+        if isinstance(value, dict):
+            parts = [f"{k}:{v}" for k, v in value.items() if v is not None and str(v).strip()]
+            return ", ".join(parts)
+        return str(value).strip()
+
+    def _deep_lookup(self, data, aliases: List[str]) -> str:
+        alias_set = {a.lower() for a in aliases}
+        queue = [data]
+        while queue:
+            cur = queue.pop(0)
+            if isinstance(cur, dict):
+                for k, v in cur.items():
+                    k_lower = str(k).lower()
+                    if k_lower in alias_set:
+                        text = self._to_text(v)
+                        if text:
+                            return text
+                    if isinstance(v, (dict, list, tuple)):
+                        queue.append(v)
+            elif isinstance(cur, (list, tuple)):
+                for v in cur:
+                    if isinstance(v, (dict, list, tuple)):
+                        queue.append(v)
+        return ""
+
+    @staticmethod
+    def _guess_sensor_from_path(img_path: Path) -> str:
+        path_lower = str(img_path).lower()
+        rules = [
+            ("sentinel", "Sentinel"),
+            ("landsat", "Landsat"),
+            ("gaofen", "GF"),
+            ("worldview", "WorldView"),
+            ("planet", "Planet"),
+            ("jl1", "JL-1"),
+            ("jilin", "JL-1"),
+        ]
+        for key, value in rules:
+            if key in path_lower:
+                return value
+        return ""
+
+    def _extract_physical_meta(self, item: Dict, dataset_name: str, img_path: Path) -> Dict[str, str]:
+        meta = {"dataset": dataset_name}
+        for field, aliases in self.PHYSICAL_FIELD_ALIASES.items():
+            meta[field] = self._deep_lookup(item, aliases)
+        if not meta["sensor"]:
+            meta["sensor"] = self._guess_sensor_from_path(img_path)
+        return meta
+
+    @staticmethod
+    def _resolve_image_path(img_dir: Path, item: Dict):
+        if "name" in item:
+            raw_name = str(item["name"])
+        else:
+            raw_name = item.get("filename", "")
+            if isinstance(raw_name, list):
+                raw_name = raw_name[0] if raw_name else ""
+            raw_name = str(raw_name)
+        if not raw_name:
+            return None
+
+        lower_name = raw_name.lower()
+        has_img_ext = lower_name.endswith((".png", ".jpg", ".jpeg", ".tif", ".tiff"))
+        candidates = [img_dir / raw_name]
+        if not has_img_ext:
+            for ext in (".png", ".jpg", ".jpeg", ".tif", ".tiff"):
+                candidates.append(img_dir / f"{raw_name}{ext}")
+
+        for candidate in candidates:
+            if valid_path(candidate):
+                return candidate
+        return None
+
+    @staticmethod
+    def _pick_caption_from_feature(feature: Dict) -> str:
+        props = feature.get("properties", {}) if isinstance(feature, dict) else {}
+        for key in ("caption1", "caption2", "caption3"):
+            value = props.get(key, "")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _infer_element_hint(self, text: str) -> str:
+        text_lower = text.lower()
+        for _, keywords in self.ELEMENT_KEYWORDS.items():
+            for keyword in keywords:
+                kw = str(keyword).strip()
+                if not kw:
+                    continue
+                if kw.lower() in text_lower and any(ch.isalpha() for ch in kw):
+                    return kw
+        return "coastline"
+
+    @staticmethod
+    def _geojson_task_name() -> str:
+        for task_name in TASK2ID.keys():
+            if "geojson" in str(task_name).lower():
+                return task_name
+        return next(iter(TASK2ID.keys()))
+
+    @staticmethod
+    def _with_det_geojson_tag(prompt: str) -> str:
+        prompt = str(prompt or "").strip()
+        if not prompt:
+            return "[DET]"
+        if prompt.lower().startswith("[det]"):
+            return prompt
+        return f"[DET] {prompt}"
+
+    @staticmethod
+    def _is_geojson_feature(feature: Dict) -> bool:
+        if not isinstance(feature, dict):
+            return False
+        geometry = feature.get("geometry", {})
+        if not isinstance(geometry, dict):
+            return False
+        geo_type = str(geometry.get("type", "")).lower()
+        return geo_type in {"polygon", "multipolygon"}
+
+    @staticmethod
+    def _collect_geojson_features(item: Dict) -> List[Dict]:
+        if not isinstance(item, dict):
+            return []
+        if isinstance(item.get("features"), list):
+            features = []
+            for feature in item["features"]:
+                if not isinstance(feature, dict):
+                    continue
+                geometry = feature.get("geometry", {})
+                if not isinstance(geometry, dict) or "type" not in geometry:
+                    continue
+                properties = feature.get("properties", {})
+                if not isinstance(properties, dict):
+                    properties = {}
+                features.append(
+                    {
+                        "type": "Feature",
+                        "geometry": geometry,
+                        "properties": properties,
+                    }
+                )
+            return features
+
+        geometry = item.get("geometry", {})
+        properties = item.get("properties", {})
+        if not isinstance(geometry, dict) or "type" not in geometry:
+            return []
+        if not isinstance(properties, dict):
+            properties = {}
+        return [
+            {
+                "type": "Feature",
+                "geometry": geometry,
+                "properties": properties,
+            }
+        ]
+
+    @classmethod
+    def _build_geojson_feature_answer(cls, feature: Dict) -> str:
+        features = cls._collect_geojson_features(feature)
+        if not features:
+            return ""
+        return json.dumps(
+            {
+                "type": "FeatureCollection",
+                "features": features,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _build_stage3_geojson_convs(self, feature: Dict) -> List[Dict]:
+        full_feature_answer = self._build_geojson_feature_answer(feature)
+        if not full_feature_answer:
+            return []
+        caption_source = feature
+        if isinstance(feature, dict) and isinstance(feature.get("features"), list) and len(feature["features"]) > 0:
+            caption_source = feature["features"][0]
+        caption_hint = self._pick_caption_from_feature(caption_source)
+
+        candidate_convs = [
+            {
+                "Question": self._with_det_geojson_tag(
+                    "Extract the target features from this remote sensing image and output a valid GeoJSON FeatureCollection. Return JSON only."
+                ),
+                "Answer": full_feature_answer,
+            },
+            {
+                "Question": self._with_det_geojson_tag(
+                    "Generate an editable GeoJSON FeatureCollection for ArcGIS from this image. Return JSON only."
+                ),
+                "Answer": full_feature_answer,
+            },
+            {
+                "Question": self._with_det_geojson_tag(
+                    "Output the extracted feature information for this image in GeoJSON FeatureCollection format. Return JSON only."
+                ),
+                "Answer": full_feature_answer,
+            },
+        ]
+        # Cap the number of near-duplicate prompts emitted per sample. Default
+        # is 1: a single prompt avoids spending most of the training budget
+        # memorising the same answer three times in a row.
+        n = max(1, min(int(getattr(self, "geojson_prompt_variants", 1)), len(candidate_convs)))
+        convs = candidate_convs[:n]
+        if caption_hint and n >= len(candidate_convs):
+            # Caption-conditioned prompt only adds value when more than one
+            # variant is requested explicitly.
+            convs.append(
+                {
+                    "Question": self._with_det_geojson_tag(
+                        "Based on the following scene description, extract the target features and output GeoJSON FeatureCollection. Return JSON only.\n"
+                        f"{caption_hint}"
+                    ),
+                    "Answer": full_feature_answer,
+                }
+            )
+        return convs
+
+    @staticmethod
+    def _is_geojson_query_text(text: str) -> bool:
+        text_lower = str(text).lower()
+        geojson_keywords = (
+            "[geojson]",
+            "geojson",
+            "featurecollection",
+            "feature collection",
+            "feature object",
+            "polygon json",
+            "geometry json",
+            "output json boundary",
+            "return geojson",
+        )
+        return any(keyword in text_lower for keyword in geojson_keywords)
+
+    @staticmethod
+    def _looks_like_geojson_answer(text: str) -> bool:
+        text = str(text or "").strip().lower()
+        return (
+            text.startswith("{")
+            and "featurecollection" in text
+            and "\"features\"" in text
+        )
+
+    def _collapse_redundant_geojson_turns(self, item: List[Dict], sample_idx: int) -> List[Dict]:
+        if not isinstance(item, list) or len(item) <= 1:
+            return item
+
+        questions = [str(conv.get("Question", "")) for conv in item if isinstance(conv, dict)]
+        answers = [str(conv.get("Answer", "")) for conv in item if isinstance(conv, dict)]
+        if len(questions) != len(item) or len(answers) != len(item):
+            return item
+        if not answers:
+            return item
+
+        first_answer = answers[0].strip()
+        if not first_answer or not self._looks_like_geojson_answer(first_answer):
+            return item
+        if any(answer.strip() != first_answer for answer in answers[1:]):
+            return item
+        if not all(
+            ("[det]" in question.lower()) or self._is_geojson_query_text(question)
+            for question in questions
+        ):
+            return item
+
+        keep_idx = int(sample_idx) % len(item)
+        return [item[keep_idx]]
+
+    def _build_auto_conv_for_feature(self, feature: Dict, sample_idx: int):
+        if self.stage >= 3 and self.geojson_priority and self._is_geojson_feature(feature):
+            geojson_convs = self._build_stage3_geojson_convs(feature)
+            if geojson_convs:
+                return geojson_convs
+
+        answer = self._pick_caption_from_feature(feature)
+        if not answer:
+            return None
+        element_hint = self._infer_element_hint(answer)
+        if sample_idx % 2 == 0:
+            question = (
+                f"Describe the image and summarize key {element_hint} related coastal elements."
+            )
+        else:
+            question = (
+                f"Extract the {element_hint} related targets from the image and give a concise summary."
+            )
+        return [{"Question": question, "Answer": answer}]
+
+    @staticmethod
+    def _normalize_time_str(time_str: str) -> str:
+        if not time_str:
+            return ""
+        return time_str.replace("T", " ").replace("Z", "").strip()
+
+    def _build_physical_prompt(self, meta: Dict[str, str]) -> str:
+        if meta is None:
+            return ""
+        parts = []
+        if meta.get("dataset"):
+            parts.append(f"[Dataset: {meta['dataset']}]")
+        if meta.get("sensor"):
+            parts.append(f"[Sensor: {meta['sensor']}]")
+        if meta.get("gsd"):
+            parts.append(f"[GSD: {meta['gsd']}]")
+        if meta.get("band"):
+            parts.append(f"[Band: {meta['band']}]")
+        norm_time = self._normalize_time_str(meta.get("time", ""))
+        if norm_time:
+            parts.append(f"[Time: {norm_time}]")
+        return " ".join(parts)
+
+    @staticmethod
+    def _default_task_id() -> int:
+        return TASK2ID.get("描述", 0)
+
+    @staticmethod
+    def _default_element_id() -> int:
+        return ELEMENT2ID.get("无", 0)
+
+    @staticmethod
+    def _default_task_text() -> str:
+        return "描述"
+
+    @staticmethod
+    def _default_element_text() -> str:
+        return "无"
+
+    @staticmethod
+    def _task_name_from_id(task_id: int) -> str:
+        for name, idx in TASK2ID.items():
+            if idx == task_id:
+                return name
+        return next(iter(TASK2ID.keys()))
+
+    @staticmethod
+    def _element_name_from_id(element_id: int) -> str:
+        for name, idx in ELEMENT2ID.items():
+            if idx == element_id:
+                return name
+        return next(iter(ELEMENT2ID.keys()))
+
+    @staticmethod
+    def _extract_free_element_text(text: str) -> str:
+        if not isinstance(text, str) or not text:
+            return ""
+        text_lower = re.sub(r"\[[a-z0-9_]+\]", " ", text.lower())
+        patterns = [
+            r"(?:find|locate|detect|identify|segment|extract)\s+(?:a|an|the)?\s*([a-z][a-z0-9 -]{2,64})",
+            r"(?:about|of|for)\s+(?:the|a|an)?\s*([a-z][a-z0-9 -]{2,64})",
+        ]
+        stop_terms = {
+            "image",
+            "scene",
+            "picture",
+            "photo",
+            "target",
+            "object",
+            "area",
+            "region",
+            "class",
+            "category",
+            "dimensions",
+            "following object",
+        }
+        for pattern in patterns:
+            match = re.search(pattern, text_lower)
+            if not match:
+                continue
+            candidate = match.group(1).strip(" .,;:!?\"'()[]{}")
+            candidate = re.split(r",|\.|;|\?|!|\band\b|\bwith\b|\bthat\b|\bwhich\b", candidate)[0].strip()
+            words = [w for w in candidate.split() if w]
+            if not words:
+                continue
+            candidate = " ".join(words[:4])
+            if candidate in stop_terms or len(candidate) < 3:
+                continue
+            return candidate
+        return ""
+
+    @staticmethod
+    def _first_answer_text(conv_data) -> str:
+        if isinstance(conv_data, dict):
+            return str(conv_data.get("Answer", conv_data.get("answer", "")))
+        if isinstance(conv_data, list) and conv_data:
+            first = conv_data[0]
+            if isinstance(first, dict):
+                return str(first.get("Answer", first.get("answer", "")))
+        return ""
+
+    def _is_geojson_priority_sample(self, item, conv_data) -> bool:
+        if not (self.stage >= 3 and self.geojson_priority):
+            return False
+        if isinstance(item, dict):
+            if str(item.get("coord_encoding", "")).lower() in {"normalized", "absolute"}:
+                return True
+        first_answer = self._first_answer_text(conv_data)
+        return self._looks_like_geojson_answer(first_answer)
+
+    def detect_task_text_from_text(self, text: str) -> str:
+        text_lower = str(text).lower()
+        geojson_task_name = self._geojson_task_name()
+        if self.stage >= 3 and self.geojson_priority and "[det]" in text_lower:
+            return geojson_task_name
+        if self._is_geojson_query_text(text_lower):
+            return geojson_task_name
+        if "[gj]" in text_lower:
+            return geojson_task_name
+
+        tag_to_task_id = [
+            ("[cls]", 0),
+            ("[vqa]", 1),
+            ("[qa]", 1),
+            ("[vg]", 2),
+            ("[loc]", 2),
+            ("[cap]", 3),
+            ("[caption]", 3),
+            ("[det]", 4),
+            ("[seg]", 4),
+        ]
+        for tag, task_id in tag_to_task_id:
+            if tag in text_lower:
+                return self._task_name_from_id(task_id)
+        for task_name in TASK2ID.keys():
+            if task_name.lower() in text_lower:
+                return task_name
+        for task_type, keywords in self.TASK_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in text_lower:
+                    return task_type
+        return self._default_task_text()
+
+    def detect_element_text_from_text(self, text: str) -> str:
+        text_lower = str(text).lower()
+        if "[cls]" in text_lower:
+            # Stage-2 classification samples usually contain broad land-cover classes.
+            return self._element_name_from_id(10)
+        for element_name in ELEMENT2ID.keys():
+            if element_name == "无":
+                continue
+            if element_name.lower() in text_lower:
+                return element_name
+        for category, keywords in self.ELEMENT_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in text_lower:
+                    return category
+        free_element = self._extract_free_element_text(text)
+        if free_element:
+            return free_element
+        return self._default_element_text()
+
+    def detect_task_from_text(self, text: str) -> int:
+        """
+        根据输入文本检测任务类型
+        Args:
+            text: 输入文本
+        Returns:
+            task_id: 任务ID
+        """
+        task_text = self.detect_task_text_from_text(text)
+        return TASK2ID.get(task_text, self._default_task_id())
+
+    def detect_category_from_text(self, text: str) -> int:
+        """
+        根据输入文本检测地物类别
+        Args:
+            text: 输入文本
+        Returns:
+            category_id: 地物类别ID
+        """
+        element_text = self.detect_element_text_from_text(text)
+        return ELEMENT2ID.get(element_text, self._default_element_id())
 
     def post_process(self):
         for i, item in enumerate(self.cap_list):
             if not isinstance(item, list):
                 item = [item]
-            first_conv = item[0]
-            if DEFAULT_IMAGE_TOKEN in first_conv["Question"]:
+            if len(item) == 0:
                 continue
-            first_conv["Question"] = "<image>" + first_conv["Question"]
+
+            item = self._collapse_redundant_geojson_turns(item, sample_idx=i)
+
+            first_conv = item[0]
+            first_question = str(first_conv.get("Question", ""))
+            if DEFAULT_IMAGE_TOKEN not in first_question:
+                first_conv["Question"] = DEFAULT_IMAGE_TOKEN + first_question
             item[0] = first_conv
+
+            # Keep exactly one image token per sample.
+            for j in range(1, len(item)):
+                if "Question" in item[j]:
+                    item[j]["Question"] = str(item[j]["Question"]).replace(DEFAULT_IMAGE_TOKEN, "")
+                if "Answer" in item[j]:
+                    item[j]["Answer"] = str(item[j]["Answer"]).replace(DEFAULT_IMAGE_TOKEN, "")
+
             self.cap_list[i] = item
 
         self.txt_json_dir = []
@@ -534,14 +1350,44 @@ class InstructDatasetWithTaskId(InstructDataset):
                 with open(dir, "rb") as f:
                     data = json.load(f)
                 for item in data:
+                    question = item.get("instruction", "") + item.get("input", "")
                     conv = [
                         {
-                            "Question": item["instruction"] + item["input"],
+                            "Question": question,
                             "Answer": item["output"],
                         }
                     ]
                     self.cap_list.append(conv)
                     self.sample_weight.append(self.WEIGHT_DICT["geosignal"])
+                    task_text = self.detect_task_text_from_text(question)
+                    detect_text = f"{question} {item.get('output', '')}"
+                    element_text = self.detect_element_text_from_text(detect_text)
+                    self.task_texts.append(task_text)
+                    self.element_texts.append(element_text)
+                    self.task_ids.append(TASK2ID.get(task_text, self._default_task_id()))
+                    self.category_ids.append(ELEMENT2ID.get(element_text, self._default_element_id()))
+                    self.sample_phys_meta.append(
+                        {
+                            "dataset": "geosignal",
+                            "sensor": "",
+                            "gsd": "",
+                            "band": "",
+                            "time": "",
+                        }
+                    )
+
+    def _is_answer_within_token_budget(self, answer_text: str) -> bool:
+        """Return True iff the tokenized answer fits inside the configured
+        per-sample budget. Always True when no tokenizer or budget is set.
+        """
+        budget = int(getattr(self, "geojson_max_answer_tokens", 0) or 0)
+        if budget <= 0 or self.tokenizer is None:
+            return True
+        try:
+            ids = self.tokenizer(answer_text, add_special_tokens=False).get("input_ids", [])
+        except Exception:
+            return True
+        return len(ids) <= budget
 
     def load_dataset(self):
         for i in range(len(self.img_dir)):
@@ -551,44 +1397,129 @@ class InstructDatasetWithTaskId(InstructDataset):
             if isinstance(data, Dict) and "data" in data.keys():
                 data = data["data"]
 
+            if getattr(self, "repair_mojibake", False):
+                data = repair_mojibake_in_obj(data)
+
             dataset_name = self.json_dir[i].stem
             for item in data:
+                conv_data = item.get("conv", None)
+                img_path = None
+
                 if dataset_name.endswith("RSVG"):
                     img_path = self.img_dir[i] / item["img"]
-                    item["conv"] = dict(Question=item["question"], Answer=item["answer"])
+                    conv_data = dict(
+                        Question=item["question"],
+                        Answer=item["answer"],
+                    )
                 elif dataset_name.endswith("DIOR"):
                     img_path = self.img_dir[i] / (item["img"] + ".jpg")
-                    item["conv"] = dict(Question=item["question"], Answer=item["answer"])
+                    conv_data = dict(
+                        Question=item["question"],
+                        Answer=item["answer"],
+                    )
                 elif "METERML" in dataset_name:
                     img_path = self.img_dir[i] / item["name"] / "naip.png"
                 elif "OSM" in dataset_name:
                     img_path = self.img_dir[i] / (item["filename"] + ".jpg")
                 else:
-                    if "name" in item.keys():
-                        img_path = self.img_dir[i] / item["name"]
-                    else:
-                        file_name = item["filename"]
-                        if isinstance(file_name, list):
-                            file_name = file_name[0]
-                        img_path = self.img_dir[i] / file_name
+                    img_path = self._resolve_image_path(self.img_dir[i], item)
+                    if conv_data is None:
+                        features = item.get("features", [])
+                        if isinstance(features, list) and len(features) > 0:
+                            conv_data = self._build_auto_conv_for_feature(
+                                features[0], len(self.cap_list)
+                            )
 
-                if valid_path(img_path):
+                if img_path is not None and valid_path(img_path) and conv_data is not None:
+                    # Drop samples whose Stage-3 GeoJSON answer would be
+                    # truncated by ``model_max_length``. Training on truncated
+                    # answers teaches the model to stop mid-FeatureCollection.
+                    if self._is_geojson_priority_sample(item, conv_data):
+                        first_answer = self._first_answer_text(conv_data)
+                        if first_answer and not self._is_answer_within_token_budget(first_answer):
+                            self._geojson_filtered_oversize += 1
+                            continue
+
                     self.img_list.append(img_path)
-                    if isinstance(item["conv"], List) and len(item["conv"]) > 10:
-                        conv = random.sample(item["conv"], 10)
+                    if isinstance(conv_data, List) and len(conv_data) > 10:
+                        conv = random.sample(conv_data, 10)
                         self.cap_list.append(conv)
                     else:
-                        self.cap_list.append(item["conv"])
+                        self.cap_list.append(conv_data)
 
-                    process_flag = False
+                    # 检测任务ID和地物类别ID
+                    conv_items = self.cap_list[-1]
+                    if isinstance(conv_items, Dict):
+                        conv_items = [conv_items]
+                    for conv_item in conv_items:
+                        if "Question" in conv_item:
+                            question = str(conv_item.get("Question", ""))
+                            answer = str(conv_item.get("Answer", conv_item.get("answer", "")))
+                            detect_text = f"{question} {answer}".strip()
+                            task_text = self.detect_task_text_from_text(question)
+                            element_text = self.detect_element_text_from_text(detect_text)
+                            self.task_texts.append(task_text)
+                            self.element_texts.append(element_text)
+                            self.task_ids.append(TASK2ID.get(task_text, self._default_task_id()))
+                            self.category_ids.append(ELEMENT2ID.get(element_text, self._default_element_id()))
+                            break
+                    else:
+                        # 如果没有Question，默认使用"描述"任务和"无"类别
+                        self.task_texts.append(self._default_task_text())
+                        self.element_texts.append(self._default_element_text())
+                        self.task_ids.append(self._default_task_id())
+                        self.category_ids.append(self._default_element_id())
+
+                    meta_source = item
+                    features = item.get("features", [])
+                    if isinstance(features, list) and len(features) > 0:
+                        first_feature = features[0]
+                        if isinstance(first_feature, dict):
+                            props = first_feature.get("properties", {})
+                            if isinstance(props, dict):
+                                meta_source = dict(item)
+                                meta_source["properties"] = props
+                    self.sample_phys_meta.append(
+                        self._extract_physical_meta(meta_source, dataset_name, img_path)
+                    )
+
+                    base_weight = 0.5
                     for name, weight in self.WEIGHT_DICT.items():
                         if name in dataset_name:
-                            self.sample_weight.append(weight)
-                            process_flag = True
+                            base_weight = float(weight)
                             break
 
-                    if not process_flag:
-                        self.sample_weight.append(0.5)
+                    if (
+                        self.stage >= 3
+                        and self.geojson_priority
+                        and len(self.task_texts) > 0
+                        and self.task_texts[-1] == self._geojson_task_name()
+                    ):
+                        base_weight = max(base_weight, 1.5)
+
+                    self.sample_weight.append(base_weight)
+
+    def __getitem__(self, idx: int) -> Dict:
+        out_dict = super().__getitem__(idx)
+
+        # 添加task_id和category_id
+        if idx < len(self.task_ids):
+            out_dict["task_id"] = self.task_ids[idx]
+        else:
+            out_dict["task_id"] = self._default_task_id()
+
+        if idx < len(self.category_ids):
+            out_dict["category_id"] = self.category_ids[idx]
+        else:
+            out_dict["category_id"] = self._default_element_id()
+
+        out_dict["task_text"] = self.task_texts[idx] if idx < len(self.task_texts) else self._default_task_text()
+        out_dict["element_text"] = self.element_texts[idx] if idx < len(self.element_texts) else self._default_element_text()
+
+        meta = self.sample_phys_meta[idx] if idx < len(self.sample_phys_meta) else None
+        out_dict["physical_prompt"] = self._build_physical_prompt(meta)
+
+        return out_dict
 
 
 def log_and_continue(exn):
@@ -603,7 +1534,7 @@ def group_by_keys_nothrow(data, keys=base_plus_ext, lcase=True, suffixes=None, h
     :param keys: function that splits the key into key and extension (base_plus_ext)
     :param lcase: convert suffixes to lower case (Default value = True)
     """
-    rrent_sample = None
+    current_sample = None
     for filesample in data:
         assert isinstance(filesample, dict)
         fname, value = filesample["fname"], filesample["data"]
@@ -660,11 +1591,11 @@ class SharedEpoch:
 
 class detshuffle2(wds.PipelineStage):
     def __init__(
-        self,
-        bufsize=1000,
-        initial=100,
-        seed=0,
-        epoch=-1,
+            self,
+            bufsize=1000,
+            initial=100,
+            seed=0,
+            epoch=-1,
     ):
         self.bufsize = bufsize
         self.initial = initial
@@ -695,10 +1626,10 @@ def byte_decode(x):
 
 
 def RS5MDataset(
-    root: Union[Path, str] = ".data/rsicd",
-    transform: T.Compose = None,
-    tokenizer: transformers.PreTrainedTokenizer = None,
-    **kwargs,
+        root: Union[Path, str] = ".data/rsicd",
+        transform: T.Compose = None,
+        tokenizer: transformers.PreTrainedTokenizer = None,
+        **kwargs,
 ):
     tune_im_start = kwargs.pop("tune_im_start", False)
     prompt_type = kwargs.pop("prompt_type", "llava_llama_2")
@@ -789,6 +1720,16 @@ class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
 
     tokenizer: transformers.PreTrainedTokenizer
+    physical_prompt_max_len: int = 64
+    task_text_max_len: int = 16
+    element_text_max_len: int = 16
+
+    def _resolve_max_len(self, target_len: int) -> int:
+        tokenizer_max_len = getattr(self.tokenizer, "model_max_length", target_len)
+        if not isinstance(tokenizer_max_len, int) or tokenizer_max_len <= 0:
+            tokenizer_max_len = target_len
+        tokenizer_max_len = min(tokenizer_max_len, 4096)
+        return max(1, min(int(target_len), int(tokenizer_max_len)))
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple(
@@ -810,7 +1751,7 @@ class DataCollatorForSupervisedDataset(object):
         if "rgb" in instances[0]:
             images = [instance["rgb"] for instance in instances]
             if not isinstance(images[0], Image.Image) and all(
-                x is not None and x.shape == images[0].shape for x in images
+                    x is not None and x.shape == images[0].shape for x in images
             ):
                 batch["rgb"] = torch.stack(images)
             else:
@@ -818,6 +1759,93 @@ class DataCollatorForSupervisedDataset(object):
 
         if "valid_image" in instances[0]:
             batch["valid_image"] = torch.tensor([instance["valid_image"] for instance in instances])
+
+        if "tsm" in instances[0]:
+            tsm_items = [instance.get("tsm", None) for instance in instances]
+            mask_items = [instance.get("mask", None) for instance in instances]
+            ref_tsm = next((x for x in tsm_items if torch.is_tensor(x)), None)
+            if ref_tsm is not None:
+                batch_tsm = []
+                batch_mask = []
+                valid_physics = []
+                for tsm_i, mask_i in zip(tsm_items, mask_items):
+                    if torch.is_tensor(tsm_i):
+                        cur_tsm = tsm_i
+                        cur_mask = mask_i if torch.is_tensor(mask_i) else torch.ones_like(tsm_i)
+                        valid_physics.append(True)
+                    else:
+                        cur_tsm = torch.zeros_like(ref_tsm)
+                        cur_mask = torch.zeros_like(ref_tsm)
+                        valid_physics.append(False)
+                    batch_tsm.append(cur_tsm)
+                    batch_mask.append(cur_mask)
+                batch["tsm"] = torch.stack(batch_tsm).unsqueeze(1)   # [B,1,H,W]
+                batch["mask"] = torch.stack(batch_mask).unsqueeze(1)  # [B,1,H,W]
+                batch["valid_physics"] = torch.tensor(valid_physics, dtype=torch.bool)
+            else:
+                batch["tsm"] = None
+                batch["mask"] = None
+                batch["valid_physics"] = torch.zeros(len(instances), dtype=torch.bool)
+        else:
+            batch["tsm"] = None
+            batch["mask"] = None
+            batch["valid_physics"] = torch.zeros(len(instances), dtype=torch.bool)
+
+        # 添加task_ids和category_ids
+        if "task_id" in instances[0]:
+            task_ids = [instance["task_id"] for instance in instances]
+            batch["task_ids"] = torch.tensor(task_ids, dtype=torch.long)
+
+        if "category_id" in instances[0]:
+            category_ids = [instance["category_id"] for instance in instances]
+            batch["category_ids"] = torch.tensor(category_ids, dtype=torch.long)
+
+        # 物理提示文本 -> token ids（在 collate 中统一 pad）
+        if "physical_prompt" in instances[0]:
+            phys_texts = [instance.get("physical_prompt", "") for instance in instances]
+            phys_max_len = self._resolve_max_len(self.physical_prompt_max_len)
+            phys_tokens = self.tokenizer(
+                phys_texts,
+                padding="max_length",
+                truncation=True,
+                max_length=phys_max_len,
+                return_tensors="pt",
+            )
+            batch["physical_prompt_ids"] = phys_tokens.input_ids
+            batch["physical_prompt_attention_mask"] = phys_tokens.attention_mask
+        else:
+            batch["physical_prompt_ids"] = None
+            batch["physical_prompt_attention_mask"] = None
+
+        if "task_text" in instances[0]:
+            task_texts = [instance.get("task_text", "描述") for instance in instances]
+            task_tokens = self.tokenizer(
+                task_texts,
+                padding="max_length",
+                truncation=True,
+                max_length=self._resolve_max_len(self.task_text_max_len),
+                return_tensors="pt",
+            )
+            batch["task_text_ids"] = task_tokens.input_ids
+            batch["task_text_attention_mask"] = task_tokens.attention_mask
+        else:
+            batch["task_text_ids"] = None
+            batch["task_text_attention_mask"] = None
+
+        if "element_text" in instances[0]:
+            element_texts = [instance.get("element_text", "无") for instance in instances]
+            element_tokens = self.tokenizer(
+                element_texts,
+                padding="max_length",
+                truncation=True,
+                max_length=self._resolve_max_len(self.element_text_max_len),
+                return_tensors="pt",
+            )
+            batch["element_text_ids"] = element_tokens.input_ids
+            batch["element_text_attention_mask"] = element_tokens.attention_mask
+        else:
+            batch["element_text_ids"] = None
+            batch["element_text_attention_mask"] = None
 
         return batch
 
@@ -854,7 +1882,7 @@ class DataCollatorForVGSupervisedDataset(object):
 
         images = [instance[0] for instance in instances]
         if not isinstance(images[0], Image.Image) and all(
-            x is not None and x.shape == images[0].shape for x in images
+                x is not None and x.shape == images[0].shape for x in images
         ):
             images = torch.stack(images)
         else:
@@ -867,8 +1895,8 @@ class DataCollatorForVGSupervisedDataset(object):
 
 
 def preprocess_multimodal(
-    sources: List[Dict[str, str]],
-    tune_im_start: bool = False,
+        sources: List[Dict[str, str]],
+        tune_im_start: bool = False,
 ) -> List[Dict[str, str]]:
     if not isinstance(sources, list):
         sources = [sources]
@@ -894,9 +1922,9 @@ def preprocess_multimodal(
 
 
 def preprocess_llama_2(
-    sources,
-    tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False,
+        sources,
+        tokenizer: transformers.PreTrainedTokenizer,
+        has_image: bool = False,
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"Question": conv.roles[0], "Answer": conv.roles[1], "value": conv.roles[1]}
@@ -949,7 +1977,7 @@ def preprocess_llama_2(
             round_len = len(tokenizer_image_token(rou, tokenizer))
             instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 2
 
-            target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
+            target[cur_len: cur_len + instruction_len] = IGNORE_INDEX
 
             cur_len += round_len
         target[cur_len:] = IGNORE_INDEX
@@ -965,8 +1993,8 @@ def preprocess_llama_2(
 
 
 def preprocess_plain(
-    sources: Sequence[Dict],
-    tokenizer: transformers.PreTrainedTokenizer,
+        sources: Sequence[Dict],
+        tokenizer: transformers.PreTrainedTokenizer,
 ) -> Dict:
     # add end signal and concatenate together
     conversations = []
@@ -1041,7 +2069,7 @@ def preprocess_v1(sources, tokenizer: transformers.PreTrainedTokenizer, has_imag
                 round_len = len(tokenizer(rou).input_ids)
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 2
 
-            target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
+            target[cur_len: cur_len + instruction_len] = IGNORE_INDEX
 
             cur_len += round_len
         target[cur_len:] = IGNORE_INDEX
@@ -1061,9 +2089,9 @@ def preprocess_v1(sources, tokenizer: transformers.PreTrainedTokenizer, has_imag
 
 
 def preprocess(
-    sources: Sequence[str],
-    tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False,
+        sources: Sequence[str],
+        tokenizer: transformers.PreTrainedTokenizer,
+        has_image: bool = False,
 ) -> Dict:
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
         return preprocess_plain(sources, tokenizer)
@@ -1075,7 +2103,18 @@ def preprocess(
 
 
 def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors=None):
-    prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split("<image>")]
+    max_len = getattr(tokenizer, "model_max_length", None)
+    use_truncation = isinstance(max_len, int) and 0 < max_len < 10**6
+    tokenize_kwargs = {}
+    if use_truncation:
+        tokenize_kwargs.update(
+            dict(
+                truncation=True,
+                max_length=int(max_len),
+                verbose=False,
+            )
+        )
+    prompt_chunks = [tokenizer(chunk, **tokenize_kwargs).input_ids for chunk in prompt.split("<image>")]
 
     def insert_separator(X, sep):
         return [ele for sublist in zip(X, [sep] * len(X)) for ele in sublist][:-1]
@@ -1088,6 +2127,9 @@ def tokenizer_image_token(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX
 
     for x in insert_separator(prompt_chunks, [image_token_index] * (offset + 1)):
         input_ids.extend(x[offset:])
+
+    if use_truncation and len(input_ids) > int(max_len):
+        input_ids = input_ids[: int(max_len)]
 
     if return_tensors is not None:
         if return_tensors == "pt":

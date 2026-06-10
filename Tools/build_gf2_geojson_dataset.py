@@ -20,8 +20,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from Models.loc_tokens import (  # noqa: E402
-    DEFAULT_LOC_BINS,
+from utils.geojson_coordinate_utils import (  # noqa: E402
     encode_feature_collection,
     repair_mojibake_in_obj,
     tile_transform_from_feature_collection,
@@ -162,15 +161,6 @@ def parse_args() -> argparse.Namespace:
             "Replace absolute lon/lat in answers with tile-normalised [0, 1] "
             "coordinates. The per-tile affine transform is stored in each "
             "sample so inference output can be de-normalised back to lon/lat."
-        ),
-    )
-    parser.add_argument(
-        "--quantize-coords",
-        type=int,
-        default=0,
-        help=(
-            "If >0, quantise normalised coordinates onto N location tokens of "
-            "the form '<loc_idx>'. Implies --normalize-coords. Recommended: 1000."
         ),
     )
     parser.add_argument(
@@ -793,7 +783,6 @@ def build_dataset(
     multiturn: bool = False,
     max_chars_per_turn: int = 3000,
     normalize_coords: bool = False,
-    quantize_coords: int = 0,
     tile_padding: float = 0.02,
     repair_mojibake: bool = True,
 ) -> Path:
@@ -811,7 +800,12 @@ def build_dataset(
     compressed_char_lengths: List[int] = []
 
     for sensor_name, sensor_root in sensor_roots:
-        for size_dir in resolve_size_dirs(sensor_root, size_filter):
+        try:
+            size_dirs = resolve_size_dirs(sensor_root, size_filter)
+        except FileNotFoundError:
+            print(f"[WARN] {sensor_name} at {sensor_root} has no matching sizes; skip.")
+            continue
+        for size_dir in size_dirs:
             image_dir = size_dir / image_subdir
             label_dir = size_dir / label_subdir
             if not image_dir.exists() or not label_dir.exists():
@@ -872,7 +866,7 @@ def build_dataset(
                 # Resolve the tile-relative geo transform once per source tile.
                 tile_transform = None
                 tile_transform_source = "none"
-                if normalize_coords or quantize_coords > 0:
+                if normalize_coords:
                     tile_transform = tile_transform_from_raster(image_path)
                     if tile_transform is not None:
                         tile_transform_source = "raster"
@@ -897,7 +891,6 @@ def build_dataset(
                             encoded_sub = encode_feature_collection(
                                 sc,
                                 transform=tile_transform,
-                                quantize_bins=int(quantize_coords) if quantize_coords > 0 else None,
                             )
                         else:
                             encoded_sub = sc
@@ -914,11 +907,7 @@ def build_dataset(
                     answer_chars = max(
                         len(dumps_feature_collection(sc, compact=True)) for sc in encoded_subs
                     )
-                    coord_encoding = (
-                        "loc_tokens"
-                        if tile_transform is not None and quantize_coords > 0
-                        else ("normalized" if tile_transform is not None else "absolute")
-                    )
+                    coord_encoding = "normalized" if tile_transform is not None else "absolute"
                     sample_record = {
                         "name": dst_image_rel.as_posix(),
                         "sample_id": base_sample_id,
@@ -937,8 +926,6 @@ def build_dataset(
                     if tile_transform is not None:
                         sample_record["tile_transform"] = tile_transform
                         sample_record["tile_transform_source"] = tile_transform_source
-                        if quantize_coords > 0:
-                            sample_record["quantize_bins"] = int(quantize_coords)
                     samples.append(sample_record)
                     compressed_char_lengths.append(answer_chars)
                 else:
@@ -949,7 +936,6 @@ def build_dataset(
                             answer_collection = encode_feature_collection(
                                 sub_collection,
                                 transform=tile_transform,
-                                quantize_bins=int(quantize_coords) if quantize_coords > 0 else None,
                             )
 
                         compact_answer_text = dumps_feature_collection(answer_collection, compact=True)
@@ -975,10 +961,7 @@ def build_dataset(
                             for conv in convs:
                                 conv["Answer"] = non_compact_text
 
-                        coord_encoding = (
-                            "loc_tokens" if tile_transform is not None and quantize_coords > 0
-                            else ("normalized" if tile_transform is not None else "absolute")
-                        )
+                        coord_encoding = "normalized" if tile_transform is not None else "absolute"
 
                         for prompt_idx, conv in enumerate(convs, start=1):
                             prompt_sample_id = (
@@ -1005,8 +988,6 @@ def build_dataset(
                             if tile_transform is not None:
                                 sample_record["tile_transform"] = tile_transform
                                 sample_record["tile_transform_source"] = tile_transform_source
-                                if quantize_coords > 0:
-                                    sample_record["quantize_bins"] = int(quantize_coords)
                             samples.append(sample_record)
 
     # Save coordinate transform parameters for inference coordinate de-normalization
@@ -1055,7 +1036,6 @@ def build_dataset(
                 },
                 "coord_encoding": {
                     "normalize_coords": bool(normalize_coords),
-                    "quantize_coords": int(quantize_coords),
                     "tile_padding": float(tile_padding),
                     "prompt_variants": int(prompt_variants),
                     "repair_mojibake": bool(repair_mojibake),
@@ -1106,8 +1086,7 @@ def main() -> None:
         merge_by_properties=not bool(args.disable_merge_by_properties),
         split_by_answer_budget=not bool(args.disable_split_by_answer_budget),
         prompt_variants=int(args.prompt_variants),
-        normalize_coords=bool(args.normalize_coords) or int(args.quantize_coords) > 0,
-        quantize_coords=int(args.quantize_coords),
+        normalize_coords=bool(args.normalize_coords),
         tile_padding=float(args.tile_padding),
         repair_mojibake=bool(args.repair_mojibake),
         multiturn=bool(args.multiturn),

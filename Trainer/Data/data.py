@@ -9,6 +9,7 @@ from PIL import Image
 from torch.utils.data import ConcatDataset, Dataset
 
 from .transform import *
+import torch_npu
 
 
 # 定义基础数据集类，继承自 torch.utils.data.Dataset
@@ -97,16 +98,16 @@ class BaseMaskDataset(BaseDataset):
     def __init__(
         self,
         grid_size: int = 7,  # 网格大小
-        input_size: Union[List, Tuple] = [224, 224],  # 输入图像尺寸
-        crop_size: Union[List, Tuple] = [224, 224],  # 裁剪后的图像尺寸
+        default_input_size: Union[List, Tuple] = [224, 224],  # 输入图像尺寸
+        default_crop_size: Union[List, Tuple] = [224, 224],  # 裁剪后的图像尺寸
         crop_num: int = 2,  # 裁剪的数量
         **kwargs,
     ) -> None:
         super(BaseMaskDataset, self).__init__(**kwargs)
         # 确保模式为预训练模式
         assert self.mode == "pretrain", "BaseMaskDataset Only Support to mask dataset"
-        self.input_size = input_size  # 存储输入图像尺寸
-        self.crop_size = crop_size  # 存储裁剪后的图像尺寸
+        self.input_size = default_input_size  # 存储输入图像尺寸
+        self.crop_size = default_crop_size  # 存储裁剪后的图像尺寸
         self.crop_num = crop_num  # 存储裁剪数量
         self.grid_size = grid_size  # 存储网格大小
         self.transform = get_pretrain_transform(self.crop_size, type="image")  # 获取图像变换函数

@@ -93,11 +93,28 @@ class LoggerHook(HookBase):
         else:
             max_mem_mb = None
 
-        loss_strings = [
-            f"{key}: {his_buf.avg:.4g}"
-            for key, his_buf in self.metric_storage.items()
-            if "loss" in key or "acc" in key
+        loss_metric_keys = [
+            key for key in self.metric_storage.keys() if "loss" in key or "acc" in key
         ]
+        loss_strings = []
+        for key in loss_metric_keys:
+            value = self.metric_storage[key].avg
+            if "route_loss" in key or "route_kl" in key or "route_effect" in key:
+                loss_strings.append(f"{key}: {value:.3e}")
+            else:
+                loss_strings.append(f"{key}: {value:.4g}")
+        moe_metric_keys = [
+            key
+            for key in self.metric_storage.keys()
+            if key.startswith("mm_moe_") and key not in loss_metric_keys
+        ]
+        moe_strings = []
+        for key in sorted(moe_metric_keys):
+            value = self.metric_storage[key].avg
+            if "route_loss" in key or "route_kl" in key or "route_effect" in key:
+                moe_strings.append(f"{key}: {value:.3e}")
+            else:
+                moe_strings.append(f"{key}: {value:.4g}")
 
         if hasattr(self.trainer, "epoch"):
             process_string = f"Epoch: [{self.trainer.epoch}][{self.trainer.inner_iter}/{self.trainer.epoch_len - 1}]"
@@ -119,10 +136,11 @@ class LoggerHook(HookBase):
 
         space = " " * 2
         logger.info(
-            "{process}{eta}{losses}{iter_time}{data_time}{lr}{memory}{tau}{grad_norm}".format(
+            "{process}{eta}{losses}{moe}{iter_time}{data_time}{lr}{memory}{tau}{grad_norm}".format(
                 process=process_string,
                 eta=space + f"ETA: {eta_string}" if eta_string is not None else "",
                 losses=space + "  ".join(loss_strings) if loss_strings else "",
+                moe=space + "  ".join(moe_strings) if moe_strings else "",
                 iter_time=(
                     space + f"iter_time: {iter_time:.4f}"
                     if iter_time is not None

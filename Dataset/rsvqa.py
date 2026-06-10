@@ -13,6 +13,7 @@ from transformers import CLIPImageProcessor
 
 from . import conversation as conversation_lib
 from .cap_dataset import preprocess, preprocess_multimodal
+import torch_npu
 
 
 class Compose(T.Compose):

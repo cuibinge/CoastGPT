@@ -3,6 +3,7 @@ import torch  # 导入PyTorch核心库
 import torch.nn as nn  # 导入PyTorch的神经网络模块
 from typing import Dict, List, Optional, Tuple, Union
 from .common_arch import AttnPooler, LayerNorm, LayerNormFp32
+import torch_npu
 
 
 class EmbeddingModel(nn.Module):

@@ -14,6 +14,61 @@ from torch._C._distributed_c10d import ProcessGroup
 logger = logging.getLogger("train")
 
 
+def _resolve_distributed_backend(
+    accelerator: str = "auto", backend: Optional[str] = None
+) -> str:
+    """Resolve torch.distributed backend from accelerator preference."""
+    if backend is not None:
+        return str(backend).lower()
+
+    acc = (accelerator or "auto").lower()
+    if acc == "npu":
+        return "hccl"
+    if acc == "gpu":
+        return "nccl"
+    if acc in {"cpu", "mps"}:
+        return "gloo"
+
+    # auto-detect
+    if hasattr(torch, "npu"):
+        try:
+            if torch.npu.is_available():
+                return "hccl"
+        except Exception:
+            pass
+    if torch.cuda.is_available():
+        return "nccl"
+    return "gloo"
+
+
+def _device_count_for_backend(backend: str) -> int:
+    backend = (backend or "").lower()
+    if backend == "hccl" and hasattr(torch, "npu"):
+        try:
+            return max(1, int(torch.npu.device_count()))
+        except Exception:
+            return 1
+    if backend in {"nccl", "smddp"}:
+        try:
+            return max(1, int(torch.cuda.device_count()))
+        except Exception:
+            return 1
+    return 1
+
+
+def _set_device_for_backend(local_rank: int, backend: str) -> None:
+    backend = (backend or "").lower()
+    if backend == "hccl":
+        if not hasattr(torch, "npu"):
+            raise RuntimeError(
+                "HCCL backend selected, but torch.npu is unavailable. "
+                "Please install torch_npu or switch accelerator/backend."
+            )
+        torch.npu.set_device(local_rank)
+    elif backend in {"nccl", "smddp"}:
+        torch.cuda.set_device(local_rank)
+
+
 def is_distributed() -> bool:
     """Return True if distributed environment has been initialized."""
     return torch_dist.is_available() and torch_dist.is_initialized()
@@ -238,7 +293,7 @@ def _get_global_gloo_group() -> ProcessGroup:
     """Return a process group based on gloo backend, containing all ranks.
     The result is cached.
     """
-    if torch_dist.get_backend() == "nccl":
+    if torch_dist.get_backend() in {"nccl", "hccl", "cncl", "smddp"}:
         return torch_dist.new_group(backend="gloo")
     else:
         return torch_dist.group.WORLD
@@ -499,7 +554,10 @@ def _find_free_port() -> int:
     return port
 
 
-def deepspeed_init_distributed() -> Tuple[int]:
+def deepspeed_init_distributed(
+    accelerator: str = "auto", backend: Optional[str] = None
+) -> Tuple[int, int, int]:
+    dist_backend = _resolve_distributed_backend(accelerator=accelerator, backend=backend)
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         # launched by `torch.distributed.launch`
         rank = int(os.environ["RANK"])
@@ -509,33 +567,44 @@ def deepspeed_init_distributed() -> Tuple[int]:
         # launched by slurm
         rank = int(os.environ["SLURM_PROCID"])
         world_size = int(os.environ["SLURM_NTASKS"])
-        local_rank = rank % torch.cuda.device_count()
+        local_rank = rank % _device_count_for_backend(dist_backend)
     else:
         print("Not using distributed mode.")
         return 0, 0, 1
 
-    print(f"| distributed init (rank {rank})", flush=True)
-    deepspeed.init_distributed()
-    torch_dist.barrier()
-    torch.cuda.set_device(local_rank)
+    print(
+        f"| distributed init (backend={dist_backend}, rank={rank}, local_rank={local_rank}, world_size={world_size})",
+        flush=True,
+    )
+    # HCCL/NCCL must bind local device before communicator init.
+    _set_device_for_backend(local_rank, dist_backend)
+    if not torch_dist.is_initialized():
+        deepspeed.init_distributed(dist_backend=dist_backend)
+    if torch_dist.is_initialized():
+        torch_dist.barrier()
     setup_print_for_distributed(rank == 0)
     return rank, local_rank, world_size
 
 
-def init_distributed(auto: bool = False) -> Tuple[int]:
+def init_distributed(
+    auto: bool = False, accelerator: str = "auto", backend: Optional[str] = None
+) -> Tuple[int, int, int]:
     """Initialize the distributed mode as follows:
 
-    - Initialize the process group, with ``backend="nccl"`` and ``init_method="env://"``.
-    - Set correct cuda device.
+    - Initialize the process group, with backend chosen by accelerator.
+    - Set correct device for backend.
     - Disable printing when not in master process.
 
     Args:
         auto (bool): If True, when MASTER_PORT is not free, automatically find a free one.
             Defaults to False.
+        accelerator (str): Accelerator type ("npu"/"gpu"/"cpu"/"auto").
+        backend (str, optional): Explicit distributed backend override.
 
     Returns:
         tuple: (``rank``, ``local_rank``, ``world_size``)
     """
+    dist_backend = _resolve_distributed_backend(accelerator=accelerator, backend=backend)
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         # launched by `torch.distributed.launch`
         rank = int(os.environ["RANK"])
@@ -545,7 +614,7 @@ def init_distributed(auto: bool = False) -> Tuple[int]:
         # launched by slurm
         rank = int(os.environ["SLURM_PROCID"])
         world_size = int(os.environ["SLURM_NTASKS"])
-        local_rank = rank % torch.cuda.device_count()
+        local_rank = rank % _device_count_for_backend(dist_backend)
     else:
         print("Not using distributed mode.")
         return 0, 0, 1
@@ -565,9 +634,15 @@ def init_distributed(auto: bool = False) -> Tuple[int]:
             print(f"Port {port} is not free, use port {new_port} instead.")
             os.environ["MASTER_PORT"] = new_port
 
-    print(f"| distributed init (rank {rank})", flush=True)
-    torch_dist.init_process_group(backend="nccl")
-    torch_dist.barrier()
-    torch.cuda.set_device(local_rank)
+    print(
+        f"| distributed init (backend={dist_backend}, rank={rank}, local_rank={local_rank}, world_size={world_size})",
+        flush=True,
+    )
+    # Bind local device before process-group init to avoid rank-to-device conflicts.
+    _set_device_for_backend(local_rank, dist_backend)
+    if not torch_dist.is_initialized():
+        torch_dist.init_process_group(backend=dist_backend)
+    if torch_dist.is_initialized():
+        torch_dist.barrier()
     setup_print_for_distributed(rank == 0)
     return rank, local_rank, world_size

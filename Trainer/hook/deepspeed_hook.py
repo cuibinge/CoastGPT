@@ -1,4 +1,5 @@
 from .hookbase import HookBase
+import torch_npu
 
 
 class DeepSpeedHook(HookBase):
@@ -7,6 +8,12 @@ class DeepSpeedHook(HookBase):
         self.trainer._call_hooks("after_backward")
         self.trainer.model.step()
         self.trainer._call_hooks("after_step")
+
+        try:
+            import torch_npu
+            torch_npu.npu.synchronize()
+        except Exception:
+            pass
 
         if (
             self.trainer._clip_grad_norm is not None

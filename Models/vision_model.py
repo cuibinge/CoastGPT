@@ -2,6 +2,7 @@ import ml_collections  # 导入ml_collections库，用于管理配置
 import torch  # 导入PyTorch核心库
 import torch.nn as nn  # 导入PyTorch的神经网络模块
 from transformers import CLIPVisionModel  # 从transformers库导入CLIP视觉模型
+import torch_npu
 
 # 视觉模型类，继承自nn.Module
 class VisionModel(nn.Module):
