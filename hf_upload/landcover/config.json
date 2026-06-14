@@ -1,0 +1,25 @@
+{
+  "model_type": "coastgpt-landcover-semantic",
+  "architectures": ["LandcoverSemanticHead"],
+  "in_channels": 256,
+  "num_classes": 25,
+  "ignore_index": 255,
+  "output_size": [224, 224],
+  "backbone": {
+    "arch": "dual",
+    "global_encoder": "dinov3_vitl16",
+    "local_encoder": "convnext_base",
+    "alignment_dim": 1024,
+    "pretrained_weights": [
+      "dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth",
+      "dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth"
+    ]
+  },
+  "training": {
+    "dataset": "GF1 21-class land cover tiles (Stage3Data/土地分类)",
+    "image_size": 224,
+    "loss": "CE + Dice",
+    "best_miou": 0.7135,
+    "epochs": 1
+  }
+}
