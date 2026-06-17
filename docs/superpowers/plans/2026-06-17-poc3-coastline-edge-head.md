@@ -22,7 +22,38 @@
 | `configs/poc3_edge_a0_closure.yaml` | Create | A0 BCE+Dice single-scale config |
 | `scripts/poc_stage_edge.py` | Create | train/eval entrypoint (single NPU) |
 
-**Dependency order:** Tasks 1-4 are independent. Task 5 depends on Task 3 (uses postprocess in dry-run). Task 6 is independent. Task 7 depends on all.
+**Dependency order:** Tasks 1-4 are independent. Task 5 depends on Task 3 (uses postprocess in dry-run). Task 6 is independent. Task 7 depends on all. Task 0 (pre-flight) runs first and gates all subsequent tasks. Task 8 (overfit test) gates A0 full training.
+
+**Gate-driven execution DAG:**
+
+```text
+Task 0: Pre-flight sanity (manifest, GT overlay, fg_ratio, round-trip)
+  ↓ GATE: all checks pass
+Tasks 1-6: Build modules (losses, head, postprocess, metrics, dataset, config)
+  ↓
+Task 7: A0 plan assembled
+  ↓
+Task 8: A0 2-sample overfit (200 iter)
+  ↓ GATE: loss decreases, heatmap responds, no NaN
+Task 7 full: A0 full training (20 epochs)
+  ↓ GATE A0: GT ok, loss down, GeoJSON闭环
+A1: Focal+Dice + threshold sweep   [future plan]
+  ↓ GATE A1
+A2: Multi-scale deep supervision    [future plan]
+  ↓ GATE A2
+A4: Topology-aware postprocess      [future plan]
+  ↓ GATE A4 → PoC-3 pass
+```
+
+**Debug priority when A0 fails:**
+
+| Priority | Suspect | Check |
+|---|---|---|
+| 40% | CRS / pixel transform error | `source_crs`, `model_transform`, `resize_georef` |
+| 25% | GT rasterization inconsistent | GT overlay visual, `fg_ratio`, `densify` step |
+| 15% | Threshold calibration | Heatmap min/max/mean, try lower threshold |
+| 10% | Skeleton/graph bug | `binary_to_skeleton` output, component count |
+| 10% | Model capacity/feature issue | Overfit test first, check FPN grads |
 
 ---
 
@@ -2363,4 +2394,270 @@ Expected: loads vision encoder, builds FPN + edge head, runs 1 training epoch wi
 ```bash
 git add scripts/poc_stage_edge.py && git commit -m "feat: add PoC-3 edge head training script (A0 BCE+Dice single-NPU)"
 ```
+
+---
+
+### Task 0: Pre-flight Sanity (run BEFORE any code tasks)
+
+**Purpose:** Verify data pipeline correctness before writing a single line of training code.
+
+- [ ] **Step 1: Scan dataset directories and count tiles**
+
+```bash
+cd /home/ma-user/work/CoastGPT && python -c "
+import os
+roots = [
+    '/home/ma-user/work/Stage3Data/海岸线/RS-海岸线二级/Patches',
+    '/home/ma-user/work/Stage3Data/海岸线/RS-海岸线一级/Patches',
+]
+total_img, total_bin, total_geo = 0, 0, 0
+for root in roots:
+    for dirpath, dirnames, filenames in os.walk(root):
+        for f in filenames:
+            if 'Image_Orig' in dirpath and f.endswith('.tif') and not f.startswith('._'):
+                total_img += 1
+                tile = f.replace('_Orig_WRZ.tif', '')
+                bin_path = dirpath.replace('Image_Orig', 'Label_Binary') + '/' + tile + '_Binary_WRZ.tif'
+                geo_path = dirpath.replace('Image_Orig', 'Label_GeoJSON') + '/' + tile + '_Label_WRZ.geojson'
+                if os.path.exists(bin_path): total_bin += 1
+                if os.path.exists(geo_path): total_geo += 1
+print(f'Total tiles: {total_img}')
+print(f'With Binary TIF: {total_bin}/{total_img} ({100*total_bin/max(1,total_img):.0f}%)')
+print(f'With GeoJSON:   {total_geo}/{total_img} ({100*total_geo/max(1,total_img):.0f}%)')
+"
+```
+
+Expected: 954 tiles, 100% Binary TIF coverage, 100% GeoJSON coverage.
+
+- [ ] **Step 2: Load one sample, check image + GT + fg_ratio**
+
+```bash
+cd /home/ma-user/work/CoastGPT && python -c "
+import sys; sys.path.insert(0, '.')
+from Dataset.coastline_dataset import CoastlineEdgeDataset, build_coastline_manifest
+import numpy as np
+
+roots = [
+    '/home/ma-user/work/Stage3Data/海岸线/RS-海岸线二级/Patches',
+    '/home/ma-user/work/Stage3Data/海岸线/RS-海岸线一级/Patches',
+]
+manifest = build_coastline_manifest(roots, '/tmp/poc3_preflight_manifest.json', val_ratio=0.2)
+print(f'Train tiles: {len(manifest[\"train\"])}, Val tiles: {len(manifest[\"val\"])}')
+
+ds = CoastlineEdgeDataset(manifest['train'][:8], line_width=3)
+for i in range(min(4, len(ds))):
+    s = ds[i]
+    img, tgt = s['image'], s['target']
+    fg = tgt.mean().item()
+    status = 'OK' if 0.001 < fg < 0.08 else 'WARN'
+    print(f'  [{i}] {s[\"meta\"][\"sample_id\"]}: img={list(img.shape)} tgt={list(tgt.shape)} fg_ratio={fg:.4f} {status}')
+"
+```
+
+Expected: all samples show `fg_ratio` between 0.001 and 0.08 (0.1%-8%). WARN if outside this range.
+
+- [ ] **Step 3: Export GT overlay for visual inspection**
+
+```bash
+cd /home/ma-user/work/CoastGPT && python -c "
+import sys; sys.path.insert(0, '.')
+from Dataset.coastline_dataset import CoastlineEdgeDataset, build_coastline_manifest
+import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
+import numpy as np
+from pathlib import Path
+
+roots = [
+    '/home/ma-user/work/Stage3Data/海岸线/RS-海岸线二级/Patches',
+    '/home/ma-user/work/Stage3Data/海岸线/RS-海岸线一级/Patches',
+]
+manifest = build_coastline_manifest(roots, '/tmp/poc3_preflight_manifest.json', val_ratio=0.2)
+ds = CoastlineEdgeDataset(manifest['train'][:6], line_width=3)
+
+out_dir = Path('outputs/poc3_edge/preflight/gt_overlay')
+out_dir.mkdir(parents=True, exist_ok=True)
+
+for i in range(min(6, len(ds))):
+    s = ds[i]
+    img = s['image'].permute(1,2,0).numpy()
+    tgt = s['target'][0].numpy()
+    sid = s['meta']['sample_id']
+    
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(15, 5))
+    ax1.imshow(np.clip(img, 0, 1))
+    ax1.set_title('Image'); ax1.axis('off')
+    ax2.imshow(tgt, cmap='gray')
+    ax2.set_title(f'GT (fg={tgt.mean():.4f})'); ax2.axis('off')
+    ax3.imshow(np.clip(img, 0, 1))
+    ax3.imshow(tgt, cmap='Reds', alpha=0.5)
+    ax3.set_title('Overlay'); ax3.axis('off')
+    plt.suptitle(sid, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(str(out_dir / f'{i:02d}_{sid[:60]}_gt.png'), dpi=100)
+    plt.close()
+    print(f'  Saved overlay {i}: {sid}')
+print(f'Overlays saved to {out_dir}')
+"
+```
+
+Open `outputs/poc3_edge/preflight/gt_overlay/` and verify: GT red lines align with visible coastline in the image. If GT is visibly offset from the coastline, stop — CRS/affine is wrong.
+
+- [ ] **Step 4: Round-trip check on one sample**
+
+```bash
+cd /home/ma-user/work/CoastGPT && python -c "
+import sys, json; sys.path.insert(0, '.')
+from utils.georef_transform import wgs84_to_pixel, pixel_to_wgs84, round_trip_check, resize_georef
+import numpy as np
+
+# Load a sample GeoJSON and check round-trip
+with open('/home/ma-user/work/Stage3Data/海岸线/RS-海岸线二级/Patches/砂质岸线/GF2/Size_128/Label_GeoJSON/砂质岸线_GF2_PMS2_E119.3_N34.7_20250703_浅海区_R073C213_128_Label_WRZ.geojson') as f:
+    gj = json.load(f)
+
+coords = gj['features'][0]['geometry']['coordinates'][:5]  # first 5 points
+original_transform = [1e-5, 0.0, 119.300000, 0.0, -1e-5, 35.072560]
+model_transform, _ = resize_georef((128, 128), (224, 224), original_transform)
+
+georef = {'source_crs': 'EPSG:4326', 'model_transform': model_transform}
+
+# WGS84 → pixel
+pixel = wgs84_to_pixel([(lon, lat) for lon, lat in coords], georef)
+print(f'  Pixel coords: {[(round(c,1), round(r,1)) for c,r in pixel[:3]]}...')
+
+# pixel → WGS84
+back = pixel_to_wgs84(pixel, georef)
+for i, ((lon1, lat1), (lon2, lat2)) in enumerate(zip(coords, back)):
+    err = np.sqrt((lon1-lon2)**2 + (lat1-lat2)**2)
+    print(f'  Point {i}: err={err:.2e} deg')
+print('Round-trip OK' if all(np.sqrt((a[0]-b[0])**2+(a[1]-b[1])**2) < 1e-6 for a,b in zip(coords, back)) else 'Round-trip FAIL')
+"
+```
+
+Expected: all errors < 1e-6 degree.
+
+- [ ] **Step 5: Gate Pre-flight**
+
+All must pass before proceeding to code tasks:
+- [x] Dataset scan: 954 tiles, 100% Binary TIF
+- [x] GT fg_ratio in [0.001, 0.08] for all samples
+- [x] GT overlay: red lines align with visible coastline
+- [x] Round-trip error < 1e-6 degree for all points
+
+---
+
+### Task 8: A0 2-Sample Overfit Test (after Task 7 code is written)
+
+**Purpose:** Before full training, verify model can overfit 2 samples — confirms no architecture/loss/optimizer bugs.
+
+- [ ] **Step 1: Run 2-sample overfit on CPU (200 iterations)**
+
+```bash
+cd /home/ma-user/work/CoastGPT && python -c "
+import sys; sys.path.insert(0, '.')
+import torch, numpy as np
+from Models.dual_vision_encoder import DualVisionEncoder
+from Models.fpn_neck import FPNNeck
+from Models.edge_head import SingleScaleEdgeHead
+from Dataset.coastline_dataset import CoastlineEdgeDataset, build_coastline_manifest, coastline_collate_fn
+from utils.edge_losses import edge_bce_dice_loss
+from ml_collections import ConfigDict
+import yaml
+
+# Load config
+with open('configs/poc3_edge_a0_closure.yaml') as f:
+    cfg = ConfigDict(yaml.safe_load(f))
+
+# Build minimal dataset (2 samples)
+roots = cfg['data']['roots']
+manifest = build_coastline_manifest(roots, '/tmp/poc3_overfit_manifest.json', val_ratio=0.0)
+ds = CoastlineEdgeDataset(manifest['train'][:2], line_width=3)
+loader = torch.utils.data.DataLoader(ds, batch_size=2, collate_fn=coastline_collate_fn)
+
+# Build model on CPU
+device = torch.device('cpu')
+model_cfg = ConfigDict(cfg['model'])
+vision = DualVisionEncoder(model_cfg)
+ckpt = torch.load(cfg['model']['vision_checkpoint'], map_location='cpu')
+if 'vision_ckpt' in ckpt:
+    sd = ckpt['vision_ckpt']
+elif 'model' in ckpt:
+    sd = ckpt['model']
+else:
+    sd = ckpt
+sd = {k.replace('module.','').replace('vision.',''): v for k,v in sd.items()}
+vision.load_state_dict(sd, strict=False)
+vision.eval()
+for p in vision.parameters():
+    p.requires_grad = False
+
+fpn = FPNNeck(in_channels=[128,256,512,1024], out_channels=256, vit_in_channels=1024)
+edge_head = SingleScaleEdgeHead(output_size=(224,224))
+
+optimizer = torch.optim.AdamW([
+    {'params': fpn.parameters(), 'lr': 1e-3},
+    {'params': edge_head.parameters(), 'lr': 1e-3},
+])
+
+images, targets, metas = next(iter(loader))
+print(f'Overfit: {len(ds)} samples, image={list(images.shape)}, target_fg={targets.mean().item():.4f}')
+
+for it in range(200):
+    with torch.no_grad():
+        _, g_grid, pyramid_raw = vision.encode_with_spatial(images)
+    c4, c8, c16, c32 = pyramid_raw
+    p1, p2, p3, p4 = fpn(c4, c8, c16, c32, vit_feat=g_grid)
+    logits = edge_head(p1, p2, p3, p4)
+    loss, bce, dice = edge_bce_dice_loss(logits, targets)
+    
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    
+    if it == 0 or (it+1) % 50 == 0:
+        probs = torch.sigmoid(logits)
+        fg_pred = (probs > 0.5).float().mean().item()
+        print(f'  iter {it+1:3d}: loss={loss.item():.4f} bce={bce.item():.4f} dice={dice.item():.4f} pred_fg={fg_pred:.4f}')
+
+# Final check
+probs = torch.sigmoid(logits)
+fg_pred = (probs > 0.5).float().mean().item()
+has_response = fg_pred > 0.0001
+loss_decreased = loss.item() < 1.0
+print(f'\\nOverfit result: loss={loss.item():.4f}, pred_fg={fg_pred:.4f}')
+print(f'  Loss decreased: {\"PASS\" if loss_decreased else \"FAIL\"} (need < 1.0)')
+print(f'  Heatmap responds: {\"PASS\" if has_response else \"FAIL\"} (need fg > 0.01%)')
+print(f'  No NaN: {\"PASS\" if not torch.isnan(loss) else \"FAIL\"}')
+"
+```
+
+Expected after 200 iterations: loss < 1.0, `pred_fg > 0.0001` (heatmap not all-black), no NaN.
+
+- [ ] **Step 2: Gate Overfit → A0 full training**
+
+All must pass:
+- [x] loss decreased below 1.0
+- [x] heatmap has foreground response (not all-black)
+- [x] no NaN / inf
+
+If overfit fails, DO NOT proceed to full A0 training. Debug: check GT fg_ratio, try higher LR (1e-3), check FPN gradients are non-zero.
+
+If overfit passes, proceed to A0 full training:
+```bash
+cd /home/ma-user/work/CoastGPT && python scripts/poc_stage_edge.py \
+  --config configs/poc3_edge_a0_closure.yaml --device npu
+```
+
+---
+
+### A0 Gate Checklist (after full training completes)
+
+Before moving to A1:
+- [ ] GT overlay: edge lines align with visible coastline
+- [ ] WGS84 ↔ pixel round-trip error < 1e-6 degree
+- [ ] Training loss decreased steadily
+- [ ] Validation heatmap not all-background
+- [ ] Skeleton produces valid polylines (>= 1 path for positive tiles)
+- [ ] GeoJSON parse success rate > 99%
+- [ ] Geometry valid rate >= 90%
+- [ ] Coordinate-in-tile rate = 100%
+- [ ] Empty-output tiles produce features=[]
 
