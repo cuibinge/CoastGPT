@@ -1,4 +1,4 @@
-import json
+﻿import json
 import logging
 import os
 
@@ -14,11 +14,13 @@ from ..utils.distribute import get_rank, get_world_size, is_distributed, is_main
 from .hookbase import HookBase
 from .knn_eval_hook import MetricLogger
 from .logger_hook import LoggerHook
-import torch_npu
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 logger = logging.getLogger("train")
 
-#源于mmdet.hooks.EvalHook
 class EvalHook(HookBase):
     """Run an evaluation function periodically.
 

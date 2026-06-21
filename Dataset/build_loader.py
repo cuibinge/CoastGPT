@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 import math
 
 import braceexpand
@@ -12,7 +12,7 @@ from .build_transform import build_cls_transform, build_vlp_transform
 from .cap_dataset import (
     CaptionDatasetVQA,
     DataCollatorForSupervisedDataset,
-    InstructDatasetWithTaskId,
+    InstructDatasetWithCondition,
     RS5MDataset,
 )
 from .ImageFolderInstance import ImageFolderInstance
@@ -28,18 +28,7 @@ def build_loader_hepler(
     collate_fn=None,
     is_train: bool = True,
 ):
-    """
-    辅助函数，用于构建数据加载器。
-
-    参数:
-    config (ml_collections.ConfigDict): 配置字典，包含数据加载的相关参数。
-    dataset (torch.utils.data.Dataset): 数据集对象。
-    collate_fn (callable, optional): 用于合并样本列表以形成小批量的函数。
-    is_train (bool, optional): 是否为训练阶段，默认为True。
-
-    返回:
-    torch.utils.data.DataLoader: 数据加载器对象。
-    """
+    """Build a torch dataloader for a dataset."""
     if config.is_distribute:
         sampler = DistributedSampler(dataset, shuffle=True)
     elif config.inf_sampler and is_train:
@@ -71,19 +60,7 @@ def build_loader_hepler(
 def build_vlp_loader(
     config: ml_collections.ConfigDict, is_train: bool = True, num_channels=3, **kwargs
 ):
-    """
-    构建用于视觉语言预训练（VLP）的数据集加载器。
-
-    参数:
-    config (ml_collections.ConfigDict): 配置字典，包含数据加载的相关参数。
-    is_train (bool, optional): 是否为训练阶段，默认为True。
-    num_channels (int, optional): 图像的通道数，默认为3。
-    **kwargs: 其他关键字参数。
-
-    返回:
-    torch.utils.data.DataLoader 或 wds.WebLoader: 数据加载器对象。
-    """
-    # 构建VLP数据变换，传递通道数信息
+    """Build the vision-language data loader."""
     transform = build_vlp_transform(config, is_train=is_train, num_channels=num_channels)
     logger.info(f"Evaluate data transform:\n{transform}")
 
@@ -106,7 +83,7 @@ def build_vlp_loader(
             geojson_kwargs["geojson_max_answer_tokens"] = int(config.geojson_max_answer_tokens)
         if hasattr(config, "repair_mojibake"):
             geojson_kwargs["repair_mojibake"] = bool(config.repair_mojibake)
-        dataset = InstructDatasetWithTaskId(
+        dataset = InstructDatasetWithCondition(
             root=config.data_path,
             transform=transform,
             crop_size=config.transform.input_size[0],
@@ -138,8 +115,6 @@ def build_vlp_loader(
                 collate_fn=DataCollatorForSupervisedDataset(
                     tokenizer=kwargs["tokenizer"],
                     physical_prompt_max_len=int(getattr(config, "physical_prompt_max_len", 64)),
-                    task_text_max_len=int(getattr(config, "task_text_max_len", 16)),
-                    element_text_max_len=int(getattr(config, "element_text_max_len", 16)),
                 ),
             )
             return loader
@@ -155,8 +130,6 @@ def build_vlp_loader(
                         collation_fn=DataCollatorForSupervisedDataset(
                             tokenizer=kwargs["tokenizer"],
                             physical_prompt_max_len=int(getattr(config, "physical_prompt_max_len", 64)),
-                            task_text_max_len=int(getattr(config, "task_text_max_len", 16)),
-                            element_text_max_len=int(getattr(config, "element_text_max_len", 16)),
                         ),
                     )
                 ]
@@ -202,8 +175,6 @@ def build_vlp_loader(
             collate_fn=DataCollatorForSupervisedDataset(
                 tokenizer=kwargs["tokenizer"],
                 physical_prompt_max_len=int(getattr(config, "physical_prompt_max_len", 64)),
-                task_text_max_len=int(getattr(config, "task_text_max_len", 16)),
-                element_text_max_len=int(getattr(config, "element_text_max_len", 16)),
             ),
         )
         logger.info(f"Build dataloader: Epoch length = {len(dataloader)}")
@@ -213,22 +184,11 @@ def build_vlp_loader(
 def build_zero_shot_loader(
     config: ml_collections.ConfigDict, mode: str = "zero_shot_cls", num_channels=3
 ):
-    """
-    构建零样本学习的数据加载器。
-
-    参数:
-    config (ml_collections.ConfigDict): 配置字典，包含数据加载的相关参数。
-    mode (str, optional): 数据加载器的模式，默认为"zero_shot_cls"。
-    num_channels (int, optional): 图像的通道数，默认为3。
-
-    返回:
-    torch.utils.data.DataLoader: 数据加载器对象。
-    """
+    """Build a zero-shot evaluation data loader."""
     assert mode in ["zero_shot_cls", "zero_shot_retrieval"], (
         "Please choose mode for dataloder from [zero_shot_cls, " "zero_shot_retrieval]"
     )
     if mode == "zero_shot_cls":
-        # 构建分类数据变换，传递通道数信息
         transform = build_cls_transform(config, is_train=False, num_channels=num_channels)
         if config.eval.dataset == "UCM":
             dataset = UCM(
@@ -264,19 +224,7 @@ def build_loader(
     num_channels=3,
     **kwargs,
 ):
-    """
-    构建数据加载器的主函数。
-
-    参数:
-    config (ml_collections.ConfigDict): 配置字典，包含数据加载的相关参数。
-    mode (str, optional): 数据加载器的模式，默认为"pretrain"。
-    is_train (bool, optional): 是否为训练阶段，默认为True。
-    num_channels (int, optional): 图像的通道数，默认为3。
-    **kwargs: 其他关键字参数。
-
-    返回:
-    torch.utils.data.DataLoader 或 wds.WebLoader: 数据加载器对象。
-    """
+    """Build a data loader for the requested mode."""
     assert mode in [
         "pretrain",
     ], "Please choose mode for dataloder from [pretrain]"
@@ -285,16 +233,7 @@ def build_loader(
 
 
 def expand_urls(urls, weights=None):
-    """
-    扩展URL列表。
-
-    参数:
-    urls (str 或 list): URL列表或单个URL字符串。
-    weights (str 或 list, optional): 每个URL的权重列表或单个权重字符串。
-
-    返回:
-    tuple: 扩展后的URL列表和对应的权重列表。
-    """
+    """Expand brace patterns for URL lists and optional weights."""
     if weights is None:
         expanded_urls = wds.shardlists.expand_urls(urls)
         return expanded_urls, None

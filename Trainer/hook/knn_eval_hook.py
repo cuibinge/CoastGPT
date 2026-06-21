@@ -1,4 +1,4 @@
-import datetime
+﻿import datetime
 import json
 import logging
 import os
@@ -10,6 +10,7 @@ from typing import Dict, Optional
 
 import ml_collections
 import torch
+from contextlib import nullcontext
 import torch.nn as nn
 import wandb
 from torch.nn.functional import one_hot, softmax
@@ -19,7 +20,11 @@ from torchmetrics.classification import MulticlassAccuracy
 from ..utils import get_rank, get_world_size, is_distributed, is_main_process
 from .hookbase import HookBase
 from .logger_hook import LoggerHook
-import torch_npu
+from utils.runtime import resolve_accelerator
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 logger = logging.getLogger("train")
 
@@ -37,7 +42,15 @@ class KnnEvaluate(HookBase):
         self.trainer.model_or_module.eval()
         train_loader, test_loader = self.trainer.eval_data_loader
 
-        with torch_npu.npu.amp.autocast(enabled=self.enable_amp):
+        accelerator = resolve_accelerator(getattr(self.trainer, "autocast_type", "auto"))
+        if accelerator == "gpu":
+            amp_context = torch.cuda.amp.autocast(enabled=self.enable_amp)
+        elif accelerator == "npu" and torch_npu is not None:
+            amp_context = torch_npu.npu.amp.autocast(enabled=self.enable_amp)
+        else:
+            amp_context = nullcontext()
+
+        with amp_context:
             results_dict_knn = eval_knn(
                 model=self.trainer.model,
                 train_loader=train_loader,
@@ -339,7 +352,7 @@ class MetricLogger(object):
             "time: {time}",
             "data: {data}",
         ]
-        if torch_npu.npu.is_available():
+        if torch_npu is not None and torch_npu.npu.is_available():
             log_list += ["max mem: {memory:.0f}"]
 
         log_msg = self.delimiter.join(log_list)
@@ -354,7 +367,7 @@ class MetricLogger(object):
                 )
                 eta_seconds = iter_time.global_avg * (n_iterations - i)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
-                if torch_npu.npu.is_available():
+                if torch_npu is not None and torch_npu.npu.is_available():
                     logger.info(
                         log_msg.format(
                             i,

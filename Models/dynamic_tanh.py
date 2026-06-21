@@ -1,7 +1,10 @@
-import torch
+﻿import torch
 import torch.nn as nn
 from timm.layers import LayerNorm2d
-import torch_npu
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 
 class DynamicTanh(nn.Module):

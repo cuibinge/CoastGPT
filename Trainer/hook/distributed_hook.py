@@ -1,5 +1,8 @@
-from .hookbase import HookBase
-import torch_npu
+﻿from .hookbase import HookBase
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 
 class DistributedHook(HookBase):

@@ -1,26 +1,10 @@
-"""
-Global mappings for tasks and elements.
-Keep IDs in sync with MoEProjection(num_tasks, num_elements).
+﻿"""Generic dataset constants.
+
+The training pipeline must not route by task class or feature category. These
+constants are kept only for backward-compatible sample metadata fields.
 """
 
-# Task taxonomy
-TASK2ID = {
-    "场景分类": 0,
-    "视觉问答": 1,
-    "视觉定位": 2,
-    "描述": 3,
-    "要素提取": 4,
-}
+GENERIC_CONDITION = "generic"
 
-# Element taxonomy (expand as needed)
-ELEMENT2ID = {
-    "无": 0,
-    "网箱养殖区": 1,
-    "筏式养殖区": 2,
-    "赤潮": 3,
-    "浒苔": 4,
-    "海岸线": 5,
-    "滩涂": 6,
-    "红树林湿地": 7,
-    "土地覆盖": 8,
-}
+TASK2ID = {GENERIC_CONDITION: 0}
+ELEMENT2ID = {GENERIC_CONDITION: 0}

@@ -1,4 +1,4 @@
-import math
+﻿import math
 import os
 import re
 from typing import Dict, Optional, Tuple
@@ -19,7 +19,7 @@ except Exception as e:
 
 class CrossFrequencyAttention(nn.Module):
     """
-    璺ㄩ鍩熶氦鍙夋敞鎰忓姏瀵归綈妯″潡銆?    鏁板閫昏緫锛氫互 ViT (DINO) 鎻愬彇鐨勫叏灞€浣庨璇箟浣滀负 Query锛?    浠?CNN (ConvNeXt) 鎻愬彇鐨勫眬閮ㄩ珮棰戠汗鐞嗕綔涓?Key 鍜?Value锛岃绠楀崗鏂瑰樊鐭╅樀銆?    """
+    genericgenericgenericΟgeneric?    generic?ViT (DINO) genericgenericｅgenericｆgeneric?Querygeneric?    generic?CNN (ConvNeXt) genericgenericgeneric０generic?Key generic?Valuegeneric€generic▕genericgeneric€generic?    """
     def __init__(self, vit_dim, cnn_dim, num_heads=8):
         super().__init__()
         self.q_proj = nn.Linear(vit_dim, vit_dim)
@@ -39,17 +39,15 @@ class CrossFrequencyAttention(nn.Module):
     def forward(self, z_vit, z_cnn):
         """
         Args:
-            z_vit: [B, N_vit, C_vit] 浣庨璇箟瀹忚娴佸舰
-            z_cnn: [B, N_cnn, C_cnn] 楂橀绾圭悊寰娴佸舰
+            z_vit: [B, N_vit, C_vit] genericｅgenericùgeneric
+            z_cnn: [B, N_cnn, C_cnn] generic﹢genericgenericùgeneric
         """
         Q = self.q_proj(z_vit)
         K = self.k_proj(z_cnn)
         V = self.v_proj(z_cnn)
 
-        # 娉ㄦ剰鍔涜绠楋細Q (瀹忚) 妫€绱?K (寰)锛屾彁鍙?V (灞€閮ㄧ壒寰?
         attn_out, _ = self.attn(query=Q, key=K, value=V)
         
-        # 娈嬪樊杩炴帴锛氫繚鐣欏師濮嬩綆棰戞嫇鎵戠殑鍚屾椂娉ㄥ叆楂橀缁嗚妭
         z_fused = self.norm1(z_vit + attn_out)
         out = self.norm2(z_fused + self.ffn(z_fused))
         return out

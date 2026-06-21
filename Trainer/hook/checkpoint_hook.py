@@ -1,13 +1,16 @@
-import os
+﻿import os
 import os.path as osp
 import shutil
 from typing import Any, Dict, List, Optional
 
 from ..utils.distribute import is_main_process
 from .hookbase import HookBase
-import torch_npu
+from .runtime import synchronize_device
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
-#源于mmengine.hooks.CheckpointHook
 class CheckpointerHook(HookBase):
     """
     Save checkpoints periodically.
@@ -66,11 +69,7 @@ class IterCheckpointerHook(CheckpointerHook):
                 checkpoint_name = f"iter_{iter}.pth"
             else:
                 checkpoint_name = f"iter_{iter}"
-            try:
-                import torch_npu
-                torch_npu.npu.synchronize()
-            except Exception:
-                pass
+            synchronize_device(self.trainer.device)
             self.trainer.save_checkpoint(checkpoint_name)
 
             self.remove_exceed_ckpt(checkpoint_name)

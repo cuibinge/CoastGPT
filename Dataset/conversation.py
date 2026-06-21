@@ -1,44 +1,43 @@
-import dataclasses
+﻿import dataclasses
 from enum import Enum, auto
 from typing import List, Tuple
 import base64
 from io import BytesIO
 from PIL import Image
-# 在不支持 NPU 的环境下忽略 torch_npu 导入错误
+# Keep NPU runtime optional for CUDA and CPU environments.
 try:
     import torch_npu  # noqa: F401
 except Exception:
-    pass
+    torch_npu = None
 
-# 定义分隔符风格的枚举类
+# Separator style options.
 class SeparatorStyle(Enum):
-    """不同的分隔符风格。"""
-    SINGLE = auto()  # 单一分隔符风格
-    TWO = auto()  # 双分隔符风格
-    MPT = auto()  # MPT 特定分隔符风格
-    PLAIN = auto()  # 普通分隔符风格
-    LLAMA_2 = auto()  # Llama 2 特定分隔符风格
+    """Supported separator styles."""
+    SINGLE = auto()
+    TWO = auto()
+    MPT = auto()
+    PLAIN = auto()
+    LLAMA_2 = auto()
 
-# 定义对话类，用于管理对话历史
+# Conversation state container.
 @dataclasses.dataclass
 class Conversation:
-    """用于保存所有对话历史的类。"""
-    system: str  # 系统消息，用于初始化对话的上下文
-    roles: List[str]  # 对话角色列表，例如 ["Human", "Assistant"]
-    messages: List[List[str]]  # 对话消息列表，每个元素是 [角色, 消息内容]
-    offset: int  # 消息偏移量，用于指定从哪个消息开始处理
-    sep_style: SeparatorStyle = SeparatorStyle.SINGLE  # 分隔符风格，默认为单一分隔符
-    sep: str = "###"  # 分隔符，默认为 "###"
-    sep2: str = None  # 第二个分隔符，默认为 None
-    version: str = "Unknown"  # 对话版本，默认为 "Unknown"
-    skip_next: bool = False  # 是否跳过下一个消息，默认为 False
+    """Conversation history and formatting options."""
+    system: str
+    roles: List[str]
+    messages: List[List[str]]
+    offset: int
+    sep_style: SeparatorStyle = SeparatorStyle.SINGLE
+    sep: str = "###"
+    sep2: str = None
+    version: str = "Unknown"
+    skip_next: bool = False
 
     def get_prompt(self):
-        """根据分隔符风格生成对话提示。"""
+        """Build a prompt string from the configured separator style."""
         messages = self.messages
-        # 处理包含图片的第一条消息当对话的第一条消息包含图像信息（以元组形式存储）时，根据版本号是否包含 "mmtag" 来对消息进行不同的处理，以便后续生成合适的提示信息
         if len(messages) > 0 and isinstance(messages[0][1], tuple):
-            messages = self.messages.copy()#如果第一条消息包含图像信息，这里对原始消息列表进行浅拷贝，避免直接修改原始消息列表
+            messages = self.messages.copy()
             init_role, init_msg = messages[0].copy()
             init_msg = init_msg[0].replace("<image>", "").strip()
             if "mmtag" in self.version:
@@ -82,8 +81,6 @@ class Conversation:
             ret = ""
             for i, (role, message) in enumerate(messages):
                 if i == 0:
-                    assert message, "第一条消息不能为空"
-                    assert role == self.roles[0], "第一条消息必须来自用户"
                 if message:
                     if isinstance(message, tuple):
                         message = message[0]
@@ -108,16 +105,13 @@ class Conversation:
                 else:
                     ret += ""
         else:
-            raise ValueError(f"无效的分隔符风格: {self.sep_style}")
 
         return ret
 
     def append_message(self, role, message):
-        """向对话历史中添加新的消息。"""
         self.messages.append([role, message])
 
     def get_images(self, return_pil=False):
-        """从对话消息中提取图片，并进行相应的处理。"""
         images = []
         for i, (role, msg) in enumerate(self.messages[self.offset:]):
             if i % 2 == 0:
@@ -143,7 +137,6 @@ class Conversation:
                     elif image_process_mode == "Resize":
                         image = image.resize((336, 336))
                     else:
-                        raise ValueError(f"无效的图片处理模式: {image_process_mode}")
                     max_hw, min_hw = max(image.size), min(image.size)
                     aspect_ratio = max_hw / min_hw
                     max_len, min_len = 800, 400
@@ -165,7 +158,6 @@ class Conversation:
         return images
 
     def to_gradio_chatbot(self):
-        """将对话历史转换为 Gradio 聊天机器人所需的格式。"""
         ret = []
         for i, (role, msg) in enumerate(self.messages[self.offset:]):
             if i % 2 == 0:
@@ -197,7 +189,6 @@ class Conversation:
         return ret
 
     def copy(self):
-        """复制当前对话对象。"""
         return Conversation(
             system=self.system,
             roles=self.roles,
@@ -210,7 +201,6 @@ class Conversation:
         )
 
     def dict(self):
-        """将对话对象转换为字典形式。"""
         if len(self.get_images()) > 0:
             return {
                 "system": self.system,
@@ -229,7 +219,6 @@ class Conversation:
             "sep2": self.sep2
         }
 
-# 预定义的对话模板
 conv_vicuna_v0 = Conversation(
     system="A chat between a curious human and an artificial intelligence assistant. "
            "The assistant gives helpful, detailed, and polite answers to the human's questions.",
@@ -371,9 +360,7 @@ conv_llava_v1_mmtag = Conversation(
     version="v1_mmtag"
 )
 
-# 默认对话模板
 default_conversation = conv_llava_llama_2
-# 对话模板字典，方便根据名称选择不同的模板
 conv_templates = {
     "default": conv_vicuna_v0,
     "v0": conv_vicuna_v0,

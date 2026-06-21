@@ -1,4 +1,4 @@
-"""GeoJSON builder: pixel -> WGS84 FeatureCollection, validation, and Mask R-CNN output conversion.
+﻿"""GeoJSON builder: pixel -> WGS84 FeatureCollection, validation, and Mask R-CNN output conversion.
 
 Conventions:
 - Pixel coordinates: (col, row) in model pixel space (224x224).
@@ -60,7 +60,7 @@ def _flatten_geojson_coords(geom: dict) -> List[Tuple[float, float]]:
 def polygon_pixel_to_geojson_feature(
     polygon_pixel: List[Tuple[float, float]],
     georef: dict,
-    class_name: str = "海水养殖区",
+    class_name: str = "generic?,
     confidence: float = 1.0,
 ) -> dict:
     """Convert a pixel-space polygon [(col, row), ...] to a GeoJSON Feature.
@@ -333,7 +333,7 @@ def outputs_to_geojson(
                 feat = polygon_pixel_to_geojson_feature(
                     poly,
                     meta,
-                    class_name="海水养殖区",
+                    class_name="generic?,
                     confidence=float(scores[i]),
                 )
                 features.append(feat)
@@ -372,7 +372,7 @@ if __name__ == "__main__":
     # Outer ring must be closed (first == last), so at least 5 points for a rectangle
     assert len(feat["geometry"]["coordinates"][0]) >= 4
     assert feat["properties"]["confidence"] == 0.95
-    assert feat["properties"]["class"] == "海水养殖区"
+    assert feat["properties"]["class"] == "generic?
     # Verify GeoJSON order is [lon, lat]
     first_pt = feat["geometry"]["coordinates"][0][0]
     assert isinstance(first_pt, list) and len(first_pt) == 2
@@ -387,7 +387,6 @@ if __name__ == "__main__":
     print("build_feature_collection: OK")
 
     # ------------------------------------------------------------------
-    # 3. validate_geojson — valid data
     # ------------------------------------------------------------------
     result = validate_geojson(fc, tile_bounds_wgs84=[119.29, 35.05, 119.32, 35.08])
     assert result["valid"], f"Validation failed: {result['errors']}"
@@ -399,7 +398,6 @@ if __name__ == "__main__":
           f"schema_ok={result['schema_ok']}, rate={result['geometry_valid_rate']}")
 
     # ------------------------------------------------------------------
-    # 4. validate_geojson — empty FeatureCollection
     # ------------------------------------------------------------------
     empty_fc = build_feature_collection([])
     result = validate_geojson(empty_fc)
@@ -408,7 +406,6 @@ if __name__ == "__main__":
     print(f"validate_geojson (empty): empty_output={result['empty_output']}, valid={result['valid']}")
 
     # ------------------------------------------------------------------
-    # 5. validate_geojson — bad schema
     # ------------------------------------------------------------------
     result = validate_geojson({"type": "NotAFeatureCollection"})
     assert not result["valid"]
@@ -417,7 +414,6 @@ if __name__ == "__main__":
     print(f"validate_geojson (bad schema): schema_ok={result['schema_ok']}")
 
     # ------------------------------------------------------------------
-    # 6. validate_geojson — not a dict
     # ------------------------------------------------------------------
     result = validate_geojson(None)
     assert not result["valid"]
@@ -425,7 +421,6 @@ if __name__ == "__main__":
     print("validate_geojson (not a dict): OK")
 
     # ------------------------------------------------------------------
-    # 7. validate_geojson — out of bounds
     # ------------------------------------------------------------------
     result = validate_geojson(fc, tile_bounds_wgs84=[120.0, 36.0, 121.0, 37.0])
     assert not result["valid"], "Should be invalid: points are far outside tile bounds"
@@ -433,7 +428,6 @@ if __name__ == "__main__":
     print(f"validate_geojson (out of bounds): rate={result['geometry_valid_rate']}")
 
     # ------------------------------------------------------------------
-    # 8. outputs_to_geojson — synthetic Mask R-CNN output
     # ------------------------------------------------------------------
     # Build a simple 224x224 binary mask with one rectangle
     # Mask R-CNN mask format: [N, 1, H, W]
@@ -466,7 +460,6 @@ if __name__ == "__main__":
     print("outputs_to_geojson (synthetic): OK")
 
     # ------------------------------------------------------------------
-    # 9. outputs_to_geojson — score filtering
     # ------------------------------------------------------------------
     synth_low_score = {
         "boxes": FakeTensor(np.array([[40, 50, 160, 180]], dtype=np.float32)),
@@ -479,7 +472,6 @@ if __name__ == "__main__":
     print("outputs_to_geojson (score filter): OK")
 
     # ------------------------------------------------------------------
-    # 10. polygon_pixel_to_geojson_feature — error on degenerate polygon
     # ------------------------------------------------------------------
     try:
         polygon_pixel_to_geojson_feature([(0, 0), (10, 10)], georef)

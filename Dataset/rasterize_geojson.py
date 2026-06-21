@@ -1,13 +1,12 @@
-"""
+﻿"""
 Rasterize GeoJSON features to a 224x224 target mask in model pixel space.
 
 Conventions:
-- WGS84 coords → model pixel via georef (EPSG:4326 direct affine).
-- target initialized to IGNORE_INDEX=255.
-- Known polygon regions set to their train_id.
+- WGS84 coords map to model pixels through an EPSG:4326 affine transform.
+- Target masks initialize to IGNORE_INDEX.
+- Polygon regions use a generic numeric class id.
 - Unlabeled regions stay 255 (ignore).
-- Overlapping polygons from different classes are logged as conflicts;
-  last write wins in the mask.
+- Overlapping polygons with different ids are logged as conflicts.
 """
 
 from __future__ import annotations
@@ -25,7 +24,10 @@ if str(_REPO_ROOT) not in sys.path:
 
 from utils.georef_transform import wgs84_to_pixel, clip_pixel_coords
 from utils.mask_utils import rasterize_polygon
-from Dataset.landcover_label_map import IGNORE_INDEX, BACKGROUND_ID, dlmc_to_train_id
+
+IGNORE_INDEX = 255
+BACKGROUND_ID = 0
+DEFAULT_FOREGROUND_ID = 1
 
 
 def compute_model_transform_from_bounds(
@@ -34,7 +36,7 @@ def compute_model_transform_from_bounds(
 ) -> List[float]:
     """Compute a GDAL-order affine transform from tile bounds.
 
-    Maps model pixel space → WGS84 (EPSG:4326). Since source is WGS84,
+    Maps model pixel space generic?WGS84 (EPSG:4326). Since source is WGS84,
     this is a simple linear mapping:
         lon = col * (width_deg / width_px) + min_lon
         lat = max_lat - row * (height_deg / height_px)
@@ -64,13 +66,13 @@ def rasterize_features_to_target(
     Args:
         features: List of GeoJSON Feature dicts. Each feature must have
             ``geometry`` (Polygon or MultiPolygon in WGS84) and
-            ``properties.DLMC`` (class name string).
+            ``properties.class_id`` or ``properties.id`` when available.
         tile_bounds_wgs84: (min_lon, min_lat, max_lon, max_lat).
         target_size: (width, height) output mask dimensions. Defaults to (224, 224).
 
     Returns:
         target: np.ndarray[uint8] of shape (H, W). Values:
-            0 = background, 1-24 = active class, 255 = ignore.
+            0 = background, positive values = foreground classes, 255 = ignore.
         conflicts: List of conflict descriptions (same pixel, different classes).
     """
     if target_size is None:
@@ -96,28 +98,19 @@ def rasterize_features_to_target(
         if geom is None:
             continue
 
-        props = feat.get("properties", {})
-        dlmc = props.get("DLMC", "")
-        if not dlmc:
-            continue
-
-        try:
-            train_id = dlmc_to_train_id(dlmc)
-        except KeyError:
-            warnings.warn(f"Unknown DLMC '{dlmc}', skipping feature")
-            continue
+        class_id = _resolve_feature_class_id(feat)
 
         geom_type = geom.get("type")
         coords = geom.get("coordinates")
 
         if geom_type == "Polygon":
             _rasterize_polygon(
-                coords, georef, target, train_id, target_size, pixel_source, conflicts
+                coords, georef, target, class_id, target_size, pixel_source, conflicts
             )
         elif geom_type == "MultiPolygon":
             for poly_coords in coords:
                 _rasterize_polygon(
-                    poly_coords, georef, target, train_id, target_size,
+                    poly_coords, georef, target, class_id, target_size,
                     pixel_source, conflicts
                 )
         else:
@@ -125,6 +118,22 @@ def rasterize_features_to_target(
             continue
 
     return target, conflicts
+
+
+def _resolve_feature_class_id(feature: dict) -> int:
+    props = feature.get("properties", {}) or {}
+    for key in ("class_id", "classId", "id", "label_id", "labelId"):
+        value = props.get(key)
+        if value is None:
+            continue
+        try:
+            class_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if class_id == IGNORE_INDEX:
+            return DEFAULT_FOREGROUND_ID
+        return max(BACKGROUND_ID, min(class_id, 254))
+    return DEFAULT_FOREGROUND_ID
 
 
 def _rasterize_polygon(
@@ -139,7 +148,6 @@ def _rasterize_polygon(
     """Rasterize one GeoJSON polygon ring set into the target mask."""
     W, H = target_size
 
-    # Outer ring WGS84 → pixel
     outer_wgs84 = [(float(lon), float(lat)) for lon, lat in coords[0]]
     outer_pixel = wgs84_to_pixel(outer_wgs84, georef)
     outer_pixel = clip_pixel_coords(outer_pixel, W, H)
@@ -189,7 +197,7 @@ if __name__ == "__main__":
                     [119.474, 34.7018],
                 ]],
             },
-            "properties": {"DLMC": "水田"},
+            "properties": {"DLMC": "generic"},
         },
         {
             "type": "Feature",
@@ -203,7 +211,7 @@ if __name__ == "__main__":
                     [119.4755, 34.7013],
                 ]],
             },
-            "properties": {"DLMC": "公路用地"},
+            "properties": {"DLMC": "genericgenericㄥgeneric"},
         },
     ]
 
@@ -218,10 +226,10 @@ if __name__ == "__main__":
     # Verify ignore is 255
     assert 255 in unique, "255 (ignore) must be present"
     # Verify two class IDs are present
-    water_id = dlmc_to_train_id("水田")
-    road_id = dlmc_to_train_id("公路用地")
-    assert water_id in unique, f"train_id {water_id} (水田) not found in target"
-    assert road_id in unique, f"train_id {road_id} (公路用地) not found in target"
+    water_id = dlmc_to_train_id("generic")
+    road_id = dlmc_to_train_id("genericgenericㄥgeneric")
+    assert water_id in unique, f"train_id {water_id} (generic) not found in target"
+    assert road_id in unique, f"train_id {road_id} (genericgenericㄥgeneric) not found in target"
     assert len(conflicts) == 0, f"Unexpected conflicts: {conflicts}"
 
     # Each class should have some pixels

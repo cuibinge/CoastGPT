@@ -1,4 +1,4 @@
-"""Multi-scale batch sampler for DDP training.
+﻿"""Multi-scale batch sampler for DDP training.
 
 Supports two modes:
   1. Weighted random: samples a resolution from a pool per training step.

@@ -1,4 +1,4 @@
-"""Utilities for semantic validation overlay export."""
+﻿"""Utilities for semantic validation overlay export."""
 
 from __future__ import annotations
 

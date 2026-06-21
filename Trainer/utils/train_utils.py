@@ -1,9 +1,12 @@
-import math
+﻿import math
 from typing import Sequence
 
 import torch
 import torch.nn as nn
-import torch_npu
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 def accuracy_at_k(
     outputs: torch.Tensor, targets: torch.Tensor, top_k: Sequence[int] = (1, 5)

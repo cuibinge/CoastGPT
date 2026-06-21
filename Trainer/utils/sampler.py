@@ -1,11 +1,14 @@
-# Copyright (c) OpenMMLab. All rights reserved.
+﻿# Copyright (c) OpenMMLab. All rights reserved.
 import itertools
 from typing import Iterator, Optional, Sized
 
 import torch
 from torch.utils.data import Sampler
 from .distribute import get_rank, get_world_size, sync_random_seed
-import torch_npu
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 class InfiniteSampler(Sampler):
     """It's designed for iteration-based runner and yields a mini-batch indices

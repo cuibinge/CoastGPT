@@ -1,4 +1,4 @@
-# Control
+﻿# Control
 alignment_dim: 768
 adjust_norm: False
 generate: False
@@ -141,36 +141,4 @@ physics:
     D_VV: 0.0
     D_VH: -3.0
 
-# Aquaculture segmentation (MOE) configuration
-aquaculture_seg:
-  enabled: true            # 设置为 false 可禁用分割头
-  num_classes: 2           # 类别数：如 [背景, 养殖区]
-  loss_weight: 1.0         # 分割总体损失的权重
-  ce_weight: 1.0           # 交叉熵损失权重
-  dice_weight: 0.0         # Dice 损失权重
-  ignore_index: 255        # 标注中忽略标签的索引值
-  include_context_expert: true  # 启用 ASPP/SPP 上下文专家
-  log_gate_stats: true     # 记录门控权重统计（mean、Top-1 占比）
-  # 路由器正则项系数（用于训练时辅助约束门控分布）
-  router_aux_loss_coef:
-    entropy: 0.001         # 建议范围 1e-4 ~ 5e-3；增大更均匀
-    zloss: 0.001           # 建议范围 1e-4 ~ 5e-3；抑制logits过大
-  # 适配器配置（安全默认值：整体关闭）
-  adapters:
-    enable: false
-    spectral:
-      enable: false
-      target_dim: 16    # 示例：光谱专家输入压缩到 16 维
-    texture:
-      enable: false
-      target_dim: 8     # 示例：纹理专家输入压缩到 8 维
-      depth: 2
-    spp:
-      enable: false
-      project_dim: 64   # 示例：SPP 筛选后投影到 64 维
-      levels: [1, 2, 4]
-    modality_gate:
-      enable: false
-      optical_weight: 0.7
-      sar_weight: 0.3
-      cloudy_boost: 0.3
+

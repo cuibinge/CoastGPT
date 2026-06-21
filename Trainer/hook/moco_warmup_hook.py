@@ -1,4 +1,4 @@
-from .hookbase import HookBase
+﻿from .hookbase import HookBase
 
 
 class MoCoWarmup(HookBase):

@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Tuple
+﻿from typing import Dict, Optional, Tuple
 
 from .history_buffer import HistoryBuffer
 

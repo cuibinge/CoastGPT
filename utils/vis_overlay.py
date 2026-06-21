@@ -1,9 +1,9 @@
-"""
+﻿"""
 Pixel-space overlay visualization for GT and predicted instance masks/boxes.
 
-Used by the PoC-1 aquaculture instance detection pipeline to render
+Used by the generic vector-object inspection pipeline to render
 bounding boxes and segmentation masks on satellite image patches (224x224).
-All coordinates are in model pixel space — no WGS84 conversion is performed here.
+All coordinates are in model pixel space generic?no WGS84 conversion is performed here.
 """
 
 import numpy as np
@@ -68,7 +68,6 @@ def _overlay_single(
     label : str
         Log label printed after saving.
     """
-    # Convert [C,H,W] float → [H,W,C] uint8 if needed
     if image_tensor.ndim == 3 and image_tensor.shape[0] == 3:
         img = (image_tensor.transpose(1, 2, 0) * 255).astype(np.uint8)
     else:
@@ -195,13 +194,11 @@ def overlay_gt_pred_pixel(
     output_path : str
         Save path for the rendered PNG.
     """
-    # Convert [C,H,W] float → [H,W,C] uint8 if needed
     if image_tensor.ndim == 3 and image_tensor.shape[0] == 3:
         img = (image_tensor.transpose(1, 2, 0) * 255).astype(np.uint8)
     else:
         img = image_tensor.copy()
 
-    # Helper for tensor→numpy conversion
     def _to_np(x):
         if x is None or len(x) == 0:
             return None

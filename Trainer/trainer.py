@@ -1,6 +1,4 @@
-
-#源于LHRS
-import logging
+﻿import logging
 import os
 import os.path as osp
 import time
@@ -35,6 +33,7 @@ from .utils import (
     is_main_process,
     symlink,
 )
+from utils.runtime import resolve_accelerator, resolve_device
 
 logger = logging.getLogger("train")
 try:
@@ -106,24 +105,20 @@ class Trainer:
             int(os.environ.get("LOCAL_RANK", get_rank())) if is_distributed else None
         )
 
+        accelerator = resolve_accelerator(accelerator)
+
         if accelerator == "cpu":
             self.device = torch.device(accelerator)
             self.autocast_type = "cpu"
         elif accelerator == "gpu":
-            if is_distributed:
-                self.device = torch.device("cuda", dist_local_rank)
-            else:
-                gpu_id = 0 if gpus is None else gpus
-                self.device = torch.device("cuda", gpu_id)
+            gpu_id = dist_local_rank if is_distributed else (0 if gpus is None else gpus)
+            self.device = resolve_device("gpu", local_rank=gpu_id)
             self.autocast_type = "cuda"
         elif accelerator == "npu":
             if not HAS_TORCH_NPU:
                 raise RuntimeError("accelerator='npu' requested, but torch_npu is not available.")
-            if is_distributed:
-                self.device = torch.device("npu", dist_local_rank)
-            else:
-                npu_id = 0 if gpus is None else gpus
-                self.device = torch.device("npu", npu_id)
+            npu_id = dist_local_rank if is_distributed else (0 if gpus is None else gpus)
+            self.device = resolve_device("npu", local_rank=npu_id)
             self.autocast_type = "npu"
         elif accelerator == "mps":
             self.device = torch.device("mps")
@@ -320,7 +315,6 @@ class Trainer:
             if isinstance(self.model.language.text_encoder, PeftModel):
                 text_path = os.path.join(self.ckpt_dir, "TextLoRA")
                 self.model.language.text_encoder.save_pretrained(text_path)
-            # 汇总所有 NPU 分片，仅在 rank 0 保存一个合并后的完整权重文件
             if is_main_process():
                 consolidated_path = osp.join(self.ckpt_dir, f"{file_name}_consolidated.pt")
                 inner_model = self.model.module if hasattr(self.model, "module") else self.model

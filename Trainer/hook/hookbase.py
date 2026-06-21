@@ -1,4 +1,4 @@
-class HookBase:
+﻿class HookBase:
     """Base class for hooks.
 
     Hooks can be registered in :class:`Trainer`. Each hook can implement 6 methods

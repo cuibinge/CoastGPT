@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import logging
 import os
 import random
@@ -11,7 +11,10 @@ import torch
 from tabulate import tabulate
 
 logger = logging.getLogger("train")
-import torch_npu
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 
 def auto_resume_helper(output_dir):

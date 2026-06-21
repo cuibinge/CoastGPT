@@ -158,7 +158,7 @@ def parse_config():
     parser.add_argument("--notes", type=str, default=None)
 
     # Hardware settings
-    parser.add_argument("--accelerator", default="npu", choices=["cpu", "gpu", "mps", "npu"])
+    parser.add_argument("--accelerator", default="auto", choices=["auto", "cpu", "gpu", "mps", "npu"])
     parser.add_argument("--local_rank", type=int)
 
     return ml_collections.config_dict.ConfigDict(parser.parse_args(wandb=True))

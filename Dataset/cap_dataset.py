@@ -1,4 +1,4 @@
-import copy
+﻿import copy
 import io
 import json
 import logging
@@ -34,8 +34,8 @@ from Models import (
     IMAGE_TOKEN_INDEX,
 )
 from . import conversation as conversation_lib
-from .constants import ELEMENT2ID, TASK2ID
 from utils.geojson_coordinate_utils import repair_mojibake_in_obj
+from utils.vector_geometry import extract_vector_stats
 try:
     import torch_npu  # noqa: F401
 except Exception:
@@ -195,20 +195,13 @@ class CaptionDataset(torch.utils.data.Dataset):
         pass
 
     def load_physics(self, idx: int):
-        """
-        加载与图像空间对齐的物理真值 (TSM) 与有效域掩码 (Mask)。
-        这部分数据必须在制作 CoastBench 时提前由定量遥感算法生成。
-        """
+        """Load optional physics targets and masks aligned with the image."""
         img_path = Path(self.img_list[idx])
 
-        # 假设物理真值存储在与图像同级的 TSM 文件夹或具有特定后缀
-        # 实际路径逻辑请根据你的 CoastBench 存储规范严格修改
         tsm_path = img_path.parent / (img_path.stem + "_tsm.npy")
         mask_path = img_path.parent / (img_path.stem + "_mask.npy")
 
         if tsm_path.exists() and mask_path.exists():
-            # 加载并转换为张量，通常需要下采样到特征图的尺度 (如 F32 对应的尺度)
-            # 或者在这里保持原图尺寸，在损失函数计算前进行 F.interpolate
             tsm_tensor = torch.from_numpy(np.load(tsm_path)).float()
             mask_tensor = torch.from_numpy(np.load(mask_path)).float()
             return tsm_tensor, mask_tensor
@@ -300,7 +293,7 @@ class CaptionDataset(torch.utils.data.Dataset):
             captions = pre_caption(captions)
 
         x = self.load_image(idx)
-        tsm, mask = self.load_physics(idx)  # 新增物理数据加载
+        tsm, mask = self.load_physics(idx)
         return dict(rgb=x, text=captions, tsm=tsm, mask=mask)
 
 
@@ -569,19 +562,8 @@ class InstructDataset(CaptionDataset):
     @staticmethod
     def _infer_element_hint(text: str) -> str:
         text_lower = text.lower()
-        for kw in (
-            "coastline",
-            "shoreline",
-            "tidal flat",
-            "mudflat",
-            "mariculture",
-            "aquaculture",
-            "mangrove",
-            "wind turbine",
-        ):
-            if kw in text_lower:
-                return kw
-        return "coastline"
+        words = [w for w in re.split(r"\W+", text_lower) if len(w) > 2]
+        return words[0] if words else "feature"
 
     def _build_auto_conv_for_feature(self, feature: Dict, sample_idx: int):
         answer = self._pick_caption_from_feature(feature)
@@ -627,20 +609,13 @@ class InstructDataset(CaptionDataset):
         self.img_list = new_img_list
 
     def load_physics(self, idx: int):
-        """
-        加载与图像空间对齐的物理真值 (TSM) 与有效域掩码 (Mask)。
-        这部分数据必须在制作 CoastBench 时提前由定量遥感算法生成。
-        """
+        """Load optional physics targets and masks aligned with the image."""
         img_path = Path(self.img_list[idx])
 
-        # 假设物理真值存储在与图像同级的 TSM 文件夹或具有特定后缀
-        # 实际路径逻辑请根据你的 CoastBench 存储规范严格修改
         tsm_path = img_path.parent / (img_path.stem + "_tsm.npy")
         mask_path = img_path.parent / (img_path.stem + "_mask.npy")
 
         if tsm_path.exists() and mask_path.exists():
-            # 加载并转换为张量，通常需要下采样到特征图的尺度 (如 F32 对应的尺度)
-            # 或者在这里保持原图尺寸，在损失函数计算前进行 F.interpolate
             tsm_tensor = torch.from_numpy(np.load(tsm_path)).float()
             mask_tensor = torch.from_numpy(np.load(mask_path)).float()
             return tsm_tensor, mask_tensor
@@ -710,7 +685,7 @@ class InstructDataset(CaptionDataset):
     def __getitem__(self, idx: int) -> Dict:
         out_dict = super().__getitem__(idx)
 
-        # 文本特征的 Tokenize 预处理
+        # Tokenize text features.
         out_dict["text"] = preprocess_multimodal(out_dict["text"], tune_im_start=self.tune_im_start)
         out_dict["text"] = preprocess(out_dict["text"], self.tokenizer, has_image=True)
         out_dict["text"] = dict(
@@ -718,15 +693,15 @@ class InstructDataset(CaptionDataset):
             labels=out_dict["text"]["labels"][0],
         )
 
-        # 边界条件防御与物理张量透传
+        # Guard invalid image-only samples and pass through physics tensors.
         if idx >= len(self.img_list):
             out_dict["valid_image"] = False
-            # 对于纯文本或无效图像样本，物理先验必须严格置空
+            # Pure-text or invalid-image samples must not carry physics tensors.
             out_dict["tsm"] = None
             out_dict["mask"] = None
         else:
             out_dict["valid_image"] = True
-            # 获取物理数据并显式挂载到输出字典中
+            # Attach optional physics tensors.
             tsm, mask = self.load_physics(idx)
             out_dict["tsm"] = tsm
             out_dict["mask"] = mask
@@ -734,7 +709,7 @@ class InstructDataset(CaptionDataset):
         return out_dict
 
 
-class InstructDatasetWithTaskId(InstructDataset):
+class InstructDatasetWithCondition(InstructDataset):
     WEIGHT_DICT = {
         "GF_geojson_train": 15.0,
         "GF_landclass_train": 0.5,
@@ -755,40 +730,8 @@ class InstructDatasetWithTaskId(InstructDataset):
         "geosignal": 15.0,
     }
 
-    # 任务关键词映射到统一任务名（再由 TASK2ID 转为 ID）
-    TASK_KEYWORDS = {
-        "场景分类": [
-            "classify", "classification", "分类", "识别", "recognize", "distinguish",
-            "category", "label", "predict", "identify", "what type", "which class"
-        ],
-        "视觉问答": [
-            "question", "answer", "问答", "vqa", "qa", "why", "how", "what", "where", "when"
-        ],
-        "视觉定位": [
-            "locate", "location", "定位", "position", "where is", "bbox", "bounding box", "坐标"
-        ],
-        "描述": [
-            "describe", "description", "描述", "explain", "caption", "summarize",
-            "what do you see", "describe the", "tell me about", "visual content", "scene"
-        ],
-        "要素提取": [
-            "extract", "extraction", "要素提取", "segment", "segmentation", "mask",
-            "detect", "detection", "object", "target", "feature", "element"
-        ]
-    }
-
-    # 统一要素关键词映射到 ELEMENT2ID 的标准 key
-    ELEMENT_KEYWORDS = {
-        "网箱养殖区": ["网箱", "cage", "cage-culture", "cage farming", "aquaculture cage"],
-        "筏式养殖区": ["筏式", "raft", "raft-culture", "raft farming"],
-        "赤潮": ["赤潮", "red tide", "algal bloom"],
-        "浒苔": ["浒苔", "green tide", "ulva", "macroalgae"],
-        "海岸线": ["海岸线", "coastline", "shoreline"],
-        "风力发电机": ["风力发电机", "wind turbine", "windmill"],
-        "海上钻井平台": ["海上钻井平台", "offshore platform", "oil rig"],
-        "滩涂": ["滩涂", "tidal flat", "mudflat"],
-        "红树林湿地": ["红树林", "mangrove", "mangrove wetland"],
-        "土地覆盖": ["土地覆盖", "land cover", "land-use", "land use", "lc", "lulc"],
+    CONDITION_KEYWORDS = {
+        "generic": ["describe", "answer", "locate", "detect", "segment", "extract", "classify"]
     }
 
     PHYSICAL_FIELD_ALIASES = {
@@ -828,11 +771,8 @@ class InstructDatasetWithTaskId(InstructDataset):
 
     def __init__(self, **kwargs):
         self.sample_weight = []
-        self.task_ids = []       # 存储每个样本的任务ID
-        self.category_ids = []   # 存储每个样本的地物类别ID（复用为 element_id）
-        self.task_texts = []     # 存储每个样本任务文本
-        self.element_texts = []  # 存储每个样本要素文本
         self.sample_phys_meta = []
+        self.sample_vector_stats = []
         super().__init__(**kwargs)
 
     @staticmethod
@@ -927,21 +867,15 @@ class InstructDatasetWithTaskId(InstructDataset):
 
     def _infer_element_hint(self, text: str) -> str:
         text_lower = text.lower()
-        for _, keywords in self.ELEMENT_KEYWORDS.items():
-            for keyword in keywords:
-                kw = str(keyword).strip()
-                if not kw:
-                    continue
-                if kw.lower() in text_lower and any(ch.isalpha() for ch in kw):
-                    return kw
-        return "coastline"
+        words = [w for w in re.split(r"\W+", text_lower) if len(w) > 2]
+        return words[0] if words else "feature"
 
     @staticmethod
     def _geojson_task_name() -> str:
         for task_name in TASK2ID.keys():
             if "geojson" in str(task_name).lower():
                 return task_name
-        return next(iter(TASK2ID.keys()))
+        return "generic"
 
     @staticmethod
     def _with_det_geojson_tag(prompt: str) -> str:
@@ -1026,19 +960,19 @@ class InstructDatasetWithTaskId(InstructDataset):
         candidate_convs = [
             {
                 "Question": self._with_det_geojson_tag(
-                    "Extract the target features from this remote sensing image and output a valid GeoJSON FeatureCollection. Return JSON only."
+                    "Extract only the requested features from this remote sensing image and output a valid GeoJSON FeatureCollection. Treat requested features as open vocabulary queries. Do not assign non-requested regions to any known category. Return JSON only."
                 ),
                 "Answer": full_feature_answer,
             },
             {
                 "Question": self._with_det_geojson_tag(
-                    "Generate an editable GeoJSON FeatureCollection for ArcGIS from this image. Return JSON only."
+                    "Generate an editable GeoJSON FeatureCollection for ArcGIS from this image. Keep only the requested objects and leave other regions unassigned. Return JSON only."
                 ),
                 "Answer": full_feature_answer,
             },
             {
                 "Question": self._with_det_geojson_tag(
-                    "Output the extracted feature information for this image in GeoJSON FeatureCollection format. Return JSON only."
+                    "Output the requested open-vocabulary feature information for this image in GeoJSON FeatureCollection format. Do not force ambiguous objects into a fixed class. Return JSON only."
                 ),
                 "Answer": full_feature_answer,
             },
@@ -1054,7 +988,7 @@ class InstructDatasetWithTaskId(InstructDataset):
             convs.append(
                 {
                     "Question": self._with_det_geojson_tag(
-                        "Based on the following scene description, extract the target features and output GeoJSON FeatureCollection. Return JSON only.\n"
+                        "Based on the following scene description, extract only the requested features and output GeoJSON FeatureCollection. Leave non-requested regions unassigned. Return JSON only.\n"
                         f"{caption_hint}"
                     ),
                     "Answer": full_feature_answer,
@@ -1156,72 +1090,10 @@ class InstructDatasetWithTaskId(InstructDataset):
         return " ".join(parts)
 
     @staticmethod
-    def _default_task_id() -> int:
-        return TASK2ID.get("描述", 0)
-
-    @staticmethod
-    def _default_element_id() -> int:
-        return ELEMENT2ID.get("无", 0)
-
-    @staticmethod
-    def _default_task_text() -> str:
-        return "描述"
-
-    @staticmethod
-    def _default_element_text() -> str:
-        return "无"
-
-    @staticmethod
-    def _task_name_from_id(task_id: int) -> str:
-        for name, idx in TASK2ID.items():
-            if idx == task_id:
-                return name
-        return next(iter(TASK2ID.keys()))
-
-    @staticmethod
-    def _element_name_from_id(element_id: int) -> str:
-        for name, idx in ELEMENT2ID.items():
-            if idx == element_id:
-                return name
-        return next(iter(ELEMENT2ID.keys()))
-
-    @staticmethod
-    def _extract_free_element_text(text: str) -> str:
-        if not isinstance(text, str) or not text:
+    def _extract_condition_text(text: str) -> str:
+        if not isinstance(text, str):
             return ""
-        text_lower = re.sub(r"\[[a-z0-9_]+\]", " ", text.lower())
-        patterns = [
-            r"(?:find|locate|detect|identify|segment|extract)\s+(?:a|an|the)?\s*([a-z][a-z0-9 -]{2,64})",
-            r"(?:about|of|for)\s+(?:the|a|an)?\s*([a-z][a-z0-9 -]{2,64})",
-        ]
-        stop_terms = {
-            "image",
-            "scene",
-            "picture",
-            "photo",
-            "target",
-            "object",
-            "area",
-            "region",
-            "class",
-            "category",
-            "dimensions",
-            "following object",
-        }
-        for pattern in patterns:
-            match = re.search(pattern, text_lower)
-            if not match:
-                continue
-            candidate = match.group(1).strip(" .,;:!?\"'()[]{}")
-            candidate = re.split(r",|\.|;|\?|!|\band\b|\bwith\b|\bthat\b|\bwhich\b", candidate)[0].strip()
-            words = [w for w in candidate.split() if w]
-            if not words:
-                continue
-            candidate = " ".join(words[:4])
-            if candidate in stop_terms or len(candidate) < 3:
-                continue
-            return candidate
-        return ""
+        return re.sub(r"\s+", " ", text).strip()[:512]
 
     @staticmethod
     def _first_answer_text(conv_data) -> str:
@@ -1233,6 +1105,9 @@ class InstructDatasetWithTaskId(InstructDataset):
                 return str(first.get("Answer", first.get("answer", "")))
         return ""
 
+    def _vector_stats_from_conv(self, conv_data) -> Dict[str, float]:
+        return extract_vector_stats(self._first_answer_text(conv_data))
+
     def _is_geojson_priority_sample(self, item, conv_data) -> bool:
         if not (self.stage >= 3 and self.geojson_priority):
             return False
@@ -1241,80 +1116,6 @@ class InstructDatasetWithTaskId(InstructDataset):
                 return True
         first_answer = self._first_answer_text(conv_data)
         return self._looks_like_geojson_answer(first_answer)
-
-    def detect_task_text_from_text(self, text: str) -> str:
-        text_lower = str(text).lower()
-        geojson_task_name = self._geojson_task_name()
-        if self.stage >= 3 and self.geojson_priority and "[det]" in text_lower:
-            return geojson_task_name
-        if self._is_geojson_query_text(text_lower):
-            return geojson_task_name
-        if "[gj]" in text_lower:
-            return geojson_task_name
-
-        tag_to_task_id = [
-            ("[cls]", 0),
-            ("[vqa]", 1),
-            ("[qa]", 1),
-            ("[vg]", 2),
-            ("[loc]", 2),
-            ("[cap]", 3),
-            ("[caption]", 3),
-            ("[det]", 4),
-            ("[seg]", 4),
-        ]
-        for tag, task_id in tag_to_task_id:
-            if tag in text_lower:
-                return self._task_name_from_id(task_id)
-        for task_name in TASK2ID.keys():
-            if task_name.lower() in text_lower:
-                return task_name
-        for task_type, keywords in self.TASK_KEYWORDS.items():
-            for keyword in keywords:
-                if keyword in text_lower:
-                    return task_type
-        return self._default_task_text()
-
-    def detect_element_text_from_text(self, text: str) -> str:
-        text_lower = str(text).lower()
-        if "[cls]" in text_lower:
-            # Stage-2 classification samples usually contain broad land-cover classes.
-            return self._element_name_from_id(10)
-        for element_name in ELEMENT2ID.keys():
-            if element_name == "无":
-                continue
-            if element_name.lower() in text_lower:
-                return element_name
-        for category, keywords in self.ELEMENT_KEYWORDS.items():
-            for keyword in keywords:
-                if keyword in text_lower:
-                    return category
-        free_element = self._extract_free_element_text(text)
-        if free_element:
-            return free_element
-        return self._default_element_text()
-
-    def detect_task_from_text(self, text: str) -> int:
-        """
-        根据输入文本检测任务类型
-        Args:
-            text: 输入文本
-        Returns:
-            task_id: 任务ID
-        """
-        task_text = self.detect_task_text_from_text(text)
-        return TASK2ID.get(task_text, self._default_task_id())
-
-    def detect_category_from_text(self, text: str) -> int:
-        """
-        根据输入文本检测地物类别
-        Args:
-            text: 输入文本
-        Returns:
-            category_id: 地物类别ID
-        """
-        element_text = self.detect_element_text_from_text(text)
-        return ELEMENT2ID.get(element_text, self._default_element_id())
 
     def post_process(self):
         for i, item in enumerate(self.cap_list):
@@ -1359,13 +1160,6 @@ class InstructDatasetWithTaskId(InstructDataset):
                     ]
                     self.cap_list.append(conv)
                     self.sample_weight.append(self.WEIGHT_DICT["geosignal"])
-                    task_text = self.detect_task_text_from_text(question)
-                    detect_text = f"{question} {item.get('output', '')}"
-                    element_text = self.detect_element_text_from_text(detect_text)
-                    self.task_texts.append(task_text)
-                    self.element_texts.append(element_text)
-                    self.task_ids.append(TASK2ID.get(task_text, self._default_task_id()))
-                    self.category_ids.append(ELEMENT2ID.get(element_text, self._default_element_id()))
                     self.sample_phys_meta.append(
                         {
                             "dataset": "geosignal",
@@ -1375,6 +1169,7 @@ class InstructDatasetWithTaskId(InstructDataset):
                             "time": "",
                         }
                     )
+                    self.sample_vector_stats.append(extract_vector_stats(""))
 
     def _is_answer_within_token_budget(self, answer_text: str) -> bool:
         """Return True iff the tokenized answer fits inside the configured
@@ -1447,29 +1242,6 @@ class InstructDatasetWithTaskId(InstructDataset):
                     else:
                         self.cap_list.append(conv_data)
 
-                    # 检测任务ID和地物类别ID
-                    conv_items = self.cap_list[-1]
-                    if isinstance(conv_items, Dict):
-                        conv_items = [conv_items]
-                    for conv_item in conv_items:
-                        if "Question" in conv_item:
-                            question = str(conv_item.get("Question", ""))
-                            answer = str(conv_item.get("Answer", conv_item.get("answer", "")))
-                            detect_text = f"{question} {answer}".strip()
-                            task_text = self.detect_task_text_from_text(question)
-                            element_text = self.detect_element_text_from_text(detect_text)
-                            self.task_texts.append(task_text)
-                            self.element_texts.append(element_text)
-                            self.task_ids.append(TASK2ID.get(task_text, self._default_task_id()))
-                            self.category_ids.append(ELEMENT2ID.get(element_text, self._default_element_id()))
-                            break
-                    else:
-                        # 如果没有Question，默认使用"描述"任务和"无"类别
-                        self.task_texts.append(self._default_task_text())
-                        self.element_texts.append(self._default_element_text())
-                        self.task_ids.append(self._default_task_id())
-                        self.category_ids.append(self._default_element_id())
-
                     meta_source = item
                     features = item.get("features", [])
                     if isinstance(features, list) and len(features) > 0:
@@ -1482,6 +1254,7 @@ class InstructDatasetWithTaskId(InstructDataset):
                     self.sample_phys_meta.append(
                         self._extract_physical_meta(meta_source, dataset_name, img_path)
                     )
+                    self.sample_vector_stats.append(self._vector_stats_from_conv(conv_data))
 
                     base_weight = 0.5
                     for name, weight in self.WEIGHT_DICT.items():
@@ -1492,8 +1265,7 @@ class InstructDatasetWithTaskId(InstructDataset):
                     if (
                         self.stage >= 3
                         and self.geojson_priority
-                        and len(self.task_texts) > 0
-                        and self.task_texts[-1] == self._geojson_task_name()
+                        and self._is_geojson_priority_sample(item, conv_data)
                     ):
                         base_weight = max(base_weight, 1.5)
 
@@ -1502,22 +1274,13 @@ class InstructDatasetWithTaskId(InstructDataset):
     def __getitem__(self, idx: int) -> Dict:
         out_dict = super().__getitem__(idx)
 
-        # 添加task_id和category_id
-        if idx < len(self.task_ids):
-            out_dict["task_id"] = self.task_ids[idx]
-        else:
-            out_dict["task_id"] = self._default_task_id()
-
-        if idx < len(self.category_ids):
-            out_dict["category_id"] = self.category_ids[idx]
-        else:
-            out_dict["category_id"] = self._default_element_id()
-
-        out_dict["task_text"] = self.task_texts[idx] if idx < len(self.task_texts) else self._default_task_text()
-        out_dict["element_text"] = self.element_texts[idx] if idx < len(self.element_texts) else self._default_element_text()
-
         meta = self.sample_phys_meta[idx] if idx < len(self.sample_phys_meta) else None
         out_dict["physical_prompt"] = self._build_physical_prompt(meta)
+        out_dict["vector_stats"] = (
+            self.sample_vector_stats[idx]
+            if idx < len(self.sample_vector_stats)
+            else extract_vector_stats("")
+        )
 
         return out_dict
 
@@ -1721,9 +1484,6 @@ class DataCollatorForSupervisedDataset(object):
 
     tokenizer: transformers.PreTrainedTokenizer
     physical_prompt_max_len: int = 64
-    task_text_max_len: int = 16
-    element_text_max_len: int = 16
-
     def _resolve_max_len(self, target_len: int) -> int:
         tokenizer_max_len = getattr(self.tokenizer, "model_max_length", target_len)
         if not isinstance(tokenizer_max_len, int) or tokenizer_max_len <= 0:
@@ -1791,16 +1551,7 @@ class DataCollatorForSupervisedDataset(object):
             batch["mask"] = None
             batch["valid_physics"] = torch.zeros(len(instances), dtype=torch.bool)
 
-        # 添加task_ids和category_ids
-        if "task_id" in instances[0]:
-            task_ids = [instance["task_id"] for instance in instances]
-            batch["task_ids"] = torch.tensor(task_ids, dtype=torch.long)
-
-        if "category_id" in instances[0]:
-            category_ids = [instance["category_id"] for instance in instances]
-            batch["category_ids"] = torch.tensor(category_ids, dtype=torch.long)
-
-        # 物理提示文本 -> token ids（在 collate 中统一 pad）
+        # Generic condition prompt tokens.
         if "physical_prompt" in instances[0]:
             phys_texts = [instance.get("physical_prompt", "") for instance in instances]
             phys_max_len = self._resolve_max_len(self.physical_prompt_max_len)
@@ -1817,35 +1568,19 @@ class DataCollatorForSupervisedDataset(object):
             batch["physical_prompt_ids"] = None
             batch["physical_prompt_attention_mask"] = None
 
-        if "task_text" in instances[0]:
-            task_texts = [instance.get("task_text", "描述") for instance in instances]
-            task_tokens = self.tokenizer(
-                task_texts,
-                padding="max_length",
-                truncation=True,
-                max_length=self._resolve_max_len(self.task_text_max_len),
-                return_tensors="pt",
-            )
-            batch["task_text_ids"] = task_tokens.input_ids
-            batch["task_text_attention_mask"] = task_tokens.attention_mask
-        else:
-            batch["task_text_ids"] = None
-            batch["task_text_attention_mask"] = None
-
-        if "element_text" in instances[0]:
-            element_texts = [instance.get("element_text", "无") for instance in instances]
-            element_tokens = self.tokenizer(
-                element_texts,
-                padding="max_length",
-                truncation=True,
-                max_length=self._resolve_max_len(self.element_text_max_len),
-                return_tensors="pt",
-            )
-            batch["element_text_ids"] = element_tokens.input_ids
-            batch["element_text_attention_mask"] = element_tokens.attention_mask
-        else:
-            batch["element_text_ids"] = None
-            batch["element_text_attention_mask"] = None
+        stats_items = [instance.get("vector_stats", {}) for instance in instances]
+        feature_counts = [float(item.get("feature_count", 0.0)) for item in stats_items]
+        point_counts = [float(item.get("point_count", 0.0)) for item in stats_items]
+        bbox_areas = [float(item.get("bbox_area", 0.0)) for item in stats_items]
+        closure_errors = [float(item.get("closure_error", 0.0)) for item in stats_items]
+        batch["vector_objective_mask"] = torch.tensor(
+            [count > 0.0 for count in feature_counts],
+            dtype=torch.bool,
+        )
+        batch["vector_feature_count"] = torch.tensor(feature_counts, dtype=torch.float32)
+        batch["vector_point_count"] = torch.tensor(point_counts, dtype=torch.float32)
+        batch["vector_bbox_area"] = torch.tensor(bbox_areas, dtype=torch.float32)
+        batch["vector_closure_error"] = torch.tensor(closure_errors, dtype=torch.float32)
 
         return batch
 

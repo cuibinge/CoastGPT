@@ -1,14 +1,16 @@
-import logging
+﻿import logging
 
 import torch
 from thop import clever_format, profile
 
 from .logger_hook import HookBase
-import torch_npu
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 logger = logging.getLogger("train")
 
-#源于mmengine.hooks.ParamFlopsHook
 class CounterHook(HookBase):
     def __init__(self, img_size: int = 224, channel: int = 3):
         super(CounterHook, self).__init__()

@@ -1,10 +1,13 @@
-from typing import Sequence
+﻿from typing import Sequence
 
 import numpy as np
 import torch
 import torchvision
 from PIL import Image
-import torch_npu
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 
 def to_numpy(data, ToCHW=True):

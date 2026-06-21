@@ -1,8 +1,11 @@
-import torch
+﻿import torch
 
 from .hookbase import HookBase
 
-import torch_npu
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 class CleanEmbedGradHook(HookBase):
     def __init__(self, save_embed_id):

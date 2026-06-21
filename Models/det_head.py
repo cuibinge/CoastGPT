@@ -1,4 +1,4 @@
-"""
+﻿"""
 FPN Neck + DualVisionFPNBackboneAdapter + Mask R-CNN builder.
 
 Provides the detection head for PoC-1:
@@ -27,7 +27,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from Models.dual_vision_encoder import DualVisionEncoder
-from Models.fpn_neck import FPNNeck  # noqa: F401 — compatibility re-export
+from Models.fpn_neck import FPNNeck
 
 
 class DualVisionFPNBackboneAdapter(nn.Module):
@@ -121,7 +121,7 @@ def build_aqua_maskrcnn(
 ) -> MaskRCNN:
     """
     Build a torchvision Mask R-CNN with a custom FPN backbone adapter.
-    num_classes includes background (2 for aquaculture + bg).
+    num_classes includes background (2 for foreground object + background).
     """
     if min_size is None:
         min_size = 224

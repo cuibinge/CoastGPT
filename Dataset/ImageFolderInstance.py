@@ -1,7 +1,10 @@
-import torch
+﻿import torch
 from torchvision.datasets import ImageFolder
 from transformers import CLIPImageProcessor
-import torch_npu
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 CLASS_NAME_MAP = {
     "AID": [

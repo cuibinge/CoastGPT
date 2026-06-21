@@ -1,4 +1,4 @@
-import functools
+﻿import functools
 import logging
 import os
 import socket
@@ -10,6 +10,7 @@ import torch
 import torch.distributed as torch_dist
 from torch import Tensor
 from torch._C._distributed_c10d import ProcessGroup
+from utils.runtime import get_device_count, resolve_distributed_backend, resolve_device
 
 logger = logging.getLogger("train")
 
@@ -18,55 +19,24 @@ def _resolve_distributed_backend(
     accelerator: str = "auto", backend: Optional[str] = None
 ) -> str:
     """Resolve torch.distributed backend from accelerator preference."""
-    if backend is not None:
-        return str(backend).lower()
-
-    acc = (accelerator or "auto").lower()
-    if acc == "npu":
-        return "hccl"
-    if acc == "gpu":
-        return "nccl"
-    if acc in {"cpu", "mps"}:
-        return "gloo"
-
-    # auto-detect
-    if hasattr(torch, "npu"):
-        try:
-            if torch.npu.is_available():
-                return "hccl"
-        except Exception:
-            pass
-    if torch.cuda.is_available():
-        return "nccl"
-    return "gloo"
+    return resolve_distributed_backend(accelerator=accelerator, backend=backend)
 
 
 def _device_count_for_backend(backend: str) -> int:
     backend = (backend or "").lower()
-    if backend == "hccl" and hasattr(torch, "npu"):
-        try:
-            return max(1, int(torch.npu.device_count()))
-        except Exception:
-            return 1
     if backend in {"nccl", "smddp"}:
-        try:
-            return max(1, int(torch.cuda.device_count()))
-        except Exception:
-            return 1
+        return get_device_count("gpu")
+    if backend == "hccl":
+        return get_device_count("npu")
     return 1
 
 
 def _set_device_for_backend(local_rank: int, backend: str) -> None:
     backend = (backend or "").lower()
     if backend == "hccl":
-        if not hasattr(torch, "npu"):
-            raise RuntimeError(
-                "HCCL backend selected, but torch.npu is unavailable. "
-                "Please install torch_npu or switch accelerator/backend."
-            )
-        torch.npu.set_device(local_rank)
+        resolve_device("npu", local_rank=local_rank)
     elif backend in {"nccl", "smddp"}:
-        torch.cuda.set_device(local_rank)
+        resolve_device("gpu", local_rank=local_rank)
 
 
 def is_distributed() -> bool:

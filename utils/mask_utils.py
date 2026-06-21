@@ -1,4 +1,4 @@
-"""Pixel-space geometry utilities: rasterization, bbox, polygon extraction.
+﻿"""Pixel-space geometry utilities: rasterization, bbox, polygon extraction.
 
 All coordinates in model pixel space (224x224). No WGS84/CRS logic here.
 """

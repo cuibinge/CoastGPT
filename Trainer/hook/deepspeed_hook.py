@@ -1,5 +1,9 @@
-from .hookbase import HookBase
-import torch_npu
+﻿from .hookbase import HookBase
+from .runtime import synchronize_device
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 
 class DeepSpeedHook(HookBase):
@@ -9,11 +13,7 @@ class DeepSpeedHook(HookBase):
         self.trainer.model.step()
         self.trainer._call_hooks("after_step")
 
-        try:
-            import torch_npu
-            torch_npu.npu.synchronize()
-        except Exception:
-            pass
+        synchronize_device(self.trainer.device)
 
         if (
             self.trainer._clip_grad_norm is not None

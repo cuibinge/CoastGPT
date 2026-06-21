@@ -1,4 +1,4 @@
-"""
+﻿"""
 Feature Pyramid Network neck for ConvNeXt pyramid features.
 
 Shared module used by PoC-1 (Instance Head), PoC-2 (Semantic Head),

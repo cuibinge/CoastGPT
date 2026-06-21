@@ -1,7 +1,10 @@
-import os
+﻿import os
 
 from .hookbase import HookBase
-import torch_npu
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 class PlotSaver(HookBase):
     def __init__(self, suffix="png", save_interval=50):

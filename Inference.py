@@ -1,4 +1,4 @@
-import json as _json
+﻿import json as _json
 import os
 import re as _re
 from io import BytesIO
@@ -25,15 +25,8 @@ from Models.coastgpt import CoastGPT
 from Models.utils import KeywordsStoppingCriteria, type_dict
 from Trainer.utils.config_parser import ConfigArgumentParser
 from Trainer.utils.misc import str2bool
-
-
-def _ensure_npu_runtime() -> None:
-    try:
-        import torch_npu  # noqa: F401
-    except Exception as exc:
-        raise RuntimeError(
-            "NPU runtime is unavailable. Please install/enable torch_npu before using --accelerator npu."
-        ) from exc
+from utils.interaction_request import normalize_interaction_instruction
+from utils.runtime import resolve_device
 
 
 def _to_dtype_name(dtype_name: str) -> torch.dtype:
@@ -102,23 +95,7 @@ def _normalize_inference_runtime(config: ml_collections.ConfigDict) -> None:
 
 
 def _resolve_device(config: ml_collections.ConfigDict) -> torch.device:
-    accelerator = str(getattr(config, "accelerator", "npu")).lower()
-    if accelerator == "gpu":
-        return torch.device("cuda")
-    if accelerator == "npu":
-        _ensure_npu_runtime()
-        # torch_npu 2.1 + Ascend 8.0.RC2 may incorrectly route ``torch.device("npu")``
-        # (no index) through the CUDA fallback inside its patched ``Module._apply``.
-        # Always use an explicit ``npu:0`` (or whatever local rank we have) to keep
-        # tensor moves on the NPU code path.
-        try:
-            import torch_npu  # noqa: F401
-            local_idx = int(os.environ.get("LOCAL_RANK", "0"))
-            torch_npu.npu.set_device(local_idx)
-            return torch.device(f"npu:{local_idx}")
-        except Exception:
-            return torch.device("npu:0")
-    return torch.device(accelerator)
+    return resolve_device(getattr(config, "accelerator", "auto"))
 
 
 def _load_image(image_file: str) -> Image.Image:
@@ -129,28 +106,17 @@ def _load_image(image_file: str) -> Image.Image:
     return load_image_as_rgb(image_file)
 
 
-def _normalize_user_instruction(text: str) -> str:
-    prompt = str(text or "").strip()
-    if not prompt:
-        return prompt
-    prompt_lower = prompt.lower()
-    if "[det]" not in prompt_lower:
-        return prompt
-
-    geojson_markers = (
-        "geojson",
-        "featurecollection",
-        "feature collection",
-        "return json only",
-        "return geojson",
+def _normalize_user_instruction(
+    text: str,
+    default_output_format: str = "auto",
+    json_only: bool = True,
+) -> str:
+    request = normalize_interaction_instruction(
+        text,
+        default_output_format=default_output_format,
+        json_only=json_only,
     )
-    if any(marker in prompt_lower for marker in geojson_markers):
-        return prompt
-
-    return (
-        f"{prompt} Output the extracted feature information as a GeoJSON "
-        "FeatureCollection. Return JSON only."
-    )
+    return request.normalized_text
 
 
 def _fix_tokenizer_ids(tokenizer, model: CoastGPT) -> None:
@@ -200,7 +166,7 @@ def _parse_option() -> ml_collections.ConfigDict:
     parser = ConfigArgumentParser()
     parser.add_argument("--opts", default=None, nargs="+")
 
-    parser.add_argument("--image-file", type=str, default="../GeoJsonData/GF1/Size_128/Image_TrueColor/海水养殖区_GF1_PMS2_E119.4_N34.9_20170210_浅海区_R004C021_128_True_WFQ.jpg")
+    parser.add_argument("--image-file", type=str, default="../data/sample.jpg")
     parser.add_argument("--model-path", type=str, default="./output/stage3/mixed_v3/checkpoints/FINAL.pt")
     parser.add_argument("--seed", type=int, default=322)
     parser.add_argument("--temperature", type=float, default=0.4)
@@ -222,12 +188,25 @@ def _parse_option() -> ml_collections.ConfigDict:
     parser.add_argument("--sample-id", type=str, default=None)
     parser.add_argument("--coord-transform-path", type=str, default=None,
                         help="Path to coord_transform_train.json for coordinate inverse transform")
+    parser.add_argument(
+        "--default-output-format",
+        type=str,
+        default="auto",
+        choices=["auto", "text", "json", "geojson", "wkt"],
+        help="Default response format when the user instruction does not specify one",
+    )
+    parser.add_argument(
+        "--json-only",
+        type=str2bool,
+        default=True,
+        help="Ask the model to return JSON only for JSON and GeoJSON responses",
+    )
 
     parser.add_argument(
         "--accelerator",
-        default="npu",
+        default="auto",
         type=str,
-        choices=["cpu", "npu", "gpu", "mps"],
+        choices=["auto", "cpu", "npu", "gpu", "mps"],
     )
     # parser.add_argument("--use-checkpoint", default=False, type=str2bool)
 
@@ -323,7 +302,7 @@ def _postprocess_geojson(text: str) -> str:
                 )
                 print("[Inference][geojson] prepended FeatureCollection + first Feature Polygon header")
             else:
-                # No Feature objects found — bare coordinate data only.
+                # No Feature objects found; bare coordinate data only.
                 stripped = (
                     '{"type": "FeatureCollection", "features": '
                     '[{"type": "Feature", "geometry": '
@@ -810,7 +789,11 @@ def main(config: ml_collections.ConfigDict):
             break
 
         print(f"{roles[1]}: ", end="")
-        inp = _normalize_user_instruction(inp)
+        inp = _normalize_user_instruction(
+            inp,
+            default_output_format=str(getattr(config, "default_output_format", "auto")),
+            json_only=bool(getattr(config, "json_only", True)),
+        )
 
         if not image_consumed and image_tensor is not None:
             if bool(getattr(config, "tune_im_start", False)):

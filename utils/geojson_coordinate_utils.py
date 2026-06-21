@@ -1,4 +1,4 @@
-"""GeoJSON coordinate helpers used by Stage-3 data preparation.
+﻿"""GeoJSON coordinate helpers used by Stage-3 data preparation.
 
 The utilities here keep tile-relative coordinate normalization and mojibake
 repair separate from tokenizer vocabulary management.
@@ -208,7 +208,7 @@ def tile_transform_from_feature_collection(
 
 
 _MOJIBAKE_HINTS = (
-    "锋", "鍏", "畺", "鍖", "娴", "捣", "鎴", "鐩", "鐨", "鐮", "鎬", "鏇",
+    "generic?, "generic?, "generic?, "generic?, "generic?, "generic?, "generic?, "generic?, "generic?, "generic?, "generic?, "generic?,
 )
 
 

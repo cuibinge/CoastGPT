@@ -1,178 +1,205 @@
 # CoastGPT
 
-Multimodal coastal remote sensing foundation model — generates GeoJSON annotations from multi-sensor satellite imagery.
+CoastGPT is a multimodal remote-sensing foundation model for image-grounded
+language generation and structured output. The production architecture keeps
+model components domain-neutral: task labels, feature categories, and output
+schemas are represented as data or prompts, not as dedicated model branches.
 
 ## Architecture
 
-```
-Satellite Imagery (GF1/2/6, SAR, Multispectral)
-    │
-    ▼
-┌─────────────────────────────────────┐
-│  WaveletFusion (DWT multi-sensor)   │  ← 异构传感器统一（频域对齐 + 光谱融合）
-└─────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────┐
-│  Dual Vision Encoder                │
-│  DINOv3 ViT-L/16 (global)           │  ← 双编码器：全局语义 + 局部细节
-│  + ConvNeXt-Base (local)            │
-└─────────────────────────────────────┘
-    │
-    ▼
-┌─────────────────────────────────────┐
-│  Task-aware MoE Projection          │
-│  Task/Element Dual-Driven Gating    │  ← 物理先验引导门控网络选择专家
-└─────────────────────────────────────┘
-    │
-    ├──► LLaMA-2-7B → GeoJSON Text
-    │
-    └──► PhysicsDecoder (RTE/SAR)      ← 物理解码器
-         AquacultureSegMOE (Seg Head)  ← 养殖区分割头
-         LandcoverSemanticHead         ← 土地覆盖分割头
+```text
+Remote-sensing imagery
+    |
+    v
+Generic sensor preprocessing
+    |
+    v
+Dual vision encoder
+  - global visual stream
+  - local visual stream
+    |
+    v
+Generic conditional sparse projection
+    |
+    v
+Language model decoder
+    |
+    v
+Text or structured output
 ```
 
-## Key Features
+## Vector Object Objective
 
-- **4-band multispectral support** — Blue / Green / Red / NIR from GF-1/2/6 PMS sensors
-- **DWT wavelet fusion** — align heterogeneous sensors (SAR, multispectral, hyperspectral) and resolutions (0.8m–10m) in frequency domain before encoder
-- **Task-aware MoE routing** — task + element + physical-prompt dual-driven gating selects experts dynamically
-- **Physics-constrained decoder** — RTE (Nechad 2010) and SAR σ₀ losses constrain visual features with physical laws
-- **End-to-end GeoJSON generation** — outputs ready-to-use GeoJSON with geometry + properties + CRS metadata
-- **Huawei Ascend NPU native** — DeepSpeed ZeRO distributed training on 910B2 NPUs
+CoastGPT treats vector production as a generic language-grounded object
+modeling problem. GeoJSON targets are parsed into domain-neutral geometry
+statistics and supervised through the same language decoder. The auxiliary
+objective increases the loss weight on generic GeoJSON structure and coordinate
+tokens, without adding line-specific, polygon-specific, task-specific, or
+feature-specific decoder branches.
 
-## Training Pipeline
+The training batch exposes optional monitoring fields:
 
-| Stage | Script | Hardware | Key Params | Output |
-|-------|--------|----------|------------|--------|
-| **1 — Pretrain** | `train_stage_one.py` | 8 NPU | batch=8/GPU | Vision-language alignment |
-| **2 — MoE Fine-tune** | `train_stage_two.py` | 8 NPU | batch=4/GPU | Task-aware expert routing |
-| **3 — GeoJSON Gen** | `train_stage_three.py` | 2 NPU | batch=2/GPU, accum=8 | End-to-end GeoJSON output |
+```text
+vector_feature_count
+vector_point_count
+vector_bbox_area
+vector_closure_error
+```
 
-Stage 3 inherits core trainer logic from stage 2.
+These fields are used for logging and supervision weighting only. They do not
+create category routers or specialized model heads.
 
-## Environment
+## Interactive Tasks
+
+CoastGPT keeps remote-sensing captioning, scene classification, visual
+grounding, visual question answering, instruction following, and vector-object
+extraction in one natural-language interaction loop. The model receives an
+image plus a user instruction, then follows the requested response format.
+
+The interactive request layer only normalizes output contracts such as text,
+JSON, GeoJSON, WKT, or export-ready vector products. Feature names, categories,
+and product scopes remain user-provided free text and training data, not
+hard-coded model branches.
+
+Vector-object extraction is open vocabulary. A user may request any feature
+scope supported by the image evidence and training distribution. The model must
+return only objects matching that request, keep non-requested regions
+unassigned, and avoid forcing ambiguous or background regions into a fixed
+known category.
+
+Example inference controls:
 
 ```bash
-# Activate NPU environment
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
-source /home/ma-user/anaconda3/etc/profile.d/conda.sh
-conda activate PyTorch-2.1.0
-
-# Offline HF cache
-export HF_HOME=./hf_cache
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
-
-# NPU memory config
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+python Inference.py \
+  --image-file sample.tif \
+  --model-path CheckPoints/model.pt \
+  --accelerator gpu \
+  --default-output-format auto
 ```
 
-**Requirements:** Python 3.10, torch 2.1.2, DeepSpeed, CANN-8.0.RC2, Ascend 910B2 NPU.  
-Full package list in `requirement.txt`.
-
-## Installation
+For product-style extraction demos, use:
 
 ```bash
-git clone https://github.com/cuibinge/CoastGPT.git
-cd CoastGPT
-conda create -n CoastGPT python=3.10
-conda activate CoastGPT
-pip install -r requirement.txt
+python Inference.py \
+  --image-file sample.tif \
+  --model-path CheckPoints/model.pt \
+  --accelerator gpu \
+  --default-output-format geojson \
+  --json-only true
 ```
 
-## Quick Start
+## CoastGPT-Bench Preparation
 
-### Inference
+CoastGPT-Bench can be converted into the generic instruction format used by
+the training loader. The conversion keeps the usable subsets:
+
+- visual grounding coordinates as generic GeoJSON LineString targets
+- georeferenced image footprints as generic FeatureCollection targets
+- visual question answering conversations
+- image caption conversations
+- scene classification samples when class folders are available
+
+Prepare the dataset:
 
 ```bash
-bash scripts/run_infer.sh <image_path> ["prompt"] [output.json] [sample_id]
+python Dataset/coastgpt_bench_builder.py \
+  --source-root data/raw/CoastGPT-Bench \
+  --output-root data/prepared/CoastBench \
+  --download
 ```
 
-### Stage 3 Training (2 NPU)
+For vector-only training data:
 
 ```bash
-bash scripts/run_stage3.sh
+python Dataset/coastgpt_bench_builder.py \
+  --source-root data/raw/CoastGPT-Bench \
+  --output-root data/prepared/CoastBenchVector \
+  --download \
+  --no-vqa \
+  --no-caption \
+  --no-geojson \
+  --no-classification
 ```
 
-### MoE Diagnostic (100-step smoke test)
+Launch Stage-3 training with the prepared dataset:
 
 ```bash
-bash scripts/run_moe_diag_100step.sh
+torchrun --nproc_per_node=2 train_stage_three.py \
+  -c Configs/step3_dual.yaml \
+  --accelerator gpu \
+  --data-path data/prepared/CoastBench \
+  --auto-build-geojson-data false \
+  --batch-size 1 \
+  --accumulation-steps 8 \
+  --workers 4 \
+  --output output/coast_bench_stage3
 ```
 
-### Direct DeepSpeed Launch
+## Design Rules
+
+- Model code must stay independent of specific feature categories.
+- Model code must stay independent of specific task types.
+- Vector extraction must follow the user-provided open vocabulary scope.
+- Non-requested or uncertain regions must not be forced into a known category.
+- Routing and projection modules may use visual context and generic condition
+  tokens only.
+- Specialized data preparation, evaluation, or export logic must live outside
+  the core model path.
+- Runtime behavior must be selected through the shared runtime abstraction,
+  not by hard-coded CUDA or NPU branches.
+
+## Hardware
+
+The codebase supports both NVIDIA CUDA systems and Huawei Ascend systems.
+
+Recommended NVIDIA 4090D path:
 
 ```bash
-deepspeed --num_nodes=1 --num_gpus=2 train_stage_three.py \
-  -c Configs/step3_dual.yaml --batch-size 2 --workers 1 \
-  --accumulation-steps 8 --epochs 4 --model-path ./FINAL.pt \
-  --data-path ./MixedStage3Data_v2 --output ./output/stage3/mixed_v3 \
-  --accelerator npu --enable-amp True --use-checkpoint --wandb False
+conda create -n coastgpt-cu121 python=3.10
+conda activate coastgpt-cu121
+pip install -r requirements-nvidia4090d.txt
 ```
 
-### 4-band Overfit Verification
+Recommended launch style:
 
 ```bash
-# 3ch baseline
-python scripts/overfit_4band_verify.py --in-chans 3 --device npu:1
-
-# 4ch (RGB+NIR) comparison
-python scripts/overfit_4band_verify.py --in-chans 4 --device npu:1
+deepspeed --num_nodes=1 --num_gpus=1 train_stage_two.py \
+  -c Configs/step2_dual.yaml \
+  --accelerator gpu \
+  --batch-size 1 \
+  --accumulation-steps 8 \
+  --workers 4 \
+  --model-path CheckPoints/FINAL_epoch8_loc_off_lr_stuck.pt \
+  --output output/stage2_cuda
 ```
 
-### DWT Multi-Sensor Fusion Verification
+Use `--accelerator auto` to select CUDA when available, then NPU, then CPU.
 
-```bash
-python scripts/verify_dwt_fusion.py
+## Checkpoints
+
+Place model checkpoints under:
+
+```text
+CheckPoints/
 ```
 
-## Directory Map
+Large external weights should not be committed to Git.
 
-```
-CoastGPT/
-  Models/              # CoastGPT model, dual vision encoder, MoE, physics decoder, DWT fusion
-  Trainer/             # EpochBasedTrainer, DeepSpeed hooks, optimizers, checkpointer
-  Dataset/             # Data loaders, transforms, conversation templates
-  Configs/             # YAML configs per training stage
-  Tools/               # GeoJSON builders, evaluation, heatmaps, weight inspection
-  scripts/             # Shell wrappers for train/infer, overfit verification, DWT verification
-  utils/               # Georeferencing, coordinate encoding, semantic overlay utilities
-  Docs/                # Design specs and data documentation
-  output/              # Checkpoints and evaluation outputs
-  MixedStage3Data_v2/  # Symlinked merged dataset for stage 3
+## Repository Map
+
+```text
+Configs/      Runtime and training configs
+Dataset/      Generic data loading and preprocessing
+Models/       Core model components
+Trainer/      Training loop, hooks, distributed utilities
+utils/        Runtime, georeference, and output utilities
 ```
 
-## Datasets
+## Current Refactor Status
 
-Training data organized under `Stage3Data/`:
-
-| Category | Sensors | Size | Description |
-|----------|---------|------|-------------|
-| 养殖区 (Aquaculture) | GF1/GF2/GF6 | ~1,800 tiles | 4-band TIF with GeoJSON labels |
-| 土地分类 (Land Cover) | GF1 | ~33,000 tiles | 21-class land cover with per-class binary masks |
-| 海岸线 (Shoreline) | GF1/GF2 | ~950 tiles | 6 shoreline types with GeoJSON labels |
-
-**Image variants per tile:**
-- `Image_Orig/` — 4-band TIF (Blue+Green+Red+NIR), full radiometric precision
-- `Image_TrueColor/` — 3-channel RGB PNG
-- `Image_FalseColor/` — 3-channel false-color PNG (NIR-R-G)
-
-## Checkpoint Conventions
-
-- Stage 1 output: `output/checkpoints/FINAL.pt`
-- Stage 2 checkpoints: `output/stage2/checkpoints/iter_NNNN_consolidated.pt`
-- Stage 3 final: `output/stage3/mixed_v3/checkpoints/FINAL.pt`
-- Mid-training stage 3: `runs/` directory (diagnostic runs)
-
-Consolidated checkpoints are created from DeepSpeed ZeRO shards via `get_fp32_state_dict_from_zero_checkpoint`.
-
-## Pretrained Weights
-
-Required checkpoint files in repo root:
-- `dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth` — DINOv3 ViT-L/16 global encoder
-- `dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth` — DINOv3 ConvNeXt-Base local encoder
-
-## License
-
-Internal research project. Contact the authors for usage.
+- Runtime device selection is centralized in `utils/runtime.py`.
+- The language model no longer imports NPU runtime unconditionally.
+- The main multimodal projection path uses a generic conditional MoE module.
+- Vector-object supervision is implemented as a generic GeoJSON language
+  objective.
+- Legacy feature-specific experiment files were removed from the core path.

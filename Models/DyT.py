@@ -1,6 +1,9 @@
-import torch
+﻿import torch
 import torch.nn as nn
-import torch_npu
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 class DyT(nn.Module):
     def __init__(self,num_features):

@@ -1,5 +1,4 @@
-import logging
-import os
+﻿import logging
 from typing import Dict, List, Optional, Tuple, Union
 
 import ml_collections
@@ -20,7 +19,8 @@ from . import (
     IGNORE_INDEX,
     IMAGE_TOKEN_INDEX,
 )
-import torch_npu
+from utils.runtime import resolve_accelerator, resolve_device, supports_bitsandbytes
+from utils.vector_geometry import build_vector_token_weights
 
 logger = logging.getLogger("train")
 type_dict = {
@@ -87,17 +87,13 @@ class LanguageModel(nn.Module):
         compute_dtype = type_dict[config.dtype]
         bnb_model_from_pretrained_args = {}
 
+        accelerator = resolve_accelerator(getattr(config, "accelerator", "auto"))
         if getattr(config, "is_distribute", False):
-            device = torch.device(getattr(config, "local_rank", 0))
-        elif (
-            "CUDA_VISABLE_DEVICES" in os.environ.keys()
-            and len(os.environ["CUDA_VISABLE_DEVICES"].split(",")) == 1
-        ):
-            device = torch.device("cuda:" + os.environ["CUDA_VISABLE_DEVICES"])
+            device = resolve_device(accelerator, local_rank=getattr(config, "local_rank", 0))
         else:
-            device = torch.device("npu")
+            device = resolve_device(accelerator)
         request_kbit = config.bits in [4, 8]
-        use_kbit = request_kbit and device.type == "cuda"
+        use_kbit = request_kbit and supports_bitsandbytes(accelerator)
         if request_kbit and not use_kbit:
             logger.warning(
                 "Requested bits=%s quantization on device '%s'. "
@@ -138,6 +134,11 @@ class LanguageModel(nn.Module):
         )
 
         self.tokenizer = self.init_tokenizer(config.text.path)
+        vector_cfg = getattr(config, "vector_objective", ml_collections.ConfigDict())
+        self.vector_objective_enabled = bool(vector_cfg.get("enabled", False))
+        self.vector_structure_weight = float(vector_cfg.get("structure_weight", 2.0))
+        self.vector_coordinate_weight = float(vector_cfg.get("coordinate_weight", 1.5))
+        self._last_vector_loss = None
 
         if use_kbit:
             from peft import prepare_model_for_kbit_training
@@ -283,6 +284,7 @@ class LanguageModel(nn.Module):
         image_embedding: torch.Tensor = None,
         attention_mask: Optional[Union[torch.Tensor, None]] = None,
         labels: torch.Tensor = None,
+        vector_objective_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor]:
         (
             input_ids,
@@ -328,6 +330,31 @@ class LanguageModel(nn.Module):
         )
 
         text_loss = outputs["loss"]
+        self._last_vector_loss = None
+        if self.vector_objective_enabled and labels is not None and vector_objective_mask is not None:
+            logits = outputs.get("logits", None)
+            if logits is not None and logits.shape[1] > 1 and labels.shape[1] > 1:
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                token_weights = build_vector_token_weights(
+                    shift_labels,
+                    self.tokenizer,
+                    ignore_index=IGNORE_INDEX,
+                    structure_weight=self.vector_structure_weight,
+                    coordinate_weight=self.vector_coordinate_weight,
+                ).to(device=shift_logits.device, dtype=shift_logits.dtype)
+                sample_mask = vector_objective_mask.to(device=shift_logits.device, dtype=shift_logits.dtype)
+                while sample_mask.dim() < token_weights.dim():
+                    sample_mask = sample_mask.unsqueeze(-1)
+                token_weights = token_weights * sample_mask
+                flat_loss = F.cross_entropy(
+                    shift_logits.view(-1, shift_logits.size(-1)),
+                    shift_labels.view(-1),
+                    reduction="none",
+                    ignore_index=IGNORE_INDEX,
+                ).view_as(shift_labels)
+                denom = token_weights.sum().clamp_min(1.0)
+                self._last_vector_loss = (flat_loss.to(token_weights.dtype) * token_weights).sum() / denom
 
         return text_loss
 
@@ -339,6 +366,9 @@ class LanguageModel(nn.Module):
     ):
         modal_input = self.get_modal_input(x)
         return self.decode(**modal_input, image_embedding=multimodal_embedding, **kwargs)
+
+    def get_vector_loss(self):
+        return self._last_vector_loss
 
 
     def prepare_inputs_for_multimodal(

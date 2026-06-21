@@ -1,8 +1,11 @@
-import numbers
+﻿import numbers
 from math import cos, pi
 
 from .hookbase import HookBase
-import torch_npu
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 class LrUpdaterHook(HookBase):
     """

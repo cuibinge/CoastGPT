@@ -1,4 +1,4 @@
-import datetime
+﻿import datetime
 import logging
 import os
 import sys
@@ -42,8 +42,8 @@ def setup_logger(
     Here are some common uses. We suppose the project structure is as follows::
 
         project
-        ├── module1
-        └── module2
+        generic€ module1
+        generic€ module2
 
     - Only setup the parent logger (``project``), then all children loggers
       (``project.module1`` and ``project.module2``) will use the handlers of the parent logger.

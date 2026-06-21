@@ -209,7 +209,7 @@ def parse_option():
     parser.add_argument("--notes", type=str, default=None, help="Wandb run notes")
     
     # Hardware parameters
-    parser.add_argument("--accelerator", default="npu", type=str, choices=["cpu", "gpu", "mps", "npu"])
+    parser.add_argument("--accelerator", default="auto", type=str, choices=["auto", "cpu", "gpu", "mps", "npu"])
     parser.add_argument("--local_rank", type=int)
     
     return parser.parse_args(wandb=True)

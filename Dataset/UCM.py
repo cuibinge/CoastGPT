@@ -1,9 +1,12 @@
-from pathlib import Path
+﻿from pathlib import Path
 from typing import Callable, Union
 
 from PIL import Image
 from torch.utils.data import Dataset
-import torch_npu
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 
 
 class UCM(Dataset):

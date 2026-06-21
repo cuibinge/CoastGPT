@@ -1,4 +1,4 @@
-"""Coordinate transform utilities for WGS84 <-> model pixel space.
+﻿"""Coordinate transform utilities for WGS84 <-> model pixel space.
 
 Conventions:
 - coords_wgs84: (lon, lat) tuples in EPSG:4326

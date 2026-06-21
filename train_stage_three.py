@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 import os
 from pathlib import Path
 
@@ -153,7 +153,7 @@ def parse_option():
         default=None,
         help=(
             "Comma-separated tile sizes to include when raw-data-root points to a GF sensor root "
-            "or a parent directory such as 养殖区数据集. Default: 512"
+            "or a parent directory containing image tiles. Default: 512"
         ),
     )
     parser.add_argument(
@@ -162,7 +162,7 @@ def parse_option():
         default=None,
         help=(
             "Image variant directory to use when raw-data-root points to a GF sensor root "
-            "or a parent directory such as 养殖区数据集. Default: Image_FalseColor"
+            "or a parent directory containing image tiles. Default: Image_FalseColor"
         ),
     )
 
@@ -176,7 +176,7 @@ def parse_option():
     parser.add_argument("--notes", type=str, default=None, help="Wandb run notes")
 
     # Hardware parameters
-    parser.add_argument("--accelerator", default="npu", type=str, choices=["cpu", "gpu", "mps", "npu"])
+    parser.add_argument("--accelerator", default="auto", type=str, choices=["auto", "cpu", "gpu", "mps", "npu"])
     parser.add_argument("--local_rank", type=int)
 
     return parser.parse_args(wandb=True)
@@ -261,49 +261,6 @@ def maybe_build_geojson_data(config: ml_collections.config_dict.ConfigDict):
     raw_root = Path(str(getattr(config, "raw_data_root", "data")))
     output_root = Path(str(getattr(config, "geojson_output_root", "stage3_data")))
 
-    if _is_gf2_root(raw_root):
-        try:
-            from Tools.build_gf2_geojson_dataset import build_dataset
-        except Exception as exc:
-            logger.warning("Skip GF2 auto-build: failed to import Tools.build_gf2_geojson_dataset (%s).", exc)
-            return config
-
-        # Coordinate encoding policy:
-        #   loc_tokens.enabled=True  -> quantise to <loc_*> tokens (only do this
-        #     if you have separately verified the embed_tokens save path actually
-        #     captures trained values; otherwise the new tokens never learn).
-        #   loc_tokens.enabled=False -> normalised [0, 1] float coordinates that
-        #     work with the original 32000-token vocabulary.
-        loc_cfg = getattr(config, "loc_tokens", None)
-        loc_enabled = bool(loc_cfg is not None and getattr(loc_cfg, "enabled", False))
-        loc_bins = int(getattr(loc_cfg, "num_bins", 1000)) if loc_cfg is not None else 0
-        quantize_coords = loc_bins if loc_enabled else 0
-        normalize_coords = True  # always normalise; only quantisation is optional
-        logger.info(
-            "Auto-building Stage-3 GF GeoJSON dataset: %s -> %s (normalize_coords=%s, quantize_coords=%s)",
-            raw_root, output_root, normalize_coords, quantize_coords,
-        )
-        build_dataset(
-            gf2_root=raw_root,
-            output_dir=output_root,
-            size_filter=_parse_gf2_sizes(getattr(config, "gf2_sizes", None)),
-            image_subdir=str(getattr(config, "gf2_image_subdir", "Image_FalseColor")),
-            label_subdir="Label_GeoJSON",
-            copy_images=bool(getattr(config, "geojson_copy_images", False)),
-            compact_answer=True,
-            keep_crs=False,
-            normalize_coords=normalize_coords,
-            quantize_coords=quantize_coords,
-        )
-
-        generated_train_json = output_root / "GF2_geojson_train.json"
-        if generated_train_json.exists():
-            config.data_path = str(output_root)
-            logger.info("GF auto-build finished. data-path switched to generated dataset root: %s", config.data_path)
-        else:
-            logger.warning("GF auto-build finished but generated train json not found: %s", generated_train_json)
-        return config
-
     train_root = raw_root / "train"
     val_root = raw_root / "val"
 
@@ -315,11 +272,7 @@ def maybe_build_geojson_data(config: ml_collections.config_dict.ConfigDict):
         )
         return config
 
-    try:
-        from Tools.build_geojson_instructions import process_split
-    except Exception as exc:
-        logger.warning("Skip auto-build: failed to import Tools.build_geojson_instructions (%s).", exc)
-        return config
+    from Dataset.geojson_instruction_builder import process_split
 
     logger.info("Auto-building Stage-3 GeoJSON instruction dataset: %s -> %s", train_root, output_root)
     process_split(
@@ -337,7 +290,7 @@ def maybe_build_geojson_data(config: ml_collections.config_dict.ConfigDict):
             copy_images=bool(getattr(config, "geojson_copy_images", False)),
         )
 
-    generated_train_json = output_root / "GF_geojson_train.json"
+    generated_train_json = output_root / "Generic_geojson_train.json"
     if not generated_train_json.exists():
         logger.warning(
             "Auto-build finished but generated train json not found: %s. Keep data-path=%s",
@@ -382,8 +335,7 @@ def ensure_stage3_data_ready(config: ml_collections.config_dict.ConfigDict):
     has_geojson = any(data_path.glob("*.geojson"))
     output_root = Path(str(getattr(config, "geojson_output_root", "stage3_data")))
     generated_candidates = [
-        output_root / "GF_geojson_train.json",
-        output_root / "GF2_geojson_train.json",
+        output_root / "Generic_geojson_train.json",
     ]
     existing_generated = next((path for path in generated_candidates if path.exists()), None)
     if existing_generated is not None:
@@ -404,7 +356,7 @@ def ensure_stage3_data_ready(config: ml_collections.config_dict.ConfigDict):
 
     if has_geojson:
         raise RuntimeError(
-            "Stage-3 expects instruction json (e.g. GF_geojson_train.json), "
+            "Stage-3 expects instruction json (e.g. Generic_geojson_train.json), "
             f"but data-path={data_path} only contains raw .geojson files. "
             "Use --auto-build-geojson-data True or set --data-path to the generated dataset root."
         )

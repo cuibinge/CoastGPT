@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 from typing import Any, Dict
 
 import torch
@@ -8,7 +8,10 @@ from torch.nn.modules.batchnorm import _BatchNorm
 from torch.nn.utils import clip_grad_norm_
 
 from .hookbase import HookBase
-import torch_npu
+try:
+    import torch_npu  # noqa: F401
+except Exception:
+    torch_npu = None
 logger = logging.getLogger("train")
 
 
@@ -263,7 +266,7 @@ class Fp16OptimizerHook(OptimizerHook):
 
         1. Scale the loss by a scale factor.
         2. Backward the loss to obtain the gradients.
-        3. Unscale the optimizer’s gradient tensors.
+        3. Unscale the optimizergeneric gradient tensors.
         4. Call optimizer.step() and update scale factor.
         5. Save loss_scaler state_dict for resume purpose.
         """

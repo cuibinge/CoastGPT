@@ -1,4 +1,4 @@
-from .EpochBasedTrainer import EpochBasedTrainer
+﻿from .EpochBasedTrainer import EpochBasedTrainer
 from .hook import *
 from .IterBasedTrainer import IterBasedTrainer
 from .trainer import MetricStroge
