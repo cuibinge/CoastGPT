@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cat /home/ma-user/work/CoastGPT/weixin_claude_bot/inbox.json)",
+      "Bash(cat /home/ma-user/work/CoastGPT/weixin_claude_bot/outbox.json)",
+      "Bash(ls /home/ma-user/work/CoastGPT/weixin_claude_bot/*)",
+      "Bash(rm /home/ma-user/work/CoastGPT/weixin_claude_bot/inbox.json)",
+      "Write(/home/ma-user/work/CoastGPT/weixin_claude_bot/outbox.json)"
+    ]
+  },
+  "enabledPlugins": {
+    "superpowers@claude-plugins-official": true
+  }
+}

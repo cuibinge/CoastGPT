@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "codegraph": {
+      "command": "/home/ma-user/.local/node-v22.20.0-linux-arm64/bin/node",
+      "args": ["/home/ma-user/.local/bin/codegraph", "serve", "--mcp"],
+      "cwd": "/home/ma-user/work/CoastGPT"
+    }
+  }
+}
