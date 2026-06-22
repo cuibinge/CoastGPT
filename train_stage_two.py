@@ -316,15 +316,23 @@ def train_model(config):
     
     if config.optimizer.lower() != "adamw":
         optimizer = build_optimizer(model, config, is_pretrain=True)
+        deepspeed_model_parameters = None
     else:
         optimizer = None
+        deepspeed_model_parameters = [p for p in model.parameters() if p.requires_grad]
+        if len(deepspeed_model_parameters) == 0:
+            raise RuntimeError("No trainable parameters available for DeepSpeed optimizer.")
+        logger.info(
+            "Passing %d explicitly trainable tensors to DeepSpeed optimizer.",
+            len(deepspeed_model_parameters),
+        )
     
     # Initialize DeepSpeed engine
     model_engine, optimizer, _, _ = deepspeed.initialize(
         config=build_ds_config(config),
         model=model,
         optimizer=optimizer,
-        model_parameters=None if config.optimizer.lower() == "adamw" else None,
+        model_parameters=deepspeed_model_parameters,
     )
     
     ckpt_period = getattr(config, "ckpt_period", None)

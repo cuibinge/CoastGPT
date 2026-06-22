@@ -10,6 +10,8 @@ def load_dataset_entries(dataset_path: Path) -> List[Dict[str, Any]]:
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
+        if 'data' in data and isinstance(data['data'], list):
+            return data['data']
         if 'features' in data:
             return data['features']
         return [data]
@@ -191,7 +193,7 @@ def _match_features_by_property(pred_features, gt_features, property_keys, iou_t
     for pi, gi, iou, prop_match in scored:
         if pi in matched_pred or gi in matched_gt:
             continue
-        if iou >= iou_threshold or prop_match:
+        if iou >= iou_threshold and (property_keys is None or prop_match):
             matches.append((pi, gi, iou))
             matched_pred.add(pi)
             matched_gt.add(gi)

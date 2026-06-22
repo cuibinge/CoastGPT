@@ -1,4 +1,5 @@
 import json as _json
+import math
 import os
 import re as _re
 from io import BytesIO
@@ -12,7 +13,6 @@ from PIL import Image
 from transformers import TextStreamer
 
 from Dataset.build_transform import build_vlp_transform
-from Dataset.cap_dataset import load_image_as_rgb
 from Dataset.conversation import SeparatorStyle, default_conversation
 from Models import (
     DEFAULT_IM_END_TOKEN,
@@ -122,11 +122,37 @@ def _resolve_device(config: ml_collections.ConfigDict) -> torch.device:
 
 
 def _load_image(image_file: str) -> Image.Image:
+    Image.MAX_IMAGE_PIXELS = None
     if image_file.startswith("http://") or image_file.startswith("https://"):
         response = requests.get(image_file, timeout=30)
         response.raise_for_status()
-        return Image.open(BytesIO(response.content)).convert("RGB")
-    return load_image_as_rgb(image_file)
+        image = Image.open(BytesIO(response.content))
+    else:
+        image = Image.open(image_file)
+    return _resize_large_image_for_inference(image)
+
+
+def _resize_large_image_for_inference(
+    image: Image.Image,
+    *,
+    max_pixels: Optional[int] = None,
+    max_side: Optional[int] = None,
+) -> Image.Image:
+    image = image.convert("RGB")
+    max_pixels = int(max_pixels or os.environ.get("COASTGPT_MAX_INFERENCE_PIXELS", 16_000_000))
+    max_side = int(max_side or os.environ.get("COASTGPT_MAX_INFERENCE_SIDE", 4096))
+    width, height = image.size
+    scales = [1.0]
+    if max_pixels > 0 and width * height > max_pixels:
+        scales.append(math.sqrt(max_pixels / float(width * height)))
+    if max_side > 0 and max(width, height) > max_side:
+        scales.append(max_side / float(max(width, height)))
+    scale = min(scales)
+    if scale >= 1.0:
+        return image
+    new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    print(f"[Inference] resize large image for inference: {width}x{height} -> {new_size[0]}x{new_size[1]}")
+    return image.resize(new_size, Image.Resampling.BICUBIC)
 
 
 def _normalize_user_instruction(text: str) -> str:
@@ -698,11 +724,25 @@ def _load_checkpoint(model: CoastGPT, model_path: str, skip_text_lora: bool = Fa
             mm = other.get("multimodal_projection", None)
             if isinstance(mm, dict) and hasattr(model, "multimodal"):
                 model.multimodal.projection.load_state_dict(mm, strict=False)
-            emb = other.get("embed_tokens", None)
-            if isinstance(emb, dict) and hasattr(model, "language"):
+
+            def _report_load_result(module_name, incompatible):
+                print(
+                    f"[Inference] restored {module_name}: Missing: "
+                    f"{getattr(incompatible, 'missing_keys', [])}. Unexpected: "
+                    f"{getattr(incompatible, 'unexpected_keys', [])}"
+                )
+
+            if hasattr(model, "_restore_embed_tokens_from_ckpt"):
+                model._restore_embed_tokens_from_ckpt(ckpt, _report_load_result)
+            else:
+                emb = other.get("embed_tokens", None)
+                lm = other.get("lm_head", None)
                 try:
                     text_encoder = model.language.get_text_encoder()
-                    text_encoder.get_input_embeddings().load_state_dict(emb, strict=False)
+                    if isinstance(emb, dict):
+                        text_encoder.get_input_embeddings().load_state_dict(emb, strict=False)
+                    if isinstance(lm, dict) and text_encoder.get_output_embeddings() is not None:
+                        text_encoder.get_output_embeddings().load_state_dict(lm, strict=False)
                 except Exception:
                     pass
         return None

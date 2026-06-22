@@ -11,6 +11,7 @@ from deepspeed.utils.zero_to_fp32 import (
     get_fp32_state_dict_from_zero_checkpoint,
 )
 from peft import PeftModel
+from .wavelet_adapter import MultiBandDirectAdapter, apply_multiband_adapter
 from .vision_model import VisionModel as SingleVisionModel  # 自定义视觉模型模块
 from .dual_vision_encoder import DualVisionEncoder  # 双编码器视觉模块
 from .language_model import LanguageModel  # 自定义语言模型模块
@@ -94,6 +95,36 @@ class CoastGPT(nn.Module):
         self.language = LanguageModel(config)  # 语言处理模块
         self.multimodal = EmbeddingModel(config)  # 多模态嵌入模块
 
+        wavelet_cfg = getattr(config, "wavelet_adapter", ml_collections.ConfigDict())
+        self.wavelet_adapter_enabled = bool(wavelet_cfg.get("enabled", False))
+        self.wavelet_adapter_mode = str(wavelet_cfg.get("mode", "learnable_direct"))
+        self.wavelet_adapter_normalize_output = bool(wavelet_cfg.get("normalize_output", True))
+        wavelet_output_mean = wavelet_cfg.get("output_mean", [0.485, 0.456, 0.406])
+        wavelet_output_std = wavelet_cfg.get("output_std", [0.229, 0.224, 0.225])
+        self.register_buffer(
+            "wavelet_output_mean",
+            torch.tensor(wavelet_output_mean, dtype=torch.float32).view(1, -1, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "wavelet_output_std",
+            torch.tensor(wavelet_output_std, dtype=torch.float32).view(1, -1, 1, 1),
+            persistent=False,
+        )
+        self.wavelet_adapter = None
+        if self.wavelet_adapter_enabled:
+            if self.wavelet_adapter_mode != "learnable_direct":
+                raise ValueError(f"unsupported wavelet_adapter.mode: {self.wavelet_adapter_mode}")
+            in_channels = int(wavelet_cfg.get("in_channels", wavelet_cfg.get("multiband_channels", 4)))
+            target_channels = int(wavelet_cfg.get("target_channels", 3))
+            init = str(wavelet_cfg.get("init", "rgb_from_bgrn"))
+            self.wavelet_adapter = MultiBandDirectAdapter(
+                in_channels=in_channels,
+                target_channels=target_channels,
+                output_size=None,
+                init=init,
+            )
+
         # 物理解码器（可选）
         phy_cfg = getattr(config, "physics", ml_collections.ConfigDict())
         self.physics_enabled = bool(phy_cfg.get("enabled", False))
@@ -108,6 +139,64 @@ class CoastGPT(nn.Module):
             self.physics_tv_weight = float(phy_cfg.get("tv_weight", 0.0))
             self.physics_consistency_weight = float(phy_cfg.get("consistency_weight", 0.0))
             self.physics_spectral_weight = float(phy_cfg.get("spectral_weight", 0.0))
+
+    def _maybe_apply_wavelet_adapter(self, data: Dict, out: Dict) -> None:
+        if not getattr(self, "wavelet_adapter_enabled", False) or self.wavelet_adapter is None:
+            return
+        multiband = data.get("multiband", None)
+        if multiband is None:
+            return
+
+        reference_rgb = data.get("rgb", None)
+        adapted_rgb, meta = apply_multiband_adapter(
+            self.wavelet_adapter,
+            multiband,
+            reference_rgb=reference_rgb if torch.is_tensor(reference_rgb) else None,
+        )
+        if getattr(self, "wavelet_adapter_normalize_output", True):
+            mean = self.wavelet_output_mean.to(device=adapted_rgb.device, dtype=adapted_rgb.dtype)
+            std = self.wavelet_output_std.to(device=adapted_rgb.device, dtype=adapted_rgb.dtype)
+            adapted_rgb = (adapted_rgb - mean) / std
+        if torch.is_tensor(reference_rgb):
+            valid_multiband = data.get("valid_multiband", None)
+            if torch.is_tensor(valid_multiband):
+                valid = valid_multiband.to(device=adapted_rgb.device, dtype=torch.bool).view(-1, 1, 1, 1)
+                reference = reference_rgb.to(device=adapted_rgb.device, dtype=adapted_rgb.dtype)
+                adapted_rgb = torch.where(valid, adapted_rgb, reference)
+                out["wavelet_valid_multiband_ratio"] = valid_multiband.float().mean().to(adapted_rgb.device)
+        data["rgb"] = adapted_rgb
+        if "extra_band_weight_l1" in meta:
+            out["wavelet_extra_band_weight_l1"] = self.wavelet_adapter.extra_band_weight_l1()
+
+    def _add_prefix_first_token_loss(
+        self,
+        data: Dict,
+        multimodal_embedding: torch.Tensor,
+        total_loss: torch.Tensor,
+        out: Dict,
+    ) -> torch.Tensor:
+        prefix_cfg = getattr(self.config, "prefix_first_token_loss", ml_collections.ConfigDict())
+        prefix_enabled = bool(prefix_cfg.get("enabled", False))
+        prefix_weight = float(prefix_cfg.get("weight", 0.0) or 0.0)
+        if not prefix_enabled or prefix_weight <= 0:
+            return total_loss
+
+        prefix_loss, prefix_stats = self.language.prefix_first_token_loss(
+            data,
+            image_embedding=multimodal_embedding,
+        )
+        for stat_name, stat_value in prefix_stats.items():
+            out[stat_name] = stat_value
+        if prefix_loss is None:
+            return total_loss
+
+        prefix_loss_weighted = (prefix_weight * prefix_loss).to(total_loss.dtype)
+        out.update({
+            "prefix_first_token_loss": prefix_loss,
+            "prefix_first_token_loss_weighted": prefix_loss_weighted,
+        })
+        return total_loss + prefix_loss_weighted
+
     def forward(self, data: Dict):
         """
         模型的前向传播。
@@ -169,6 +258,8 @@ class CoastGPT(nn.Module):
                     element_text_embs = element_text_embs * element_mask.unsqueeze(-1).to(element_text_embs.dtype)
                 data["element_text_embs"] = element_text_embs
 
+        self._maybe_apply_wavelet_adapter(data, out)
+
         # 通过视觉模型处理图像
         if isinstance(self.vision, DualVisionEncoder):
             image_seq, fused_spatial, pyramid_raw = self.vision.encode_with_spatial(
@@ -192,6 +283,13 @@ class CoastGPT(nn.Module):
             raise RuntimeError(f"language model must return a tensor loss, got {type(text_loss)}")
         total_loss = text_loss
         out.update({"text_loss": text_loss})
+
+        total_loss = self._add_prefix_first_token_loss(
+            data=data,
+            multimodal_embedding=multimodal_embedding,
+            total_loss=total_loss,
+            out=out,
+        )
 
         if hasattr(self.multimodal, "get_aux_loss"):
             # 获取辅助损失
@@ -386,7 +484,45 @@ class CoastGPT(nn.Module):
 
         return out
 
-    def encode_image(self, image, pool):
+    def _embed_semantic_text_ids(self, input_ids, attention_mask=None):
+        if input_ids is None or not torch.is_tensor(input_ids):
+            return None
+        emb_layer = None
+        try:
+            if hasattr(self.language, "get_text_encoder"):
+                emb_layer = self.language.get_text_encoder().get_input_embeddings()
+            elif hasattr(self.language, "text_encoder"):
+                emb_layer = self.language.text_encoder.get_input_embeddings()
+            elif hasattr(self.language, "model"):
+                emb_layer = self.language.model.get_input_embeddings()
+        except Exception as exc:
+            emb_layer = None
+            if not getattr(self, "_warned_generate_semantic_emb_layer", False):
+                logger.warning(
+                    "Failed to get semantic embedding layer for generation: %s", exc
+                )
+                self._warned_generate_semantic_emb_layer = True
+        if emb_layer is None:
+            return None
+
+        input_ids = input_ids.to(device=emb_layer.weight.device)
+        embs = emb_layer(input_ids)
+        if attention_mask is not None and torch.is_tensor(attention_mask):
+            mask = attention_mask.to(device=embs.device)
+            embs = embs * mask.unsqueeze(-1).to(embs.dtype)
+        return embs
+
+    def encode_image(
+            self,
+            image,
+            pool,
+            physical_prompt_embs=None,
+            task_text_embs=None,
+            element_text_embs=None,
+            physical_prompt_attention_mask=None,
+            task_text_attention_mask=None,
+            element_text_attention_mask=None,
+    ):
         """
         将输入图像编码为嵌入向量。
 
@@ -397,9 +533,24 @@ class CoastGPT(nn.Module):
         返回:
             图像嵌入向量（池化或未池化）
         """
-        # 从视觉模型获取原始图像嵌入
-        image_embedding = self.vision.encode(image)
-        image_embedding = self.multimodal.encode_test(image_embedding)
+        # 从视觉模型获取原始图像嵌入。DualVisionEncoder 训练时使用
+        # encode_with_spatial + physical_prompt_embs，生成时必须对齐。
+        if isinstance(self.vision, DualVisionEncoder):
+            image_embedding, _, _ = self.vision.encode_with_spatial(
+                image,
+                physical_prompt_embs=physical_prompt_embs,
+            )
+        else:
+            image_embedding = self.vision.encode(image)
+        image_embedding = self.multimodal.encode_test(
+            image_embedding,
+            physical_prompts=physical_prompt_embs,
+            task_text_embs=task_text_embs,
+            element_text_embs=element_text_embs,
+            physical_prompt_mask=physical_prompt_attention_mask,
+            task_text_mask=task_text_attention_mask,
+            element_text_mask=element_text_attention_mask,
+        )
         if pool:
             # 如果请求池化，返回平均池化的嵌入向量
             return image_embedding.mean(dim=1)
@@ -411,6 +562,8 @@ class CoastGPT(nn.Module):
             self,
             input_ids: torch.Tensor,
             images: torch.Tensor = None,
+            multiband: torch.Tensor = None,
+            valid_multiband: torch.Tensor = None,
             do_sample: bool = True,
             temperature: float = 0.2,
             max_new_tokens: int = 1024,
@@ -437,8 +590,42 @@ class CoastGPT(nn.Module):
             生成的文本输出
         """
         if images is not None:
+            physical_prompt_ids = kwargs.pop("physical_prompt_ids", None)
+            physical_prompt_attention_mask = kwargs.pop("physical_prompt_attention_mask", None)
+            task_text_ids = kwargs.pop("task_text_ids", None)
+            task_text_attention_mask = kwargs.pop("task_text_attention_mask", None)
+            element_text_ids = kwargs.pop("element_text_ids", None)
+            element_text_attention_mask = kwargs.pop("element_text_attention_mask", None)
+            physical_prompt_embs = self._embed_semantic_text_ids(
+                physical_prompt_ids,
+                attention_mask=physical_prompt_attention_mask,
+            )
+            task_text_embs = self._embed_semantic_text_ids(
+                task_text_ids,
+                attention_mask=task_text_attention_mask,
+            )
+            element_text_embs = self._embed_semantic_text_ids(
+                element_text_ids,
+                attention_mask=element_text_attention_mask,
+            )
+            if multiband is not None:
+                wavelet_data = {"rgb": images, "multiband": multiband}
+                if valid_multiband is not None:
+                    wavelet_data["valid_multiband"] = valid_multiband
+                wavelet_out = {}
+                self._maybe_apply_wavelet_adapter(wavelet_data, wavelet_out)
+                images = wavelet_data.get("rgb", images)
             # 如果提供了图像，编码为嵌入向量（不池化）
-            image_embedding = self.encode_image(images, pool=False)
+            image_embedding = self.encode_image(
+                images,
+                pool=False,
+                physical_prompt_embs=physical_prompt_embs,
+                task_text_embs=task_text_embs,
+                element_text_embs=element_text_embs,
+                physical_prompt_attention_mask=physical_prompt_attention_mask,
+                task_text_attention_mask=task_text_attention_mask,
+                element_text_attention_mask=element_text_attention_mask,
+            )
         else:
             image_embedding = None
         # 调用语言模型的生成方法
@@ -605,28 +792,45 @@ class CoastGPT(nn.Module):
 
         Looks for ``ckpt["other_ckpt"]["embed_tokens"]`` (and optional
         ``lm_head``) and copies them onto the current text encoder. Silently
-        no-ops when the keys are absent or shapes mismatch so it stays safe on
-        legacy checkpoints.
+        no-ops when the keys are absent. When an older checkpoint has a larger
+        vocabulary than the current tokenizer, restore only the aligned rows so
+        current non-bin-token inference can still use the trained text weights.
         """
         other = ckpt.get("other_ckpt") if isinstance(ckpt, dict) else None
         if not isinstance(other, dict):
             return
+
+        def _restore_layer_weight(layer, ckpt_weight, module_name: str) -> None:
+            target_shape = tuple(layer.weight.shape)
+            ckpt_shape = tuple(ckpt_weight.shape)
+            if ckpt_shape == target_shape:
+                msg = layer.load_state_dict({"weight": ckpt_weight}, strict=False)
+                report(module_name, msg)
+                return
+            if len(ckpt_shape) == 2 and len(target_shape) == 2 and ckpt_shape[1] == target_shape[1]:
+                rows = min(ckpt_shape[0], target_shape[0])
+                with torch.no_grad():
+                    layer.weight[:rows].copy_(
+                        ckpt_weight[:rows].to(device=layer.weight.device, dtype=layer.weight.dtype)
+                    )
+                print(
+                    f"[Inference] {module_name} shape mismatch: "
+                    f"ckpt={ckpt_shape} vs model={target_shape}; "
+                    f"restored first {rows} aligned rows without tokenizer resize."
+                )
+                return
+            print(
+                f"[Inference] {module_name} shape mismatch: "
+                f"ckpt={ckpt_shape} vs model={target_shape}; keeping current init."
+            )
+
         emb = other.get("embed_tokens")
         if isinstance(emb, dict) and "weight" in emb:
             try:
                 text_encoder = self.language.get_text_encoder()
                 input_layer = text_encoder.get_input_embeddings()
                 ckpt_weight = emb["weight"]
-                target_shape = tuple(input_layer.weight.shape)
-                if tuple(ckpt_weight.shape) == target_shape:
-                    msg = input_layer.load_state_dict({"weight": ckpt_weight}, strict=False)
-                    report("embed_tokens", msg)
-                else:
-                    print(
-                        f"[Inference] embed_tokens shape mismatch: "
-                        f"ckpt={tuple(ckpt_weight.shape)} vs model={target_shape}; "
-                        f"keeping current init."
-                    )
+                _restore_layer_weight(input_layer, ckpt_weight, "embed_tokens")
             except Exception as exc:
                 print(f"[Inference] failed to restore embed_tokens: {exc}")
         lm = other.get("lm_head")
@@ -636,12 +840,15 @@ class CoastGPT(nn.Module):
                 output_layer = text_encoder.get_output_embeddings()
                 if output_layer is not None:
                     ckpt_weight = lm["weight"]
-                    target_shape = tuple(output_layer.weight.shape)
-                    if tuple(ckpt_weight.shape) == target_shape:
-                        msg = output_layer.load_state_dict({"weight": ckpt_weight}, strict=False)
-                        report("lm_head", msg)
+                    _restore_layer_weight(output_layer, ckpt_weight, "lm_head")
             except Exception as exc:
                 print(f"[Inference] failed to restore lm_head: {exc}")
+
+    @staticmethod
+    def _unwrap_text_lora_base_encoder(text_encoder):
+        while isinstance(text_encoder, PeftModel):
+            text_encoder = text_encoder.model
+        return text_encoder
 
     def custom_load_state_dict(self, state_dict_path, strict=False):
         """
@@ -709,17 +916,22 @@ class CoastGPT(nn.Module):
         if any(key.startswith('module') for key in ckpt.keys()):
             # filtered_state_dict = {k: v for k, v in ckpt["module"].items() if k.startswith("multimodal.")}
             filtered_state_dict = {k: v for k, v in ckpt["module"].items() if
-                                   k.startswith("multimodal.") or k.startswith("vision.")}
+                                   k.startswith("multimodal.") or k.startswith("vision.") or k.startswith("wavelet_adapter.")}
             msg = self.load_state_dict(filtered_state_dict, strict=False)
             _report_load_result("model", msg)
 
         elif any(key.startswith('vision_ckpt') for key in ckpt.keys()) :
             vision_ckpt = ckpt["vision_ckpt"]
-            multimodal_ckpt = ckpt["other_ckpt"]["multimodal_projection"]
+            other_ckpt = ckpt.get("other_ckpt", {})
+            multimodal_ckpt = other_ckpt["multimodal_projection"]
             msg = self.vision.load_state_dict(vision_ckpt, strict=strict)
             _report_load_result("vision", msg)
             msg = self.multimodal.projection.load_state_dict(multimodal_ckpt, strict=strict)
             _report_load_result("multimodal", msg)
+            wavelet_ckpt = other_ckpt.get("wavelet_adapter")
+            if self.wavelet_adapter is not None and isinstance(wavelet_ckpt, dict):
+                msg = self.wavelet_adapter.load_state_dict(wavelet_ckpt, strict=False)
+                _report_load_result("wavelet_adapter", msg)
             # Restore text-encoder input embeddings for compatibility with
             # older checkpoints that saved these tensors separately.
             self._restore_embed_tokens_from_ckpt(ckpt, _report_load_result)
@@ -741,11 +953,16 @@ class CoastGPT(nn.Module):
         text_path = pathlib.Path(state_dict_path).parent / "TextLoRA"  # 构造 TextLoRA 目录路径
         if text_path.exists():
             print(f"[Inference] loading TextLoRA from: {text_path}")
+            lora_cfg = getattr(self.config, "lora", None)
+            train_text_lora = bool(getattr(lora_cfg, "enable", False)) and self.stage >= 2
+            base_text_encoder = self._unwrap_text_lora_base_encoder(self.language.text_encoder)
+            if base_text_encoder is not self.language.text_encoder:
+                print("[Inference] unwrap existing TextLoRA adapter before checkpoint load.")
             # 如果 TextLoRA 目录存在，则加载文本 LoRA
             self.language.text_encoder = PeftModel.from_pretrained(
-                self.language.text_encoder,
+                base_text_encoder,
                 text_path,
-                is_trainable=self.stage > 2,  # 仅在 stage > 2 时设置为可训练
+                is_trainable=train_text_lora,
                 torch_dtype=torch.float16,  # 使用 float16 数据类型
             )
             print("[Inference] TextLoRA load finished.")
@@ -836,6 +1053,10 @@ class CoastGPT(nn.Module):
                 p.requires_grad = False
             for p in text_encoder.get_output_embeddings().parameters():
                 p.requires_grad = False
+            for name, p in text_encoder.named_parameters():
+                if "lora_" in name:
+                    p.requires_grad = True
+                    p.data = p.data.to(dtype=compute_dtype)
 
         # 多模态相关参数是否训练
         for param in self.multimodal.parameters():
@@ -853,6 +1074,12 @@ class CoastGPT(nn.Module):
                 p.data = p.data.to(dtype=torch.float32)
             for name, buffer in self.physics.named_buffers():
                 buffer.data = buffer.data.to(dtype=torch.float32)
+
+        if getattr(self, "wavelet_adapter_enabled", False) and self.wavelet_adapter is not None:
+            self.wavelet_adapter.train()
+            for p in self.wavelet_adapter.parameters():
+                p.requires_grad = True
+                p.data = p.data.to(dtype=torch.float32)
 
         if tune_im_start and freeze_text:
             # 如果 tune_im_start 为 True 且文本被冻结，则解冻输入嵌入
@@ -883,12 +1110,13 @@ def maybe_zero_3(param, ignore_status=False, name=None):
 
 def get_other_maybe_zero_3(named_params):
     # 定义需要处理的键名
-    names = ["multimodal.projection", "embed_tokens", "physics"]
+    names = ["multimodal.projection", "embed_tokens", "physics", "wavelet_adapter"]
     multimodal_projection = dict()
     text_proj = dict()
     embed_tokens = dict()
     lm_head = dict()
     physics_ckpt = dict()
+    wavelet_adapter_ckpt = dict()
 
     # 将输入的 named_params 转换为列表，方便遍历
     params = list(named_params)
@@ -899,6 +1127,7 @@ def get_other_maybe_zero_3(named_params):
         text_proj=text_proj,
         lm_head=lm_head,
         physics=physics_ckpt,
+        wavelet_adapter=wavelet_adapter_ckpt,
     )
     # 遍历参数
     for k, v in params:
@@ -912,6 +1141,10 @@ def get_other_maybe_zero_3(named_params):
                     to_return["embed_tokens"][k.split(name + ".")[-1]] = maybe_zero_3(v, ignore_status=True, name=k)
                 elif name == "physics":
                     to_return["physics"][k.split(name + ".")[-1]] = maybe_zero_3(v, ignore_status=True, name=k)
+                elif name == "wavelet_adapter":
+                    to_return["wavelet_adapter"][k.split(name + ".")[-1]] = maybe_zero_3(
+                        v, ignore_status=True, name=k
+                    )
 
     return to_return
 # def get_other_maybe_zero_3(named_params):

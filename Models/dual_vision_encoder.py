@@ -16,6 +16,15 @@ except Exception as e:
     _open_clip_import_error = e
 
 
+def _interpolate_pos_embed_grid(patch_pe: torch.Tensor, size: Tuple[int, int]) -> torch.Tensor:
+    original_dtype = patch_pe.dtype
+    work = patch_pe
+    if work.dtype in (torch.float16, torch.bfloat16):
+        work = work.float()
+    work = F.interpolate(work, size=size, mode='bicubic', align_corners=False)
+    return work.to(dtype=original_dtype) if work.dtype != original_dtype else work
+
+
 
 class CrossFrequencyAttention(nn.Module):
     """
@@ -664,7 +673,7 @@ class DualVisionEncoder(nn.Module):
         cls_token = pe[:, :1, :]  # [1, 1, D]
         patch_pe = pe[:, 1:, :]   # [1, H_old*W_old, D]
         patch_pe = patch_pe.reshape(1, H_old, H_old, D).permute(0, 3, 1, 2)  # [1, D, H_old, W_old]
-        patch_pe = F.interpolate(patch_pe, size=(H_new, W_new), mode='bicubic', align_corners=False)
+        patch_pe = _interpolate_pos_embed_grid(patch_pe, size=(H_new, W_new))
         patch_pe = patch_pe.permute(0, 2, 3, 1).reshape(1, H_new * W_new, D)
         return torch.cat([cls_token, patch_pe], dim=1)
 
@@ -955,6 +964,5 @@ class DualVisionEncoder(nn.Module):
         if self.physical_guided_align is not None and hasattr(self.physical_guided_align, "_last_stats"):
             stats.update(self.physical_guided_align._last_stats)
         return stats
-
 
 

@@ -140,19 +140,34 @@ class EmbeddingModel(nn.Module):
     def encode_test(
             self,
             image_embedding: torch.Tensor,
+            physical_prompts: Optional[torch.Tensor] = None,
             task_text_embs: Optional[torch.Tensor] = None,
             element_text_embs: Optional[torch.Tensor] = None,
+            physical_prompt_mask: Optional[torch.Tensor] = None,
+            task_text_mask: Optional[torch.Tensor] = None,
+            element_text_mask: Optional[torch.Tensor] = None,
     ):
+        if physical_prompts is not None:
+            physical_prompts = physical_prompts.to(image_embedding.device, dtype=image_embedding.dtype)
         if task_text_embs is not None:
             task_text_embs = task_text_embs.to(image_embedding.device, dtype=image_embedding.dtype)
         if element_text_embs is not None:
             element_text_embs = element_text_embs.to(image_embedding.device, dtype=image_embedding.dtype)
+        if physical_prompt_mask is not None:
+            physical_prompt_mask = physical_prompt_mask.to(image_embedding.device)
+        if task_text_mask is not None:
+            task_text_mask = task_text_mask.to(image_embedding.device)
+        if element_text_mask is not None:
+            element_text_mask = element_text_mask.to(image_embedding.device)
 
         return self.projection(
             image_embs=image_embedding,
-            physical_prompts=None,
+            physical_prompts=physical_prompts,
             task_text_embs=task_text_embs,
             element_text_embs=element_text_embs,
+            physical_prompt_mask=physical_prompt_mask,
+            task_text_mask=task_text_mask,
+            element_text_mask=element_text_mask,
         )
 
     def get_aux_loss(self) -> torch.Tensor:

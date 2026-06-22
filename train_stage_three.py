@@ -165,6 +165,30 @@ def parse_option():
             "or a parent directory such as 养殖区数据集. Default: Image_FalseColor"
         ),
     )
+    parser.add_argument(
+        "--wavelet-adapter-enabled",
+        type=str2bool,
+        default=None,
+        help="Enable multi-band wavelet adapter input path",
+    )
+    parser.add_argument(
+        "--wavelet-adapter-mode",
+        type=str,
+        default=None,
+        help="Wavelet adapter mode, currently learnable_direct",
+    )
+    parser.add_argument(
+        "--wavelet-adapter-in-channels",
+        type=int,
+        default=None,
+        help="Number of raw multi-band channels consumed by the adapter",
+    )
+    parser.add_argument(
+        "--wavelet-adapter-multiband-channels",
+        type=int,
+        default=None,
+        help="Maximum TIFF bands loaded by the dataset",
+    )
 
     # W&B parameters
     parser.add_argument("--wandb", type=str2bool, default=False, help="Enable wandb logging")
@@ -223,6 +247,17 @@ def apply_stage3_defaults(config: ml_collections.config_dict.ConfigDict):
         config.auto_build_geojson_data = True
     if getattr(config, "ckpt_period", None) is None:
         config.ckpt_period = 0
+
+    wavelet_cfg = getattr(config, "wavelet_adapter", ml_collections.config_dict.ConfigDict())
+    if getattr(config, "wavelet_adapter_enabled", None) is not None:
+        wavelet_cfg.enabled = bool(config.wavelet_adapter_enabled)
+    if getattr(config, "wavelet_adapter_mode", None) is not None:
+        wavelet_cfg.mode = str(config.wavelet_adapter_mode)
+    if getattr(config, "wavelet_adapter_in_channels", None) is not None:
+        wavelet_cfg.in_channels = int(config.wavelet_adapter_in_channels)
+    if getattr(config, "wavelet_adapter_multiband_channels", None) is not None:
+        wavelet_cfg.multiband_channels = int(config.wavelet_adapter_multiband_channels)
+    config.wavelet_adapter = wavelet_cfg
 
     # Stage-3 on NPU is much more stable in bf16 than fp16.
     if str(getattr(config, "accelerator", "")).lower() == "npu":

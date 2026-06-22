@@ -100,6 +100,14 @@ def build_vlp_transform(config: ml_collections.ConfigDict, is_train: bool = True
     if is_train:
         input_size = getattr(config.transform, 'default_input_size', None) \
                   or getattr(config.transform, 'input_size', [224, 224])
+        if bool(getattr(config.transform, "deterministic_resize", False)):
+            return transforms.Compose(
+                [
+                    transforms.Resize(tuple(input_size), interpolation=PIL.Image.BICUBIC),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean, std),
+                ]
+            )
         transform = create_transform(
             is_training=True,
             input_size=input_size,

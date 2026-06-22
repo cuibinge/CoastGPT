@@ -141,6 +141,30 @@ def resolve_device(device_str: str) -> torch.device:
 # Loss functions
 # =============================================================================
 
+THIN_CLASS_IDS = {2, 4, 6, 9, 11, 18}  # 港口码头, 公路, 沟渠, 坑塘, 内陆滩涂, 水工建筑
+ZERO_SAMPLE_IDS = {1, 12}                 # 城镇村道路, 农村道路 — 极稀疏类，强制曝光
+
+
+def focal_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    class_weights: torch.Tensor,
+    ignore_index: int = 255,
+    gamma: float = 2.0,
+) -> torch.Tensor:
+    """Focal Loss with per-class weights and ignore_index support."""
+    log_p = torch.log_softmax(logits, dim=1)  # [B, C, H, W]
+    ce = -log_p.gather(1, target.unsqueeze(1)).squeeze(1)  # [B, H, W]
+    pt = torch.exp(-ce)
+    focal_weight = (1.0 - pt) ** gamma
+
+    weight = class_weights.to(logits.device)[target]  # [B, H, W]
+
+    loss = weight * focal_weight * ce
+    valid = target != ignore_index
+    if valid.sum() == 0:
+        return logits.sum() * 0.0
+    return loss[valid].mean()
 
 def dice_loss(pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """Binary Dice loss for a single class.
@@ -201,6 +225,8 @@ def compute_loss(
     max_ignore_ratio: float = 0.25,
     max_labeled_for_bg: float = 0.3,
     pseudo_bg_threshold: float = 0.7,
+    loss_type: str = "ce",
+    class_weights: torch.Tensor = None,
     pseudo_bg_entropy_threshold: float = 0.25,
     pseudo_bg_protect_radius: int = 8,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, float]]:
@@ -225,7 +251,10 @@ def compute_loss(
         z = logits.sum() * 0.0
         return z, z, z, z, {}
 
-    loss_ce = F.cross_entropy(logits, target, ignore_index=ignore_index)
+    if loss_type == "focal" and class_weights is not None:
+        loss_ce = focal_loss(logits, target, class_weights, ignore_index=ignore_index, gamma=2.0)
+    else:
+        loss_ce = F.cross_entropy(logits, target, ignore_index=ignore_index)
     loss_dice = observed_class_dice_loss(logits, target, ignore_index)
 
     loss_bg = logits.sum() * 0.0
@@ -268,6 +297,12 @@ def compute_loss(
         elif bg_type == "bce":
             loss_bg, bg_stats = _sampled_background_bce_loss(
                 logits, target, ignore_index, max_ignore_ratio, max_labeled_for_bg,
+            )
+            total = loss_ce + loss_dice + lambda_bg * loss_bg
+        elif bg_type == "soft_bce":
+            loss_bg, bg_stats = _sampled_background_bce_loss(
+                logits, target, ignore_index, max_ignore_ratio, max_labeled_for_bg,
+                soft=True,
             )
             total = loss_ce + loss_dice + lambda_bg * loss_bg
         else:
@@ -334,21 +369,23 @@ def _sampled_background_bce_loss(
     ignore_index: int = IGNORE_INDEX,
     max_ignore_ratio: float = 0.25,
     max_labeled_for_bg: float = 0.3,
+    soft: bool = False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Conditional sampled BCE: apply background prior only on low-label tiles.
+    """Sampled BCE background prior.
 
-    Gate: SKIP tiles with labeled_ratio > max_labeled_for_bg.
-    On high-label tiles (e.g. 80%+ labeled), the ignore region may contain
-    unlabeled foreground — applying BCE prior there crushes thin classes.
-    On low-label tiles (e.g. ≤30% labeled), the ignore region is likely
-    true background — BCE prior is safe.
+    Two modes:
+      - hard (soft=False): SKIP tiles with labeled_ratio > max_labeled_for_bg.
+      - soft (soft=True):  Scale per-tile loss by (1 - labeled_ratio).
+        Sparse tiles (1% labeled) get ~full strength; dense tiles (90%) get ~10%.
+        No hard skip — every tile with IGNORE pixels participates, but sparse
+        tiles dominate.
 
-    For the selected tiles, sample up to max_ignore_ratio * N_labeled
-    ignore pixels and apply BCE loss treating them as background (class 0).
+    For each tile, sample up to max_ignore_ratio * N_labeled ignore pixels
+    and apply BCE loss treating them as background (class 0).
 
     Returns:
         loss: scalar tensor
-        stats: dict with active_tile_ratio, sampled_pixel_count, active_labeled_ratio_mean
+        stats: dict
     """
     log_p = torch.log_softmax(logits, dim=1)  # [B, C, H, W]
     log_p_bg = log_p[:, 0]  # [B, H, W]
@@ -372,9 +409,13 @@ def _sampled_background_bce_loss(
         total_pixels = n_labeled + n_ignore
         labeled_ratio = n_labeled / total_pixels if total_pixels > 0 else 0.0
 
-        # Conditional gate: skip if tile is highly labeled
-        if labeled_ratio > max_labeled_for_bg:
-            continue
+        if soft:
+            soft_weight = 1.0 - labeled_ratio
+        else:
+            # Hard gate: skip if tile is highly labeled
+            if labeled_ratio > max_labeled_for_bg:
+                continue
+            soft_weight = 1.0
 
         active_tiles += 1
         active_labeled_ratios.append(labeled_ratio)
@@ -390,7 +431,7 @@ def _sampled_background_bce_loss(
 
         # BCE: -log(p_bg) for sampled ignore pixels → pushes p_bg → 1
         loss_b = -log_p_bg[b][sampled[:, 0], sampled[:, 1]].mean()
-        losses.append(loss_b)
+        losses.append(loss_b * soft_weight)
 
     stats = {
         "bg_prior_active_tile_ratio": active_tiles / batch_size if batch_size > 0 else 0.0,
@@ -538,6 +579,8 @@ def train_epoch(
     pseudo_bg_threshold_ramp_start_epoch: int = 1,
     pseudo_bg_entropy_threshold: float = 0.25,
     pseudo_bg_protect_radius: int = 8,
+    loss_type: str = "ce",
+    class_weights: torch.Tensor = None,
 ) -> float:
     vision.eval()      # frozen
     fpn.train()
@@ -582,7 +625,7 @@ def train_epoch(
             image_seq, g_grid, pyramid_raw = vision.encode_with_spatial(images)
 
         c4, c8, c16, c32 = pyramid_raw
-        p1, p2, p3, p4 = fpn(c4, c8, c16, c32)
+        p1, p2, p3, p4 = fpn(c4, c8, c16, c32, vit_feat=g_grid if fpn.has_vit else None)
         logits = sem_head(p1, p2, p3, p4)
 
         total_loss, loss_ce, loss_dice, loss_bg, bg_stats = compute_loss(
@@ -595,6 +638,8 @@ def train_epoch(
             pseudo_bg_threshold=dynamic_pseudo_bg_threshold,
             pseudo_bg_entropy_threshold=pseudo_bg_entropy_threshold,
             pseudo_bg_protect_radius=pseudo_bg_protect_radius,
+            loss_type=loss_type,
+            class_weights=class_weights.to(device) if class_weights is not None else None,
         )
 
         # Accumulate stats
@@ -696,7 +741,7 @@ def validate(
 
         image_seq, g_grid, pyramid_raw = vision.encode_with_spatial(images)
         c4, c8, c16, c32 = pyramid_raw
-        p1, p2, p3, p4 = fpn(c4, c8, c16, c32)
+        p1, p2, p3, p4 = fpn(c4, c8, c16, c32, vit_feat=g_grid if fpn.has_vit else None)
         logits = sem_head(p1, p2, p3, p4)
 
         # Per-image metrics
@@ -1034,10 +1079,15 @@ def main():
 
     # ---- Build FPN + Semantic Head ----
     print("\n--- Building FPN + LandcoverSemanticHead ---")
+    vit_in_channels = cfg["model"]["fpn"].get("vit_in_channels", 0)
     fpn = FPNNeck(
         in_channels=cfg["model"]["fpn"]["in_channels"],
         out_channels=cfg["model"]["fpn"]["out_channels"],
+        vit_in_channels=vit_in_channels,
     ).to(device)
+    vit_fusion = vit_in_channels > 0
+    if vit_fusion:
+        print(f"FPN ViT fusion enabled: vit_in_channels={vit_in_channels}")
 
     sem_head = LandcoverSemanticHead(
         in_channels=cfg["model"]["fpn"]["out_channels"],
@@ -1074,10 +1124,59 @@ def main():
     train_ds = LandcoverSemanticDataset(train_samples, image_size=data_cfg["image_size"], cache_dir=target_cache)
     val_ds = LandcoverSemanticDataset(val_samples, image_size=data_cfg["image_size"], cache_dir=target_cache)
 
+    # --- Compute class weights from training set ---
+    class_pixel_counts = np.zeros(num_classes, dtype=np.float64)
+    total_labeled = 0
+    for s in train_samples:
+        cache_path = Path(target_cache) / f"{s['sample_id']}.pt"
+        d = torch.load(str(cache_path), map_location='cpu')
+        t = d['target'].numpy() if isinstance(d['target'], torch.Tensor) else d['target']
+        for c in range(1, num_classes):  # skip background (0)
+            class_pixel_counts[c] += int((t == c).sum())
+        total_labeled += int((t != IGNORE_INDEX).sum())
+
+    class_freqs = class_pixel_counts / max(total_labeled, 1)
+    # Inverse frequency weight, capped at 10x
+    class_weights = 1.0 / np.maximum(class_freqs, 1e-6)
+    class_weights[0] = 1.0  # background gets unit weight
+    class_weights = np.minimum(class_weights, 10.0)
+    class_weights = class_weights / class_weights.sum() * num_classes  # normalize
+    class_weights_tensor = torch.tensor(class_weights, dtype=torch.float32)
+    print(f"  Class weights: thin classes boosted (max={class_weights.max():.1f}x)")
+    for tid in sorted(THIN_CLASS_IDS):
+        from Dataset.landcover_label_map import train_id_to_dlmc
+        print(f"    {train_id_to_dlmc(tid)}: weight={class_weights[tid]:.1f}x  freq={class_freqs[tid]*100:.3f}%  px={class_pixel_counts[tid]:.0f}")
+
+    # --- Thin-class-aware sampler ---
+    # Zero-sample classes get heavy boost, other thin get moderate, normal get reduced
+    ZERO_BOOST = 10.0
+    sampler_weights = []
+    zero_count = thin_count = 0
+    for s in train_samples:
+        tids = set(s['train_ids'])
+        if tids & ZERO_SAMPLE_IDS:
+            sampler_weights.append(ZERO_BOOST)
+            zero_count += 1
+        elif tids & THIN_CLASS_IDS:
+            sampler_weights.append(1.0)
+            thin_count += 1
+        else:
+            sampler_weights.append(0.3)
+    n_total = len(sampler_weights)
+    print(f"  Sampler: {zero_count} zero-sample tiles (weight={ZERO_BOOST}), "
+          f"{thin_count} thin tiles (weight=1.0), "
+          f"{n_total-zero_count-thin_count} normal (weight=0.3)")
+
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights=sampler_weights,
+        num_samples=len(train_ds),
+        replacement=True,
+    )
+
     train_loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=batch_size,
-        shuffle=True,
+        sampler=sampler,
         num_workers=data_cfg.get("num_workers", 2),
         collate_fn=landcover_collate_fn,
         drop_last=True,
@@ -1120,6 +1219,7 @@ def main():
 
     # Background prior config
     bg_prior_cfg = cfg["train"].get("background_prior", {})
+    loss_type = str(bg_prior_cfg.get("loss_type", "ce"))  # "ce" or "focal"
     lambda_bg = float(bg_prior_cfg.get("lambda", 0.0) if bg_prior_cfg.get("enabled", False) else 0.0)
     min_labeled_ratio = float(bg_prior_cfg.get("min_labeled_ratio", 0.5))
     warmup_epochs = int(bg_prior_cfg.get("warmup_epochs", 1))
@@ -1163,6 +1263,8 @@ def main():
             pseudo_bg_threshold_ramp_start_epoch=pseudo_bg_threshold_ramp_start,
             pseudo_bg_entropy_threshold=pseudo_bg_entropy_threshold,
             pseudo_bg_protect_radius=pseudo_bg_protect_radius,
+            loss_type=loss_type,
+            class_weights=class_weights_tensor,
         )
 
         # Clear NPU cache after training to prevent memory fragmentation crash

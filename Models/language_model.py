@@ -340,6 +340,85 @@ class LanguageModel(nn.Module):
         modal_input = self.get_modal_input(x)
         return self.decode(**modal_input, image_embedding=multimodal_embedding, **kwargs)
 
+    def prefix_first_token_loss(
+        self,
+        x: Dict[str, Union[str, torch.Tensor, BatchEncoding]],
+        image_embedding: Optional[torch.Tensor] = None,
+    ):
+        input_ids = x["input_ids"]
+        labels = x["labels"]
+        attention_mask = x.get("attention_mask", None)
+        losses = []
+        correct = []
+
+        for batch_idx in range(input_ids.shape[0]):
+            supervised = torch.where(labels[batch_idx].ne(IGNORE_INDEX))[0]
+            if supervised.numel() == 0:
+                continue
+            first_idx = int(supervised[0].item())
+            if first_idx <= 0:
+                continue
+
+            prefix_input_ids = input_ids[batch_idx : batch_idx + 1, :first_idx]
+            prefix_attention_mask = (
+                attention_mask[batch_idx : batch_idx + 1, :first_idx]
+                if attention_mask is not None
+                else None
+            )
+            prefix_image_embedding = (
+                image_embedding[batch_idx : batch_idx + 1]
+                if image_embedding is not None
+                else None
+            )
+
+            (
+                prepared_input_ids,
+                prepared_attention_mask,
+                past_key_values,
+                prepared_inputs_embeds,
+                _,
+            ) = self.prepare_inputs_for_multimodal(
+                input_ids=prefix_input_ids,
+                attention_mask=prefix_attention_mask,
+                labels=None,
+                image_embedding=prefix_image_embedding,
+                past_key_values=None,
+            )
+            model_kwargs = dict(
+                attention_mask=prepared_attention_mask,
+                past_key_values=past_key_values,
+                use_cache=False,
+                return_dict=True,
+            )
+            if prepared_inputs_embeds is not None:
+                model_kwargs["inputs_embeds"] = torch.nan_to_num(prepared_inputs_embeds)
+            else:
+                model_kwargs["input_ids"] = prepared_input_ids
+
+            outputs = self.text_encoder(**model_kwargs)
+            logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
+            if prepared_attention_mask is not None:
+                last_pos = prepared_attention_mask.to(dtype=torch.long).sum(dim=1) - 1
+                step_logits = logits[torch.arange(logits.shape[0], device=logits.device), last_pos]
+            else:
+                step_logits = logits[:, -1, :]
+
+            target = labels[batch_idx, first_idx].to(device=step_logits.device).view(1)
+            losses.append(F.cross_entropy(step_logits.float(), target.long()))
+            correct.append(step_logits.argmax(dim=-1).eq(target).float())
+
+        device = input_ids.device
+        if not losses:
+            return None, {
+                "prefix_first_token_count": torch.zeros((), device=device, dtype=torch.long),
+            }
+
+        loss = torch.stack(losses).mean()
+        exact = torch.cat(correct).mean().to(device=loss.device)
+        return loss, {
+            "prefix_first_token_count": torch.tensor(len(losses), device=loss.device, dtype=torch.long),
+            "prefix_first_token_exact": exact,
+        }
 
     def prepare_inputs_for_multimodal(
         self,

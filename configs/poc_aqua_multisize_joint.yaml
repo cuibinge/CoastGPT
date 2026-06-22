@@ -1,0 +1,105 @@
+# PoC-1 Multi-Size Joint Training: 224 (small tiles) + 512 (large tiles)
+# Epoch-level alternation: shared backbone + FPN weights, per-epoch anchor/size switching.
+
+experiment:
+  name: poc_aqua_multisize_joint
+  output_dir: outputs/poc_aqua_multisize_joint
+  seed: 42
+
+data:
+  data_root: /home/ma-user/work/Stage3Data/养殖区
+  train_manifest: data/poc_aqua_full/train.json
+  val_manifest: data/poc_aqua_full/val.json
+  image_size: 224
+  max_samples_train: 0
+  num_workers: 2
+
+model:
+  alignment_dim: 1024
+  rgb_vision:
+    arch: dual
+    global_encoder_name: dinov3_vitl16
+    local_source: dino
+    local_encoder_name: convnext_base
+    local_ckpt_path: ./dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth
+    freeze_global: true
+    freeze_local: true
+    global_ckpt_path: ./dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth
+    default_input_size: [224, 224]
+    physical_prompt_dim: 4096
+    patch_dropout: 0.0
+    input_patchnorm: false
+    tune_pooler: false
+    attn_pooler:
+      num_query: 144
+      num_attn_heads: 16
+      num_layers: 6
+  vision_checkpoint: ./output/stage2/checkpoints/iter_2879_consolidated.pt
+  fpn:
+    in_channels: [128, 256, 512, 1024]
+    out_channels: 256
+  mask_rcnn:
+    num_classes: 2
+    min_size: 224
+    max_size: 224
+    image_mean: [0.0, 0.0, 0.0]
+    image_std: [1.0, 1.0, 1.0]
+    rpn_pre_nms_top_n_train: 512
+    rpn_post_nms_top_n_train: 128
+    rpn_pre_nms_top_n_test: 256
+    rpn_post_nms_top_n_test: 64
+    rpn_nms_thresh: 0.7
+    box_score_thresh: 0.05
+    box_nms_thresh: 0.5
+    box_detections_per_img: 50
+
+  # Default anchors (for smoke test; overridden per epoch in multi_size mode)
+  anchors:
+    sizes:
+      - [16, 32]
+      - [32, 64]
+      - [64, 96]
+    aspect_ratios:
+      - [0.5, 1.0, 2.0, 3.0]
+      - [0.5, 1.0, 2.0, 3.0]
+      - [0.5, 1.0, 2.0, 3.0]
+
+multi_size:
+  enabled: true
+  sizes:
+    - name: small_224
+      train_manifest: data/poc_aqua_full/train_small.json
+      val_manifest: data/poc_aqua_full/val_small.json
+      image_size: 224
+      min_size: 224
+      anchors:
+        - [16, 32]
+        - [32, 64]
+        - [64, 96]
+    - name: large_512
+      train_manifest: data/poc_aqua_full/train_512.json
+      val_manifest: data/poc_aqua_full/val_512.json
+      image_size: 512
+      min_size: 512
+      anchors:
+        - [37, 73]
+        - [73, 146]
+        - [146, 219]
+
+train:
+  device: npu
+  epochs: 50
+  batch_size: 2
+  lr: 0.0001
+  weight_decay: 0.0001
+  max_grad_norm: 1.0
+  log_interval: 10
+  val_interval: 5
+  save_interval: 5
+
+eval:
+  score_thresh: 0.5
+  mask_thresh: 0.5
+  min_area_px: 8
+  export_geojson: true
+  export_overlay: true

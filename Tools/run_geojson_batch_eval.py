@@ -1,4 +1,5 @@
 import argparse
+import importlib.util
 import json
 import re
 import sys
@@ -97,10 +98,21 @@ def parse_args() -> ml_collections.ConfigDict:
     parser.add_argument("--do-sample", type=str2bool, default=False)
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--dtype", type=str, choices=["float16", "bfloat16", "bf16", "float32", "fp32"], default=None)
+    parser.add_argument("--fp16", type=str2bool, default=None)
+    parser.add_argument("--bf16", type=str2bool, default=None)
     parser.add_argument("--force-safe-npu", type=str2bool, default=True)
     parser.add_argument("--skip-text-lora", type=str2bool, default=False)
     parser.add_argument("--diag-on-unk", type=str2bool, default=True)
     parser.add_argument("--diag-topk", type=int, default=8)
+    parser.add_argument(
+        "--multiband-inference-mode",
+        type=str,
+        choices=["auto", "off", "zero-extra"],
+        default="auto",
+        help="auto loads TIFF multi-band input, off uses RGB only, zero-extra zeros bands after RGB.",
+    )
+    parser.add_argument("--multiband-max-channels", type=int, default=4)
 
     parser.add_argument(
         "--accelerator",
@@ -291,6 +303,200 @@ def _load_inference_bundle(config: ml_collections.ConfigDict):
     return model, tokenizer, vision_processor, device, dtype
 
 
+def _build_multiband_tensor_for_generation(
+    *,
+    config: ml_collections.ConfigDict,
+    image_path: Path,
+    image_tensor: Optional[torch.Tensor],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    mode = str(getattr(config, "multiband_inference_mode", "auto")).strip().lower()
+    if mode in {"off", "none", "false", "0"}:
+        return None, None
+
+    module_path = PROJECT_ROOT / "Dataset" / "multiband_source.py"
+    spec = importlib.util.spec_from_file_location("multiband_source", module_path)
+    multiband_source = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(multiband_source)
+
+    max_channels = int(getattr(config, "multiband_max_channels", 4))
+    multiband = multiband_source.load_multiband_tensor(
+        image_path,
+        output_size=None,
+        max_channels=max_channels,
+    )
+    if multiband is None:
+        return None, None
+
+    wavelet_cfg = getattr(config, "wavelet_adapter", {})
+    expected_channels = int(
+        wavelet_cfg.get("in_channels", wavelet_cfg.get("multiband_channels", max_channels))
+        if hasattr(wavelet_cfg, "get")
+        else max_channels
+    )
+    if multiband.shape[0] < expected_channels:
+        return None, None
+
+    if mode == "zero-extra" and multiband.shape[0] > 3:
+        multiband = multiband.clone()
+        multiband[3:, :, :] = 0.0
+
+    multiband = multiband.unsqueeze(0).to(device=device, dtype=torch.float32)
+    valid_multiband = torch.ones((1,), device=device, dtype=torch.bool)
+    return multiband, valid_multiband
+
+
+def _ensure_image_token(
+    prompt_text: str,
+    *,
+    tune_im_start: bool,
+    default_image_token: str,
+    default_im_start_token: str,
+    default_im_end_token: str,
+) -> str:
+    prompt_text = str(prompt_text or "").strip()
+    image_token = default_image_token
+    if tune_im_start:
+        image_token = default_im_start_token + default_image_token + default_im_end_token
+    if default_image_token in prompt_text:
+        text = (
+            prompt_text.replace(default_im_start_token, "")
+            .replace(default_im_end_token, "")
+            .replace(default_image_token, "")
+            .strip()
+        )
+        return (image_token + ("\n" + text if text else "")).strip()
+    return (image_token + ("\n" + prompt_text if prompt_text else "")).strip()
+
+
+def _extract_free_element_text(text: str) -> str:
+    text_lower = re.sub(r"\[[a-z0-9_]+\]", " ", str(text or "").lower())
+    patterns = [
+        r"(?:find|locate|detect|identify|segment|extract)\s+(?:a|an|the)?\s*([a-z][a-z0-9 -]{2,64})",
+        r"(?:about|of|for)\s+(?:the|a|an)?\s*([a-z][a-z0-9 -]{2,64})",
+    ]
+    stop_terms = {
+        "image",
+        "scene",
+        "picture",
+        "photo",
+        "target",
+        "object",
+        "area",
+        "region",
+        "class",
+        "category",
+        "dimensions",
+    }
+    for pattern in patterns:
+        match = re.search(pattern, text_lower)
+        if not match:
+            continue
+        candidate = match.group(1).strip(" .,;:!?\"'()[]{}")
+        candidate = re.split(
+            r",|\.|;|\?|!|\band\b|\bwith\b|\bthat\b|\bwhich\b|\bin\b|\bon\b",
+            candidate,
+        )[0].strip()
+        words = [word for word in candidate.split() if word]
+        if not words:
+            continue
+        candidate = " ".join(words[:4])
+        if candidate in stop_terms or len(candidate) < 3:
+            continue
+        return candidate
+    return ""
+
+
+def _infer_semantic_route_texts(prompt_text: str) -> Tuple[str, str]:
+    text_lower = str(prompt_text or "").lower()
+    if "[cls]" in text_lower or ("rural" in text_lower and "urban" in text_lower):
+        return "场景分类", "土地覆盖"
+    if "[vg]" in text_lower or "[loc]" in text_lower or "bbox" in text_lower or "bounding box" in text_lower:
+        return "视觉定位", _extract_free_element_text(prompt_text) or "无"
+    if "[cap]" in text_lower or "[caption]" in text_lower or "caption" in text_lower:
+        return "描述", "无"
+    if any(token in text_lower for token in ("question", "answer", "what", "where", "when", "why", "how")):
+        return "视觉问答", "无"
+    return "描述", "无"
+
+
+def _tokenize_route_text(
+    tokenizer,
+    text: str,
+    device: torch.device,
+    max_length: Optional[int] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    tokenize_kwargs = dict(
+        return_tensors="pt",
+        padding="max_length" if max_length is not None else True,
+        truncation=True,
+    )
+    if max_length is not None:
+        tokenize_kwargs["max_length"] = int(max_length)
+    tokens = tokenizer([text], **tokenize_kwargs)
+    input_ids = tokens["input_ids"].to(device)
+    attention_mask = tokens.get("attention_mask", None)
+    if attention_mask is not None:
+        attention_mask = attention_mask.to(device)
+    return input_ids, attention_mask
+
+
+def _build_semantic_route_inputs(
+    tokenizer,
+    prompt_text: str,
+    device: torch.device,
+    physical_prompt_text: str = "",
+    physical_prompt_max_len: int = 64,
+    task_text_max_len: int = 16,
+    element_text_max_len: int = 16,
+) -> Dict[str, Optional[torch.Tensor]]:
+    task_text, element_text = _infer_semantic_route_texts(prompt_text)
+    task_ids, task_mask = _tokenize_route_text(
+        tokenizer,
+        task_text,
+        device,
+        max_length=task_text_max_len,
+    )
+    element_ids, element_mask = _tokenize_route_text(
+        tokenizer,
+        element_text,
+        device,
+        max_length=element_text_max_len,
+    )
+    route_inputs = {
+        "task_text_ids": task_ids,
+        "task_text_attention_mask": task_mask,
+        "element_text_ids": element_ids,
+        "element_text_attention_mask": element_mask,
+    }
+    if str(physical_prompt_text or "").strip():
+        physical_ids, physical_mask = _tokenize_route_text(
+            tokenizer,
+            physical_prompt_text,
+            device,
+            max_length=physical_prompt_max_len,
+        )
+        route_inputs["physical_prompt_ids"] = physical_ids
+        route_inputs["physical_prompt_attention_mask"] = physical_mask
+    return route_inputs
+
+
+def _infer_decode_prompt_len(output_ids: torch.Tensor, input_ids: torch.Tensor) -> int:
+    if not torch.is_tensor(output_ids) or not torch.is_tensor(input_ids):
+        return 0
+    if output_ids.ndim != 2 or input_ids.ndim != 2:
+        return 0
+    prompt_len = int(input_ids.shape[1])
+    if prompt_len <= 0 or int(output_ids.shape[1]) < prompt_len:
+        return 0
+    output_prefix = output_ids[0, :prompt_len].detach().cpu()
+    prompt_ids = input_ids[0, :prompt_len].detach().cpu()
+    if torch.equal(output_prefix, prompt_ids):
+        return prompt_len
+    return 0
+
+
 def _generate_single_prediction(
     *,
     config: ml_collections.ConfigDict,
@@ -301,6 +507,7 @@ def _generate_single_prediction(
     dtype: torch.dtype,
     image_path: Path,
     prompt_text: str,
+    physical_prompt_text: str = "",
 ) -> Dict[str, Any]:
     from Dataset.conversation import SeparatorStyle, default_conversation
     from Inference import (
@@ -321,13 +528,23 @@ def _generate_single_prediction(
     from Models.utils import KeywordsStoppingCriteria
 
     image_tensor = _build_image_tensor(config, vision_processor, str(image_path), device, dtype)
+    multiband_tensor, valid_multiband = _build_multiband_tensor_for_generation(
+        config=config,
+        image_path=image_path,
+        image_tensor=image_tensor,
+        device=device,
+        dtype=dtype,
+    )
 
     user_prompt = _normalize_user_instruction(prompt_text)
     if image_tensor is not None:
-        if bool(getattr(config, "tune_im_start", False)):
-            user_prompt = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + "\n" + user_prompt
-        else:
-            user_prompt = DEFAULT_IMAGE_TOKEN + "\n" + user_prompt
+        user_prompt = _ensure_image_token(
+            user_prompt,
+            tune_im_start=bool(getattr(config, "tune_im_start", False)),
+            default_image_token=DEFAULT_IMAGE_TOKEN,
+            default_im_start_token=DEFAULT_IM_START_TOKEN,
+            default_im_end_token=DEFAULT_IM_END_TOKEN,
+        )
 
     conv = default_conversation.copy()
     conv.append_message(conv.roles[0], user_prompt)
@@ -343,14 +560,29 @@ def _generate_single_prediction(
     gen_kwargs = _build_generation_kwargs(config, tokenizer, stopping_criteria)
 
     with torch.inference_mode():
-        output_ids = model.generate(
-            input_ids=input_ids,
-            images=image_tensor,
-            **gen_kwargs,
+        semantic_route_inputs = _build_semantic_route_inputs(
+            tokenizer,
+            prompt_text,
+            device,
+            physical_prompt_text=physical_prompt_text,
+            physical_prompt_max_len=int(getattr(config, "physical_prompt_max_len", 64)),
+            task_text_max_len=int(getattr(config, "task_text_max_len", 16)),
+            element_text_max_len=int(getattr(config, "element_text_max_len", 16)),
         )
+        generate_inputs = {
+            "input_ids": input_ids,
+            "images": image_tensor,
+            **gen_kwargs,
+            **semantic_route_inputs,
+        }
+        if multiband_tensor is not None:
+            generate_inputs["multiband"] = multiband_tensor
+            generate_inputs["valid_multiband"] = valid_multiband
+        output_ids = model.generate(**generate_inputs)
 
+    decode_prompt_len = _infer_decode_prompt_len(output_ids, input_ids)
     outputs, raw_outputs, new_tokens = _decode_new_tokens(
-        tokenizer, output_ids, int(input_ids.shape[1]), stop_str
+        tokenizer, output_ids, decode_prompt_len, stop_str
     )
     all_unk, unk_ratio = _calc_unk_stats(new_tokens, tokenizer)
 
@@ -383,10 +615,11 @@ def _generate_single_prediction(
         "all_unk": bool(all_unk),
         "unk_ratio": float(unk_ratio),
         "prompt_length": int(input_ids.shape[1]),
+        "decode_prompt_length": int(decode_prompt_len),
         "generated_tokens": int(new_tokens.shape[0]),
     }
 
-    del input_ids, output_ids, new_tokens, image_tensor
+    del input_ids, output_ids, new_tokens, image_tensor, multiband_tensor, valid_multiband
     return result
 
 

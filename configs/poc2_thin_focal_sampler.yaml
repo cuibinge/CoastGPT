@@ -1,0 +1,72 @@
+# PoC-2: Thin-class-aware sampler + Focal Loss (no BG prior)
+# Replaces hand-tuned BCE prior with class-weighted Focal Loss
+# and oversamples thin-class tiles via WeightedRandomSampler.
+
+experiment:
+  name: poc2_thin_focal_sampler
+  output_dir: outputs/poc2_thin_focal_sampler
+  seed: 42
+
+data:
+  patches_root: /home/ma-user/work/Stage3Data/土地分类/Patches
+  sizes: ["Size_128", "Size_256", "Size_512"]
+  image_size: 224
+  val_ratio: 0.2
+  val_split_seed: 42
+  num_workers: 2
+
+model:
+  alignment_dim: 1024
+
+  rgb_vision:
+    arch: dual
+    global_encoder_name: dinov3_vitl16
+    local_source: dino
+    local_encoder_name: convnext_base
+    local_ckpt_path: ./dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth
+    freeze_global: true
+    freeze_local: true
+    global_ckpt_path: ./dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth
+    input_size: [224, 224]
+    physical_prompt_dim: 4096
+    patch_dropout: 0.0
+    input_patchnorm: false
+    tune_pooler: false
+    attn_pooler:
+      num_query: 144
+      num_attn_heads: 16
+      num_layers: 6
+
+  vision_checkpoint: ./output/stage2/checkpoints/iter_2879_consolidated.pt
+
+  fpn:
+    in_channels: [128, 256, 512, 1024]
+    out_channels: 256
+
+  semantic_head:
+    num_classes: 25
+    output_size: [224, 224]
+
+train:
+  device: npu
+  epochs: 15
+  batch_size: 8
+  lr: 0.0001
+  weight_decay: 0.0001
+  max_grad_norm: 1.0
+  log_interval: 20
+  val_interval: 5
+  save_interval: 5
+
+  background_prior:
+    enabled: true
+    type: soft_bce
+    lambda: 0.10
+    max_ignore_ratio: 0.10
+    loss_type: focal
+
+eval:
+  score_thresh: 0.5
+  min_area_px: 8
+  export_overlay: true
+  export_geojson: true

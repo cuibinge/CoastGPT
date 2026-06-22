@@ -2,8 +2,8 @@
 # Single NPU, no DeepSpeed, frozen DualVisionEncoder
 
 experiment:
-  name: poc2_landcover_semantic
-  output_dir: outputs/poc2_landcover_semantic
+  name: poc2b_cond_bce_030_t50
+  output_dir: outputs/poc2b_cond_bce_030_t50
   seed: 42
 
 data:
@@ -56,6 +56,15 @@ train:
   log_interval: 20
   val_interval: 5
   save_interval: 5
+
+  background_prior:
+    enabled: true
+    type: bce
+    lambda: 0.30
+    min_labeled_ratio: 0.5
+    max_labeled_for_bg: 0.5
+    warmup_epochs: 0
+    max_ignore_ratio: 0.1
 
 eval:
   score_thresh: 0.5

@@ -1,0 +1,97 @@
+# PoC-1 Multi-Size: Bucket by Original Resolution (128/256/512)
+# Uses epoch-level size switching: one size per epoch subset, anchor auto-scaled.
+# Requires: dynamic resolution Phase 1 refactor applied.
+
+experiment:
+  name: poc_aqua_multisize
+  output_dir: outputs/poc_aqua_multisize
+  seed: 42
+
+data:
+  data_root: /home/ma-user/work/Stage3Data/养殖区
+  train_manifest: data/poc_aqua_full/train.json
+  val_manifest: data/poc_aqua_full/val.json
+  image_size: 0               # 0 = use each sample's original_size
+  max_samples_train: 0
+  num_workers: 2
+
+model:
+  alignment_dim: 1024
+
+  rgb_vision:
+    arch: dual
+    global_encoder_name: dinov3_vitl16
+    local_source: dino
+    local_encoder_name: convnext_base
+    local_ckpt_path: ./dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth
+    freeze_global: true
+    freeze_local: true
+    global_ckpt_path: ./dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth
+    default_input_size: [224, 224]
+    physical_prompt_dim: 4096
+    patch_dropout: 0.0
+    input_patchnorm: false
+    tune_pooler: false
+    attn_pooler:
+      num_query: 144
+      num_attn_heads: 16
+      num_layers: 6
+
+  vision_checkpoint: ./output/stage2/checkpoints/iter_2879_consolidated.pt
+
+  fpn:
+    in_channels: [128, 256, 512, 1024]
+    out_channels: 256
+
+  mask_rcnn:
+    num_classes: 2
+    min_size: 224             # overridden per epoch
+    max_size: 224
+    image_mean: [0.0, 0.0, 0.0]
+    image_std: [1.0, 1.0, 1.0]
+    rpn_pre_nms_top_n_train: 512
+    rpn_post_nms_top_n_train: 128
+    rpn_pre_nms_top_n_test: 256
+    rpn_post_nms_top_n_test: 64
+    rpn_nms_thresh: 0.7
+    box_score_thresh: 0.05
+    box_nms_thresh: 0.5
+    box_detections_per_img: 50
+
+  # Relative anchor scales (auto-scaled to current epoch size)
+  anchors:
+    mode: relative
+    scales:
+      - [0.0714, 0.1429]
+      - [0.1429, 0.2857]
+      - [0.2857, 0.5714]
+    aspect_ratios:
+      - [0.5, 1.0, 2.0, 3.0]
+      - [0.5, 1.0, 2.0, 3.0]
+      - [0.5, 1.0, 2.0, 3.0]
+
+multi_scale:
+  enabled: true
+  bucket_by_original_size: true
+  sizes:
+    - [128, 128]
+    - [256, 256]
+    - [512, 512]
+
+train:
+  device: npu
+  epochs: 50
+  batch_size: 4
+  lr: 0.0001
+  weight_decay: 0.0001
+  max_grad_norm: 1.0
+  log_interval: 10
+  val_interval: 5
+  save_interval: 5
+
+eval:
+  score_thresh: 0.5
+  mask_thresh: 0.5
+  min_area_px: 8
+  export_geojson: true
+  export_overlay: true

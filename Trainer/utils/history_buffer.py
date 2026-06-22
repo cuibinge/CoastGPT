@@ -1,6 +1,7 @@
 from collections import deque
 
 import numpy as np
+import torch
 
 
 class HistoryBuffer:
@@ -21,7 +22,21 @@ class HistoryBuffer:
         self._count: int = 0
         self._sum: float = 0.0
 
+    @staticmethod
+    def _to_float(value) -> float:
+        if torch.is_tensor(value):
+            tensor = value.detach()
+            if tensor.numel() != 1:
+                tensor = tensor.float().mean()
+            return float(tensor.float().cpu().item())
+        if isinstance(value, np.ndarray):
+            if value.size != 1:
+                value = value.astype(np.float32).mean()
+            return float(value.item())
+        return float(value)
+
     def update(self, value: float) -> None:
+        value = self._to_float(value)
         self._history.append(value)
         self._count += 1
         self._sum += value

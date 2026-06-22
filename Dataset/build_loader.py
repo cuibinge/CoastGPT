@@ -22,6 +22,17 @@ from .UCM import UCM
 logger = logging.getLogger("train")
 
 
+def _wavelet_dataset_kwargs(config: ml_collections.ConfigDict) -> dict:
+    wavelet_cfg = getattr(config, "wavelet_adapter", None)
+    if wavelet_cfg is None or not bool(getattr(wavelet_cfg, "enabled", False)):
+        return {}
+
+    return {
+        "return_multiband": True,
+        "multiband_channels": int(getattr(wavelet_cfg, "multiband_channels", getattr(wavelet_cfg, "in_channels", 4))),
+    }
+
+
 def build_loader_hepler(
     config: ml_collections.ConfigDict,
     dataset: torch.utils.data.Dataset,
@@ -83,6 +94,11 @@ def build_vlp_loader(
     返回:
     torch.utils.data.DataLoader 或 wds.WebLoader: 数据加载器对象。
     """
+    wavelet_dataset_kwargs = _wavelet_dataset_kwargs(config)
+    wavelet_cfg = getattr(config, "wavelet_adapter", None)
+    if wavelet_dataset_kwargs and bool(getattr(wavelet_cfg, "deterministic_transform", True)):
+        config.transform.deterministic_resize = True
+
     # 构建VLP数据变换，传递通道数信息
     transform = build_vlp_transform(config, is_train=is_train, num_channels=num_channels)
     logger.info(f"Evaluate data transform:\n{transform}")
@@ -92,11 +108,16 @@ def build_vlp_loader(
             dataset = RS5MDataset(root=config.data_path, transform=transform, **kwargs)
         else:
             dataset = CaptionDatasetVQA(
-                root=config.data_path, transform=transform, **kwargs
+                root=config.data_path, transform=transform, **wavelet_dataset_kwargs, **kwargs
             )
     elif is_train and config.stage >= 2:
         stage_value = int(getattr(config, "stage", 2))
         geojson_priority = bool(getattr(config, "geojson_priority", stage_value >= 3))
+        transform_input_size = getattr(
+            config.transform,
+            "input_size",
+            getattr(config.transform, "default_input_size", [224, 224]),
+        )
         # Forward Stage-3 GeoJSON quality knobs (defined in step3_dual.yaml).
         # These are no-ops for Stage-2 unless explicitly set.
         geojson_kwargs = {}
@@ -109,10 +130,11 @@ def build_vlp_loader(
         dataset = InstructDatasetWithTaskId(
             root=config.data_path,
             transform=transform,
-            crop_size=config.transform.input_size[0],
+            crop_size=transform_input_size[0],
             stage=stage_value,
             geojson_priority=geojson_priority,
             **geojson_kwargs,
+            **wavelet_dataset_kwargs,
             **kwargs,
         )
         if len(dataset) == 0:

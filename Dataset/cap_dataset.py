@@ -9,7 +9,7 @@ import numpy as np
 from dataclasses import dataclass
 from multiprocessing import Value
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torchvision.transforms as T
@@ -35,6 +35,7 @@ from Models import (
 )
 from . import conversation as conversation_lib
 from .constants import ELEMENT2ID, TASK2ID
+from .multiband_source import load_multiband_tensor, stack_optional_multiband
 from utils.geojson_coordinate_utils import repair_mojibake_in_obj
 try:
     import torch_npu  # noqa: F401
@@ -166,12 +167,16 @@ class CaptionDataset(torch.utils.data.Dataset):
             self,
             root: Union[Path, str] = ".data/rsicd",
             transform: T.Compose = None,
+            return_multiband: bool = False,
+            multiband_channels: int = 4,
     ):
         if isinstance(root, str):
             root = Path(root)
 
         self.root = root
         self.transform = transform
+        self.return_multiband = bool(return_multiband)
+        self.multiband_channels = int(multiband_channels)
         self.img_dir = list(self.root.glob("*_Image"))
         self.json_dir = []
         for i in self.img_dir:
@@ -294,6 +299,14 @@ class CaptionDataset(torch.utils.data.Dataset):
 
         return x
 
+    def load_multiband(self, idx: int, reference: Optional[torch.Tensor] = None):
+        output_size = tuple(reference.shape[-2:]) if torch.is_tensor(reference) else None
+        return load_multiband_tensor(
+            self.img_list[idx],
+            output_size=output_size,
+            max_channels=self.multiband_channels,
+        )
+
     def __getitem__(self, idx: int) -> Dict:
         captions = self.cap_list[idx]
         if not isinstance(captions, list):
@@ -301,7 +314,10 @@ class CaptionDataset(torch.utils.data.Dataset):
 
         x = self.load_image(idx)
         tsm, mask = self.load_physics(idx)  # 新增物理数据加载
-        return dict(rgb=x, text=captions, tsm=tsm, mask=mask)
+        out = dict(rgb=x, text=captions, tsm=tsm, mask=mask)
+        if self.return_multiband:
+            out["multiband"] = self.load_multiband(idx, reference=x)
+        return out
 
 
 class VGEvalDataset(CaptionDataset):
@@ -1266,6 +1282,8 @@ class InstructDatasetWithTaskId(InstructDataset):
         for tag, task_id in tag_to_task_id:
             if tag in text_lower:
                 return self._task_name_from_id(task_id)
+        if "rural" in text_lower and "urban" in text_lower:
+            return "场景分类"
         for task_name in TASK2ID.keys():
             if task_name.lower() in text_lower:
                 return task_name
@@ -1280,6 +1298,8 @@ class InstructDatasetWithTaskId(InstructDataset):
         if "[cls]" in text_lower:
             # Stage-2 classification samples usually contain broad land-cover classes.
             return self._element_name_from_id(10)
+        if "rural" in text_lower and "urban" in text_lower:
+            return "土地覆盖" if "土地覆盖" in ELEMENT2ID else self._element_name_from_id(10)
         for element_name in ELEMENT2ID.keys():
             if element_name == "无":
                 continue
@@ -1442,7 +1462,12 @@ class InstructDatasetWithTaskId(InstructDataset):
 
                     self.img_list.append(img_path)
                     if isinstance(conv_data, List) and len(conv_data) > 10:
-                        conv = random.sample(conv_data, 10)
+                        # Keep the canonical first turn. Stage2 BEN-style evals use
+                        # the first QA turn per image, so pure random truncation
+                        # under-trains the exact question used by target metrics.
+                        first_turn = conv_data[0]
+                        sampled_rest = random.sample(conv_data[1:], 9)
+                        conv = [first_turn] + sampled_rest
                         self.cap_list.append(conv)
                     else:
                         self.cap_list.append(conv_data)
@@ -1757,6 +1782,13 @@ class DataCollatorForSupervisedDataset(object):
             else:
                 batch["rgb"] = images
 
+        if any("multiband" in instance for instance in instances):
+            multiband, valid_multiband = stack_optional_multiband(
+                [instance.get("multiband", None) for instance in instances]
+            )
+            batch["multiband"] = multiband
+            batch["valid_multiband"] = valid_multiband
+
         if "valid_image" in instances[0]:
             batch["valid_image"] = torch.tensor([instance["valid_image"] for instance in instances])
 
@@ -1960,7 +1992,7 @@ def preprocess_llama_2(
     # Mask targets
     sep = "[/INST] "
     for conversation, target in zip(conversations, targets):
-        total_len = int(target.ne(tokenizer.pad_token_id).sum())
+        total_len = int(target.shape[0])
 
         rounds = conversation.split(conv.sep2)
         cur_len = 1
@@ -2048,7 +2080,7 @@ def preprocess_v1(sources, tokenizer: transformers.PreTrainedTokenizer, has_imag
     # Mask targets
     sep = conv.sep + conv.roles[1] + ": "
     for conversation, target in zip(conversations, targets):
-        total_len = int(target.ne(tokenizer.pad_token_id).sum())
+        total_len = int(target.shape[0])
 
         rounds = conversation.split(conv.sep2)
         cur_len = 1
