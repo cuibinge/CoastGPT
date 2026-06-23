@@ -1,0 +1,86 @@
+# PoC-4: LLM Fallback + Fusion inference configuration
+# Usage: python scripts/poc_stage_fusion.py -c Configs/poc4_fusion.yaml
+
+# --- Model checkpoint manifest ---
+checkpoints:
+  # Vision backbone (shared across all heads)
+  vision_ckpt: "./output/checkpoints/FINAL.pt"  # or a vision-only checkpoint
+
+  # Detection heads
+  instance_ckpt: "outputs/poc_aqua_full/checkpoints/epoch_040.pt"
+  semantic_ckpt: "outputs/poc2b_vit_fpn/checkpoints/best.pt"
+  edge_ckpt: "outputs/poc3_edge/a1_finetune/checkpoints/best.pt"
+
+  # LLM (CoastGPT full model)
+  llm_ckpt: "./output/stage3/mixed_v3/checkpoints/FINAL.pt"
+
+  # TextLoRA (for LLM predictor)
+  text_lora_path: "./TextLoRA"
+
+# --- Model architecture (must match checkpoint training config) ---
+model:
+  rgb_vision:
+    arch: "vit"
+    global_ckpt_path: "dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth"
+    local_ckpt_path: "dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth"
+    freeze: true
+  language:
+    model_name: "llama-2-7b"
+  fpn:
+    in_channels: [128, 256, 512, 1024]
+    out_channels: 256
+  num_tasks: 5
+  num_elements: 9
+
+# --- Predictor settings ---
+predictors:
+  instance:
+    score_thresh: 0.5
+    mask_thresh: 0.5
+    min_area_px: 8.0
+    class_name: "海水养殖区"
+  semantic:
+    min_area_px: 50.0
+    simplify_epsilon: 1.0
+    class_names_path: "Configs/label_map.json"
+  edge:
+    threshold: 0.6
+    min_area: 8
+    min_length: 10
+    max_components: 5
+    simplify_epsilon: 0.1
+    class_name: "海岸线"
+  llm:
+    max_new_tokens: 1024
+  llm_text:
+    max_new_tokens: 512
+
+# --- Fusion pipeline settings ---
+fusion:
+  parser:
+    max_new_tokens: 128
+    confidence_threshold: 0.3
+  gating:
+    label_map_path: "Configs/label_map.json"
+    empty_target_policy: "error"   # "error" | "all_heads" | "llm_only"
+  validation:
+    sliver_min_area_deg: 1.0e-10
+    sliver_min_length_deg: 1.0e-6
+    llm_min_confidence: 0.3
+  dedup:
+    internal_thresholds:
+      area: 0.7
+      line: 0.6
+      point: 5.0e-6
+    cross_thresholds:
+      area: 0.5
+      line: 0.5
+      point: 1.0e-5
+
+# --- Runtime ---
+accelerator: "npu"
+dtype: "float16"
+bits: 16
+bf16: false
+fp16: true
+seed: 322
