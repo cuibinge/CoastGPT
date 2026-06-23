@@ -1,0 +1,19 @@
+{
+  "known_only": [
+    {"prompt": "[DET] 请检测图中的海水养殖区。", "expected_task": "DET", "expected_classes": ["海水养殖区"], "expect_llm_fallback": false},
+    {"prompt": "[DET] 检测海岸线", "expected_task": "DET", "expected_classes": ["海岸线"], "expect_llm_fallback": false},
+    {"prompt": "[DET] 请检测图中的水田和旱地。", "expected_task": "DET", "expected_classes": ["水田", "旱地"], "expect_llm_fallback": false}
+  ],
+  "unknown": [
+    {"prompt": "[DET] 请检测图中的红树林湿地。", "expected_task": "DET", "expected_classes": ["红树林湿地"], "expect_llm_fallback": true},
+    {"prompt": "[DET] 找出所有的养殖设施", "expected_task": "DET", "expected_classes": ["海水养殖区"], "expect_llm_fallback": false}
+  ],
+  "cap_vqa": [
+    {"prompt": "[CAP] 描述这张遥感影像。", "expected_task": "CAP", "expected_classes": [], "expect_llm_fallback": false},
+    {"prompt": "[VQA] 这张图中有多少养殖区？", "expected_task": "VQA", "expected_classes": [], "expect_llm_fallback": false}
+  ],
+  "edge_cases": [
+    {"prompt": "请检测海岸线", "expected_task": "DET", "expected_classes": ["海岸线"], "expect_llm_fallback": false, "note": "no prefix, default DET"},
+    {"prompt": "[DET] 分析这张图", "expected_task": "DET", "expected_classes": [], "expect_llm_fallback": false, "note": "vague prompt, empty classes"}
+  ]
+}
