@@ -41,15 +41,49 @@ def _close_ring(ring: List[Tuple[float, float]], eps: float = 1e-12) -> List[Tup
 
 
 def _flatten_geojson_coords(geom: dict) -> List[Tuple[float, float]]:
-    """Extract all (lon, lat) coordinate pairs from a GeoJSON Polygon geometry."""
+    """Extract all (lon, lat) coordinate pairs from any GeoJSON geometry."""
+    geom_type = geom.get("type")
     coords = geom.get("coordinates")
     if not isinstance(coords, list) or len(coords) == 0:
         return []
-    # Polygon coords are [[ring], ...]; flatten outer ring
-    outer = coords[0]
-    if not isinstance(outer, list):
+
+    if geom_type == "Polygon":
+        # coords = [[outer_ring], [hole1], ...]
+        pts = []
+        for ring in coords:
+            if isinstance(ring, list):
+                pts.extend(tuple(pt) for pt in ring if isinstance(pt, (list, tuple)) and len(pt) >= 2)
+        return pts
+
+    elif geom_type == "MultiPolygon":
+        # coords = [[[outer], [hole]], [[outer2]], ...]
+        pts = []
+        for polygon in coords:
+            if isinstance(polygon, list):
+                for ring in polygon:
+                    if isinstance(ring, list):
+                        pts.extend(tuple(pt) for pt in ring if isinstance(pt, (list, tuple)) and len(pt) >= 2)
+        return pts
+
+    elif geom_type == "LineString":
+        return [tuple(pt) for pt in coords if isinstance(pt, (list, tuple)) and len(pt) >= 2]
+
+    elif geom_type == "MultiLineString":
+        pts = []
+        for line in coords:
+            if isinstance(line, list):
+                pts.extend(tuple(pt) for pt in line if isinstance(pt, (list, tuple)) and len(pt) >= 2)
+        return pts
+
+    elif geom_type == "Point":
+        if isinstance(coords, (list, tuple)) and len(coords) >= 2:
+            return [tuple(coords)]
         return []
-    return [tuple(pt) for pt in outer if isinstance(pt, (list, tuple)) and len(pt) >= 2]
+
+    elif geom_type == "MultiPoint":
+        return [tuple(pt) for pt in coords if isinstance(pt, (list, tuple)) and len(pt) >= 2]
+
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +143,67 @@ def build_feature_collection(features: List[dict]) -> dict:
         GeoJSON FeatureCollection dict.
     """
     return {"type": "FeatureCollection", "features": features}
+
+
+def auto_repair_geometry(geom: dict) -> Tuple[dict, bool]:
+    """Attempt to repair an invalid geometry.
+
+    Returns (repaired_geometry, was_repaired).
+
+    Repairs attempted:
+      - Polygon not closed → auto-close ring
+      - Ring orientation wrong → orient(ccw=True) via shapely
+      - Self-intersection → buffer(0)
+      - LineString < 2 points after dedup → cannot repair
+    """
+    if not HAS_SHAPELY:
+        return geom, False
+
+    geom_type = geom.get("type")
+    try:
+        shp = shapely_shape(geom)
+    except Exception:
+        return geom, False
+
+    repaired = False
+
+    if geom_type == "Polygon":
+        # Auto-close ring
+        coords = geom["coordinates"]
+        for ring_idx, ring in enumerate(coords):
+            if len(ring) < 3:
+                continue
+            first = ring[0]
+            last = ring[-1]
+            if first != last:
+                ring.append(first)
+                repaired = True
+
+        # Fix orientation
+        try:
+            from shapely.geometry import Polygon as ShapelyPolygon
+            outer = coords[0]
+            sp = ShapelyPolygon(outer, holes=coords[1:] if len(coords) > 1 else None)
+            if not sp.exterior.is_ccw:
+                coords[0] = list(reversed(outer))
+                repaired = True
+        except Exception:
+            pass
+
+    # Buffer(0) repair for self-intersections
+    if not shp.is_valid:
+        try:
+            fixed = shp.buffer(0)
+            if fixed.is_valid and not fixed.is_empty:
+                from shapely.geometry import mapping
+                new_geom = mapping(fixed)
+                if new_geom.get("type") == geom_type:
+                    geom = new_geom
+                    repaired = True
+        except Exception:
+            pass
+
+    return geom, repaired
 
 
 def validate_geojson(
@@ -207,41 +302,56 @@ def validate_geojson(
             result["errors"].append(f"Feature[{idx}] missing 'geometry' or not a dict")
             continue
 
-        # geometry.type == Polygon
-        if geom.get("type") != "Polygon":
+        # geometry.type must be a supported type
+        SUPPORTED_TYPES = {"Polygon", "MultiPolygon", "LineString", "MultiLineString", "Point", "MultiPoint"}
+        geom_type = geom.get("type")
+        if geom_type not in SUPPORTED_TYPES:
             result["errors"].append(
-                f"Feature[{idx}] geometry.type must be 'Polygon', got {geom.get('type')!r}"
+                f"Feature[{idx}] geometry.type must be one of {SUPPORTED_TYPES}, got {geom_type!r}"
             )
             continue
 
-        # coordinates are valid
+        # Per-type coordinate validation
         coords = geom.get("coordinates")
-        if not isinstance(coords, list) or len(coords) == 0:
-            result["errors"].append(f"Feature[{idx}] coordinates is empty or not a list")
-            feat_ok = False
-        elif not isinstance(coords[0], list) or len(coords[0]) < 4:
-            result["errors"].append(
-                f"Feature[{idx}] Polygon outer ring has fewer than 4 points (need 3 distinct + 1 closing)"
-            )
-            feat_ok = False
-        else:
-            # Validate each coordinate point is [lon, lat]
+        type_coord_ok = True
+        if geom_type == "Polygon":
+            if not isinstance(coords, list) or len(coords) == 0:
+                result["errors"].append(f"Feature[{idx}] Polygon coordinates empty")
+                type_coord_ok = False
+            elif not isinstance(coords[0], list) or len(coords[0]) < 4:
+                result["errors"].append(f"Feature[{idx}] Polygon outer ring has < 4 points")
+                type_coord_ok = False
+        elif geom_type == "MultiPolygon":
+            if not isinstance(coords, list) or len(coords) == 0:
+                result["errors"].append(f"Feature[{idx}] MultiPolygon coordinates empty")
+                type_coord_ok = False
+        elif geom_type == "LineString":
+            if not isinstance(coords, list) or len(coords) < 2:
+                result["errors"].append(f"Feature[{idx}] LineString needs >= 2 points, got {len(coords) if isinstance(coords, list) else 0}")
+                type_coord_ok = False
+        elif geom_type == "MultiLineString":
+            if not isinstance(coords, list) or len(coords) == 0:
+                result["errors"].append(f"Feature[{idx}] MultiLineString coordinates empty")
+                type_coord_ok = False
+        elif geom_type in ("Point", "MultiPoint"):
+            if not isinstance(coords, list) or len(coords) == 0:
+                result["errors"].append(f"Feature[{idx}] {geom_type} coordinates empty")
+                type_coord_ok = False
+
+        # Generic coordinate point validation for all geometry types
+        if type_coord_ok:
+            flat_coords = _flatten_geojson_coords(geom)
             bad_pts = False
-            for pt_idx, pt in enumerate(coords[0]):
-                if not isinstance(pt, (list, tuple)) or len(pt) != 2:
-                    result["errors"].append(
-                        f"Feature[{idx}] coordinate[{pt_idx}] is not [lon, lat]: {pt!r}"
-                    )
-                    bad_pts = True
-                elif not all(isinstance(v, (int, float)) for v in pt):
+            for pt_idx, pt in enumerate(flat_coords):
+                if not all(isinstance(v, (int, float)) for v in pt):
                     result["errors"].append(
                         f"Feature[{idx}] coordinate[{pt_idx}] has non-numeric values: {pt!r}"
                     )
                     bad_pts = True
             if bad_pts:
-                feat_ok = False
+                type_coord_ok = False
 
-        if not feat_ok:
+        if not type_coord_ok:
             continue
 
         # ---- Bounds check ----
@@ -261,19 +371,18 @@ def validate_geojson(
 
         # ---- Shapely validation ----
         if feat_ok and HAS_SHAPELY:
+            geom, was_repaired = auto_repair_geometry(geom)
+            if was_repaired:
+                result["repaired_features"] += 1
+                feat["geometry"] = geom
             try:
                 shp_geom = shapely_shape(geom)
                 if not shp_geom.is_valid:
-                    # Attempt buffer(0) repair
-                    repaired = shp_geom.buffer(0)
-                    if repaired.is_valid and not repaired.is_empty:
-                        result["repaired_features"] += 1
-                    else:
-                        reason = explain_validity(shp_geom)
-                        result["errors"].append(
-                            f"Feature[{idx}] geometry invalid (unrepairable): {reason}"
-                        )
-                        feat_ok = False
+                    reason = explain_validity(shp_geom)
+                    result["errors"].append(
+                        f"Feature[{idx}] geometry invalid (unrepairable): {reason}"
+                    )
+                    feat_ok = False
             except Exception as exc:  # noqa: BLE001
                 result["errors"].append(
                     f"Feature[{idx}] shapely geometry build failed: {exc}"
@@ -291,6 +400,53 @@ def validate_geojson(
     )
 
     return result
+
+
+def filter_sliver_features(
+    features: List[dict],
+    min_area_deg: float = 0.0,
+    min_length_deg: float = 0.0,
+    min_points: int = 2,
+) -> Tuple[List[dict], List[dict]]:
+    """Filter sliver/tiny features.
+
+    Returns (kept_features, removed_features).
+    Thresholds in WGS84 degrees; 1e-5 deg ≈ 1.1m at equator.
+    """
+    kept = []
+    removed = []
+    for feat in features:
+        geom = feat.get("geometry", {})
+        geom_type = geom.get("type", "")
+        if geom_type in ("Polygon", "MultiPolygon") and min_area_deg > 0:
+            if HAS_SHAPELY:
+                try:
+                    area = shapely_shape(geom).area
+                except Exception:
+                    area = 0.0
+                if area < min_area_deg:
+                    feat["_reject_reason"] = f"sliver: area={area:.2e} < min={min_area_deg:.2e}"
+                    removed.append(feat)
+                    continue
+        elif geom_type in ("LineString", "MultiLineString") and min_length_deg > 0:
+            if HAS_SHAPELY:
+                try:
+                    length = shapely_shape(geom).length
+                except Exception:
+                    length = 0.0
+                if length < min_length_deg:
+                    feat["_reject_reason"] = f"sliver: length={length:.2e} < min={min_length_deg:.2e}"
+                    removed.append(feat)
+                    continue
+        elif geom_type in ("Point", "MultiPoint") and min_points > 0:
+            coords = geom.get("coordinates", [])
+            n_pts = len(coords) if geom_type == "MultiPoint" else 1
+            if n_pts < min_points:
+                feat["_reject_reason"] = f"sliver: {n_pts} points < min={min_points}"
+                removed.append(feat)
+                continue
+        kept.append(feat)
+    return kept, removed
 
 
 def outputs_to_geojson(
