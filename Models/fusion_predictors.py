@@ -20,12 +20,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import torch
 
-from utils.georef_transform import pixel_to_wgs84
-from utils.geojson_builder import (
-    build_feature_collection,
-    filter_sliver_features,
-    polygon_pixel_to_geojson_feature,
-)
+from utils.geojson_builder import polygon_pixel_to_geojson_feature
 from utils.mask_utils import filter_small_polygons, mask_to_polygon
 
 
@@ -163,9 +158,6 @@ class InstancePredictor(BasePredictor):
 
 class SemanticPredictor(BasePredictor):
     """Land cover semantic segmentation."""
-
-    # Mapping from class index → class name (must match training label_map)
-    _DEFAULT_CLASS_NAMES: Dict[int, str] = {}  # populated from label_map.json at init
 
     def __init__(
         self,
@@ -369,8 +361,8 @@ class LLMPredictor(BasePredictor):
         from Models import (
             DEFAULT_IMAGE_TOKEN,
             IMAGE_TOKEN_INDEX,
+            tokenizer_image_token,
         )
-        from Models.utils import tokenizer_image_token
 
         gen_prompt = DEFAULT_IMAGE_TOKEN + "\n" + full_prompt
         input_ids = tokenizer_image_token(
@@ -385,6 +377,8 @@ class LLMPredictor(BasePredictor):
                 temperature=1.0,
                 max_new_tokens=self._max_new_tokens,
                 use_cache=True,
+                remove_invalid_values=True,
+                renormalize_logits=True,
             )
 
         # Decode
@@ -454,8 +448,8 @@ class LLMTextPredictor(BasePredictor):
         from Models import (
             DEFAULT_IMAGE_TOKEN,
             IMAGE_TOKEN_INDEX,
+            tokenizer_image_token,
         )
-        from Models.utils import tokenizer_image_token
 
         gen_prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt
         input_ids = tokenizer_image_token(
@@ -470,6 +464,8 @@ class LLMTextPredictor(BasePredictor):
                 temperature=1.0,
                 max_new_tokens=self._max_new_tokens,
                 use_cache=True,
+                remove_invalid_values=True,
+                renormalize_logits=True,
             )
 
         new_tokens = output_ids[0, input_ids.shape[1]:]

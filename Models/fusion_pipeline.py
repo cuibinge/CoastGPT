@@ -138,6 +138,8 @@ class LLMParser:
                 temperature=1.0,
                 max_new_tokens=self._config.parser_max_new_tokens,
                 use_cache=True,
+                remove_invalid_values=True,
+                renormalize_logits=True,
             )
 
         new_tokens = output_ids[0, input_ids.shape[1]:]
