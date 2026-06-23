@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
@@ -89,11 +88,8 @@ def main():
     parser.add_argument("--georef", type=str, default=None, help="Path to georef JSON")
     parser.add_argument("--device", type=str, default="npu:0")
     parser.add_argument("--save-diagnostics", type=str, default=None)
-    args = parser.parse_args(wandb=False)
-
-    # Load config
-    with open(args.config, "r") as f:
-        cfg = yaml.safe_load(f)
+    args = parser.parse_args(wandb=True)
+    cfg = args  # ConfigArgumentParser(wandb=True) returns a ConfigDict with YAML merged
 
     device = torch.device(args.device)
     dtype = torch.float16
