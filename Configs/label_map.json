@@ -1,0 +1,23 @@
+{
+  "global_classes": {
+    "0": {"name": "海水养殖区", "branch": "instance", "geometry_type": "Polygon"},
+    "1": {"name": "水田", "branch": "semantic", "geometry_type": "Polygon"},
+    "2": {"name": "旱地", "branch": "semantic", "geometry_type": "Polygon"},
+    "3": {"name": "海岸线", "branch": "edge", "geometry_type": "LineString"}
+  },
+  "branch_classes": {
+    "instance": {
+      "0": "background",
+      "1": "海水养殖区"
+    },
+    "semantic": {
+      "0": "background",
+      "1": "水田",
+      "2": "旱地"
+    },
+    "edge": {
+      "0": "background",
+      "1": "海岸线"
+    }
+  }
+}

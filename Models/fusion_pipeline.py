@@ -30,6 +30,9 @@ from utils.geojson_validator import validate_llm_fallback
 @dataclass
 class FusionConfig:
     """PoC-4 fusion pipeline configuration."""
+    # Label map
+    label_map_path: str = "Configs/label_map.json"
+
     # Parser
     parser_max_new_tokens: int = 128
     parser_confidence_threshold: float = 0.3
