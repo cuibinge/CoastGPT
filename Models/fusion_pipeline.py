@@ -17,10 +17,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from Models.fusion_predictors import BasePredictor, PredictorOutput
+from Models.fusion_predictors import BasePredictor
 from utils.geojson_builder import build_feature_collection, validate_geojson, filter_sliver_features
 from utils.geojson_dedup import dedup_within_source, dedup_cross_source
-from utils.geojson_validator import validate_llm_fallback, ValidationReport
+from utils.geojson_validator import validate_llm_fallback
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +45,6 @@ class FusionConfig:
     )
 
     # Gating
-    label_map_path: str = "Configs/label_map.json"
     empty_target_policy: str = "error"  # "error" | "all_heads" | "llm_only"
 
     # Validation
@@ -121,7 +120,7 @@ class LLMParser:
         """Try LLM-based parsing. Returns None on failure."""
         from Models import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX, tokenizer_image_token
 
-        parse_prompt_text = self._config.parser_prompt_template.format(user_prompt=prompt)
+        parse_prompt_text = self._config.parser_prompt_template.replace("{user_prompt}", prompt)
         full_prompt = DEFAULT_IMAGE_TOKEN + "\n" + parse_prompt_text
 
         input_ids = tokenizer_image_token(
@@ -182,7 +181,7 @@ class LLMParser:
             return ParseResult(task_type="VQA", target_classes=[], source="rule_fallback")
 
         # [DET] — try keyword matching against label_map
-        # alias/exact/longest/fuzzy: try exact match first, then substring
+        # substring matching against label_map class names
         all_class_names = list(self._label_map.get("branch_classes", {}).get("instance", {}).values())
         all_class_names += list(self._label_map.get("branch_classes", {}).get("semantic", {}).values())
         all_class_names += list(self._label_map.get("branch_classes", {}).get("edge", {}).values())
@@ -278,7 +277,11 @@ class FusionPipeline:
 
         # Step 2: [CAP]/[VQA] early return — pure text path
         if task_prefix in ("CAP", "VQA"):
-            output = self.predictors["llm_text"].predict(image, prompt, georef, [])
+            llm_text = self.predictors.get("llm_text")
+            if llm_text is None:
+                diagnostics["early_return_error"] = "llm_text predictor not configured"
+                return {"type": "FeatureCollection", "features": []}, diagnostics
+            output = llm_text.predict(image, prompt, georef, [])
             diagnostics["early_return"] = task_prefix
             diagnostics["text_output"] = output.raw.get("text", "") if output.raw else ""
             return {"type": "FeatureCollection", "features": []}, diagnostics
@@ -313,6 +316,9 @@ class FusionPipeline:
                     "semantic": list(self._get_semantic_class_names()),
                     "edge": ["海岸线"],
                 }
+            elif self.config.empty_target_policy == "llm_only":
+                # Route everything to LLM fallback with original prompt
+                dispatch_map.unknown = ["*"]
 
         # Step 5: Run detection heads (known classes only)
         det_features = []
@@ -321,8 +327,12 @@ class FusionPipeline:
             classes = dispatch_map.known.get(branch, [])
             if not classes:
                 continue
+            predictor = self.predictors.get(branch)
+            if predictor is None:
+                diagnostics.setdefault("det_errors", {})[branch] = f"Predictor '{branch}' not configured"
+                continue
             try:
-                output = self.predictors[branch].predict(image, prompt, georef, classes)
+                output = predictor.predict(image, prompt, georef, classes)
                 # Layer 1 validation for detection head features
                 fc = build_feature_collection(output.features)
                 val_result = validate_geojson(fc, tile_bounds_wgs84=tile_bounds)
@@ -342,7 +352,10 @@ class FusionPipeline:
                 llm_prompt = self._build_fallback_prompt(
                     prompt, dispatch_map.unknown
                 )
-                output = self.predictors["llm"].predict(
+                llm_predictor = self.predictors.get("llm")
+                if llm_predictor is None:
+                    raise RuntimeError("llm predictor not configured")
+                output = llm_predictor.predict(
                     image, llm_prompt, georef, dispatch_map.unknown
                 )
                 # Layer 1: GeoJSON validation
@@ -412,9 +425,14 @@ class FusionPipeline:
 
     @staticmethod
     def _build_fallback_prompt(original_prompt: str, unknown_classes: List[str]) -> str:
+        if "*" in unknown_classes:
+            # Wildcard: LLM generates freely from original prompt
+            return original_prompt
         class_list = "、".join(unknown_classes)
+        original_context = original_prompt[:200] + "..." if len(original_prompt) > 200 else original_prompt
         return (
             f"[DET] 请检测图中的{class_list}。"
+            f" Original request: {original_context}. "
             f"Output the extracted feature information as a GeoJSON "
             f"FeatureCollection. Return JSON only."
         )
