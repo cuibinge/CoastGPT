@@ -120,39 +120,35 @@ class LLMParser:
         return self._rule_parse(prompt)
 
     def _llm_parse(self, prompt: str, image: torch.Tensor) -> Optional[ParseResult]:
-        """Try LLM-based parsing. Returns None on failure.
-
-        Uses the model's internal generate() with input_ids=None to leverage
-        the built-in conversation-format prompt construction — identical to
-        how Inference.py generates text.
-        """
+        """Try LLM-based parsing. Returns None on failure."""
         import json as _json
-        from Models import DEFAULT_IMAGE_TOKEN
+        from Models import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX, tokenizer_image_token
 
-        # Must include <image> token so LanguageModel.generate() uses image features
-        parse_prompt_text = DEFAULT_IMAGE_TOKEN + "\n" + self._config.parser_prompt_template.replace("{user_prompt}", prompt)
+        parse_prompt_text = self._config.parser_prompt_template.replace("{user_prompt}", prompt)
+        # Simple prompt format: <image>\n[task description]\n[user prompt]
+        full_prompt = DEFAULT_IMAGE_TOKEN + "\n" + parse_prompt_text
+
+        input_ids = tokenizer_image_token(
+            full_prompt, self._tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
+        ).unsqueeze(0).to(self._device)
 
         with torch.inference_mode():
             output_ids = self._model.generate(
-                input_ids=None,
+                input_ids=input_ids,
                 images=image.to(self._device),
-                prompt=parse_prompt_text,  # will be wrapped in conversation template
                 do_sample=False,
                 temperature=1.0,
                 max_new_tokens=self._config.parser_max_new_tokens,
+                min_new_tokens=1,
                 use_cache=True,
                 remove_invalid_values=True,
                 renormalize_logits=True,
+                eos_token_id=self._tokenizer.eos_token_id,
+                pad_token_id=self._tokenizer.pad_token_id,
             )
 
-        # generate() with input_ids=None returns decoded text directly
-        if output_ids is None:
-            return None
-        if isinstance(output_ids, torch.Tensor):
-            # Fallback: if it returned token ids, decode them
-            text = self._tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
-        else:
-            text = str(output_ids).strip()
+        new_tokens = output_ids[0, input_ids.shape[1]:]
+        text = self._tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
         if not text:
             return None
