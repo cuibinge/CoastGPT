@@ -364,7 +364,7 @@ class LLMPredictor(BasePredictor):
             tokenizer_image_token,
         )
 
-        gen_prompt = DEFAULT_IMAGE_TOKEN + "\n" + full_prompt
+        gen_prompt = "\n" + DEFAULT_IMAGE_TOKEN + "\n" + full_prompt
         input_ids = tokenizer_image_token(
             gen_prompt, self._tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
         ).unsqueeze(0).to(self._device)
@@ -376,9 +376,12 @@ class LLMPredictor(BasePredictor):
                 do_sample=False,
                 temperature=1.0,
                 max_new_tokens=self._max_new_tokens,
+                min_new_tokens=1,
                 use_cache=True,
                 remove_invalid_values=True,
                 renormalize_logits=True,
+                eos_token_id=self._tokenizer.eos_token_id,
+                pad_token_id=self._tokenizer.pad_token_id,
             )
 
         # Decode
@@ -451,7 +454,8 @@ class LLMTextPredictor(BasePredictor):
             tokenizer_image_token,
         )
 
-        gen_prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt
+        # Leading \n prevents <image> at position 0 (prepare_inputs_for_multimodal bug)
+        gen_prompt = "\n" + DEFAULT_IMAGE_TOKEN + "\n" + prompt
         input_ids = tokenizer_image_token(
             gen_prompt, self._tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
         ).unsqueeze(0).to(self._device)
@@ -463,9 +467,12 @@ class LLMTextPredictor(BasePredictor):
                 do_sample=False,
                 temperature=1.0,
                 max_new_tokens=self._max_new_tokens,
+                min_new_tokens=1,
                 use_cache=True,
                 remove_invalid_values=True,
                 renormalize_logits=True,
+                eos_token_id=self._tokenizer.eos_token_id,
+                pad_token_id=self._tokenizer.pad_token_id,
             )
 
         new_tokens = output_ids[0, input_ids.shape[1]:]
