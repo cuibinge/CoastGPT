@@ -108,6 +108,8 @@ class LLMParser:
         """Parse prompt to extract task_type and target_classes."""
         import json as _json
 
+        self._last_llm_raw = None  # set by _llm_parse for diagnostics
+
         # --- Attempt LLM parse ---
         try:
             result = self._llm_parse(prompt, image)
@@ -151,6 +153,7 @@ class LLMParser:
 
         new_tokens = output_ids[0, input_ids.shape[1]:]
         text = self._tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        self._last_llm_raw = text  # for diagnostics
 
         if not text:
             return None
@@ -308,6 +311,7 @@ class FusionPipeline:
             "target_classes": parse_result.target_classes,
             "confidence": parse_result.confidence,
             "source": parse_result.source,
+            "llm_raw_output": getattr(self.parser, "_last_llm_raw", None),
         }
 
         # Step 4: Gating → DispatchMap
