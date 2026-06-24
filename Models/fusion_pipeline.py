@@ -121,10 +121,17 @@ class LLMParser:
 
     def _llm_parse(self, prompt: str, image: torch.Tensor) -> Optional[ParseResult]:
         """Try LLM-based parsing. Returns None on failure."""
+        import json as _json
         from Models import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX, tokenizer_image_token
+        from Dataset.conversation import default_conversation
 
+        # Build conversation-format prompt (matching model's training format)
+        conv = default_conversation.copy()
         parse_prompt_text = self._config.parser_prompt_template.replace("{user_prompt}", prompt)
-        full_prompt = DEFAULT_IMAGE_TOKEN + "\n" + parse_prompt_text
+        inp = DEFAULT_IMAGE_TOKEN + "\n" + parse_prompt_text
+        conv.append_message(conv.roles[0], inp)
+        conv.append_message(conv.roles[1], None)
+        full_prompt = conv.get_prompt()
 
         input_ids = tokenizer_image_token(
             full_prompt, self._tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
