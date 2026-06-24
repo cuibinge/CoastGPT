@@ -77,6 +77,7 @@ def main():
     config = ConfigDict(raw)
     config.stage = 0
     config.adjust_norm = False
+    config.lora.enable = False   # 推理不需要 PeftModel 包装
     # NPU safety
     bits = int(getattr(config, "bits", 16))
     if bits in (4, 8):
@@ -86,16 +87,55 @@ def main():
         config.fp16 = True; config.bf16 = False
 
     # ---- Load CoastGPT ----
-    print("[verify] Loading CoastGPT...")
+    # Priority: FINAL_merged.pt > FINAL.pt + manual LoRA merge
+    merged_path = args.model_path.replace(".pt", "_merged.pt")
+    print(f"[verify] Loading CoastGPT (lora.enable=False)...")
     torch.manual_seed(322)
     from Models.coastgpt import CoastGPT
-    model = CoastGPT(config)
+    model = CoastGPT(config)     # 干净的 CustomLlamaForCausalLM，无 PeftModel 壳
     model.to(dtype)
-    model.custom_load_state_dict(args.model_path)
-    model.to(device)
-    model.eval()
+
+    if Path(merged_path).exists():
+        print(f"[verify] Loading merged checkpoint: {merged_path}")
+        ckpt = torch.load(merged_path, map_location="cpu")
+        model.load_state_dict(ckpt["vision_ckpt"], strict=False)
+        model.load_state_dict(ckpt["other_ckpt"], strict=False)
+    else:
+        print(f"[verify] Loading FINAL.pt + manual LoRA merge...")
+        ckpt = torch.load(args.model_path, map_location="cpu")
+        model.vision.load_state_dict(ckpt["vision_ckpt"], strict=False)
+        other = ckpt["other_ckpt"]
+        model.multimodal.projection.load_state_dict(other["multimodal_projection"], strict=False)
+        te = model.language.get_text_encoder()
+        ew = other["embed_tokens"]["weight"]
+        te.get_input_embeddings().weight.data.copy_(ew[:te.get_input_embeddings().weight.shape[0], :])
+        # Manual LoRA merge
+        lora_file = _REPO_ROOT / "TextLoRA" / "adapter_model.safetensors"
+        if lora_file.exists():
+            from safetensors.torch import load_file
+            import re, json
+            with open(_REPO_ROOT / "TextLoRA" / "adapter_config.json") as f:
+                lora_cfg = json.load(f)
+            lora_state = load_file(str(lora_file))
+            scale = lora_cfg["lora_alpha"] / lora_cfg["r"]
+            base_sd = model.state_dict()
+            merged = 0
+            for key in list(lora_state.keys()):
+                m = re.match(r'base_model\.model\.(.+)\.lora_A\.weight$', key)
+                if not m: continue
+                bp = m.group(1)
+                bk = key.replace('.lora_A.weight', '.lora_B.weight')
+                if bk not in lora_state: continue
+                delta = (lora_state[bk].float() @ lora_state[key].float()) * scale
+                target = f'language.text_encoder.{bp}.weight'
+                if target in base_sd:
+                    base_sd[target] = base_sd[target].float() + delta
+                    merged += 1
+            model.load_state_dict(base_sd, strict=True)
+            print(f"[verify]  LoRA merged: {merged}/{len(lora_state)//2} adapters")
+
+    model.to(device); model.eval()
     tokenizer = model.language.tokenizer
-    # Fix tokenizer IDs (mirrors Inference.py)
     eos_id = getattr(tokenizer, "eos_token_id", None)
     pad_id = getattr(tokenizer, "pad_token_id", None)
     unk_id = getattr(tokenizer, "unk_token_id", None)
@@ -107,7 +147,7 @@ def main():
     model.language.get_text_encoder().config.pad_token_id = tokenizer.pad_token_id
     if eos_id is not None:
         model.language.get_text_encoder().config.eos_token_id = eos_id
-    print(f"[verify] CoastGPT loaded. vocab={len(tokenizer)}, pad={tokenizer.pad_token_id}, eos={eos_id}")
+    print(f"[verify] Model ready. vocab={len(tokenizer)}, pad={tokenizer.pad_token_id}")
 
     # ---- Load image ----
     print(f"[verify] Loading image: {args.image_file}")
