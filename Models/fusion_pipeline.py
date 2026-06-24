@@ -125,8 +125,10 @@ class LLMParser:
         from Models import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX, tokenizer_image_token
 
         parse_prompt_text = self._config.parser_prompt_template.replace("{user_prompt}", prompt)
-        # Simple prompt format: <image>\n[task description]\n[user prompt]
-        full_prompt = DEFAULT_IMAGE_TOKEN + "\n" + parse_prompt_text
+        # <image> must NOT be at position 0 — prepare_inputs_for_multimodal
+        # has a bug where image_token_start==0 causes incorrect tensor slicing.
+        # A leading newline ensures <image> is at position > 0.
+        full_prompt = "\n" + DEFAULT_IMAGE_TOKEN + "\n" + parse_prompt_text
 
         input_ids = tokenizer_image_token(
             full_prompt, self._tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
