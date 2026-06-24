@@ -77,6 +77,13 @@ def _normalize_inference_runtime(config: ml_collections.ConfigDict) -> None:
         )
         config.stage = 0
 
+    # Disable LoRA at init time — inference doesn't need the PeftModel shell.
+    # Merged checkpoints already have LoRA weights baked in; unmerged checkpoints
+    # are handled by _load_checkpoint's skip_text_lora path.
+    if getattr(getattr(config, "lora", None), "enable", False):
+        config.lora.enable = False
+        print("[Inference] disable lora.enable for inference (no PeftModel shell at init).")
+
     merge_text_lora = getattr(config, "merge_text_lora", None)
     if merge_text_lora is None:
         if str(getattr(config, "accelerator", "")).lower() == "npu":
@@ -709,42 +716,31 @@ def _load_checkpoint(model: CoastGPT, model_path: str, skip_text_lora: bool = Fa
     # Structured stage-2 format: {'vision_ckpt': ..., 'other_ckpt': ...}
     if "vision_ckpt" in ckpt or "other_ckpt" in ckpt:
         print("[Inference] detected structured checkpoint (vision_ckpt/other_ckpt).")
-        if hasattr(model, "custom_load_state_dict") and not skip_text_lora:
-            msg = model.custom_load_state_dict(model_path)
-            print("[Inference] loaded structured checkpoint via custom_load_state_dict.")
-            return msg
-        if skip_text_lora:
-            print("[Inference] skip TextLoRA load by request; use fallback structured loader.")
 
-        # Fallback path (should rarely happen in this repo).
+        # With lora.enable=False, we load weights directly — no PeftModel shell needed.
+        # The merged checkpoint already has LoRA weights baked into text_encoder.
         if "vision_ckpt" in ckpt and hasattr(model, "vision"):
             model.vision.load_state_dict(ckpt["vision_ckpt"], strict=False)
         other = ckpt.get("other_ckpt", {})
         if isinstance(other, dict):
+            # Load critical components with strict matching
             mm = other.get("multimodal_projection", None)
             if isinstance(mm, dict) and hasattr(model, "multimodal"):
                 model.multimodal.projection.load_state_dict(mm, strict=False)
-
-            def _report_load_result(module_name, incompatible):
-                print(
-                    f"[Inference] restored {module_name}: Missing: "
-                    f"{getattr(incompatible, 'missing_keys', [])}. Unexpected: "
-                    f"{getattr(incompatible, 'unexpected_keys', [])}"
-                )
-
-            if hasattr(model, "_restore_embed_tokens_from_ckpt"):
-                model._restore_embed_tokens_from_ckpt(ckpt, _report_load_result)
-            else:
-                emb = other.get("embed_tokens", None)
-                lm = other.get("lm_head", None)
-                try:
-                    text_encoder = model.language.get_text_encoder()
-                    if isinstance(emb, dict):
-                        text_encoder.get_input_embeddings().load_state_dict(emb, strict=False)
-                    if isinstance(lm, dict) and text_encoder.get_output_embeddings() is not None:
-                        text_encoder.get_output_embeddings().load_state_dict(lm, strict=False)
-                except Exception:
-                    pass
+            emb = other.get("embed_tokens", None)
+            lm = other.get("lm_head", None)
+            try:
+                text_encoder = model.language.get_text_encoder()
+                if isinstance(emb, dict):
+                    text_encoder.get_input_embeddings().load_state_dict(emb, strict=False)
+                if isinstance(lm, dict) and len(lm) > 0 and text_encoder.get_output_embeddings() is not None:
+                    text_encoder.get_output_embeddings().load_state_dict(lm, strict=False)
+            except Exception:
+                pass
+            # Load all remaining weights (merged text_encoder, language model, etc.)
+            msg = model.load_state_dict(other, strict=False)
+            print(f"[Inference] loaded other_ckpt: missing={len(msg.missing_keys)}, unexpected={len(msg.unexpected_keys)}")
+        print("[Inference] structured checkpoint loaded.")
         return None
 
     # Generic flat formats.
