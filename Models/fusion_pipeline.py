@@ -120,27 +120,23 @@ class LLMParser:
         return self._rule_parse(prompt)
 
     def _llm_parse(self, prompt: str, image: torch.Tensor) -> Optional[ParseResult]:
-        """Try LLM-based parsing. Returns None on failure."""
+        """Try LLM-based parsing. Returns None on failure.
+
+        Uses the model's internal generate() with input_ids=None to leverage
+        the built-in conversation-format prompt construction — identical to
+        how Inference.py generates text.
+        """
         import json as _json
-        from Models import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX, tokenizer_image_token
-        from Dataset.conversation import default_conversation
+        from Models import DEFAULT_IMAGE_TOKEN
 
-        # Build conversation-format prompt (matching model's training format)
-        conv = default_conversation.copy()
-        parse_prompt_text = self._config.parser_prompt_template.replace("{user_prompt}", prompt)
-        inp = DEFAULT_IMAGE_TOKEN + "\n" + parse_prompt_text
-        conv.append_message(conv.roles[0], inp)
-        conv.append_message(conv.roles[1], None)
-        full_prompt = conv.get_prompt()
-
-        input_ids = tokenizer_image_token(
-            full_prompt, self._tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
-        ).unsqueeze(0).to(self._device)
+        # Must include <image> token so LanguageModel.generate() uses image features
+        parse_prompt_text = DEFAULT_IMAGE_TOKEN + "\n" + self._config.parser_prompt_template.replace("{user_prompt}", prompt)
 
         with torch.inference_mode():
             output_ids = self._model.generate(
-                input_ids=input_ids,
+                input_ids=None,
                 images=image.to(self._device),
+                prompt=parse_prompt_text,  # will be wrapped in conversation template
                 do_sample=False,
                 temperature=1.0,
                 max_new_tokens=self._config.parser_max_new_tokens,
@@ -149,10 +145,19 @@ class LLMParser:
                 renormalize_logits=True,
             )
 
-        new_tokens = output_ids[0, input_ids.shape[1]:]
-        text = self._tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+        # generate() with input_ids=None returns decoded text directly
+        if output_ids is None:
+            return None
+        if isinstance(output_ids, torch.Tensor):
+            # Fallback: if it returned token ids, decode them
+            text = self._tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+        else:
+            text = str(output_ids).strip()
 
-        # Extract JSON
+        if not text:
+            return None
+
+        # Extract JSON from text
         json_start = text.find("{")
         json_end = text.rfind("}")
         if json_start < 0 or json_end <= json_start:
@@ -173,7 +178,7 @@ class LLMParser:
 
         confidence = float(obj.get("confidence", 0.0))
         if confidence < self._config.parser_confidence_threshold:
-            return None  # Trigger rule fallback
+            return None
 
         return ParseResult(
             task_type=task_type,
