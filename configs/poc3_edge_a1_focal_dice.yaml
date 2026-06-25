@@ -1,0 +1,108 @@
+# PoC-3 A1: Focal+Dice baseline with threshold sweep
+# Goal: solve extreme class imbalance (edge fg ~1%), establish formal baseline.
+# A0 already verified pipeline closure — A1 focuses on performance.
+
+experiment:
+  name: poc3_a1_focal_dice_sweep
+  output_dir: outputs/poc3_edge/a1_focal_dice_sweep
+  seed: 42
+  stage: P3-A1
+
+data:
+  roots:
+    - /home/ma-user/work/Stage3Data/海岸线/RS-海岸线二级/Patches
+    - /home/ma-user/work/Stage3Data/海岸线/RS-海岸线一级/Patches
+  manifest_path: outputs/poc3_edge/coastline_manifest.json
+  image_size: 224
+  val_ratio: 0.2
+  val_split_seed: 42
+  num_workers: 2
+  line_width_train: 3
+  line_width_eval: 1
+
+model:
+  alignment_dim: 1024
+
+  rgb_vision:
+    arch: dual
+    global_encoder_name: dinov3_vitl16
+    local_source: dino
+    local_encoder_name: convnext_base
+    local_ckpt_path: ./dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth
+    freeze_global: true
+    freeze_local: true
+    global_ckpt_path: ./dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth
+    input_size: [224, 224]
+    physical_prompt_dim: 4096
+    patch_dropout: 0.0
+    input_patchnorm: false
+    tune_pooler: false
+    attn_pooler:
+      num_query: 144
+      num_attn_heads: 16
+      num_layers: 6
+
+  vision_checkpoint: ./output/stage2/checkpoints/iter_2879_consolidated.pt
+
+  fpn:
+    in_channels: [128, 256, 512, 1024]
+    out_channels: 256
+    vit_in_channels: 1024
+
+  edge_head:
+    type: single_scale
+    in_channels: 256
+    decoder_channels: [256, 128]
+    output_size: [224, 224]
+
+  # Optional: warm-start FPN+Edge Head from A0 checkpoint
+  a0_checkpoint: null
+
+train:
+  device: npu
+  epochs: 40
+  batch_size: 2
+  lr_fpn: 5.0e-5
+  lr_edge_head: 1.0e-4
+  weight_decay: 1.0e-4
+  max_grad_norm: 1.0
+  log_interval: 20
+  val_interval: 5
+  save_interval: 5
+  accum_steps: 1
+  freeze_vision: true
+  precision: bf16
+
+loss:
+  type: focal_dice
+  focal_alpha: 0.75
+  focal_gamma: 2.0
+
+postprocess:
+  mode: threshold_sweep
+  threshold_default: 0.30
+  threshold_values:
+    - 0.10
+    - 0.15
+    - 0.20
+    - 0.25
+    - 0.30
+    - 0.35
+    - 0.40
+    - 0.45
+    - 0.50
+    - 0.55
+    - 0.60
+    - 0.65
+    - 0.70
+  threshold_select_metric: buffered_f1_1px
+  min_component_area: 8
+  min_line_length_px: 10
+  max_components: 5
+  simplify_epsilon_px: 1.0
+
+eval:
+  export_overlay: true
+  export_geojson: true
+  max_val_batches: 0
+  max_overlay_samples: 12

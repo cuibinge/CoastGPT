@@ -1,0 +1,94 @@
+# PoC-3 A3-1: GDF with A2 FPN warm-start (MAIN EXPERIMENT)
+# Loads A2-224 FPN weights → train FPN + GDF Head with field supervision.
+# Go/No-go: Gate 3 — FP median distance, FP beyond 20px, TP/FP ratio, oracle ceiling.
+
+experiment:
+  name: poc3_a3_1_gdf_warmstart
+  output_dir: outputs/poc3_gdf/a3_1_warmstart
+  seed: 42
+  stage: P3-A3-1
+
+data:
+  roots:
+    - /home/ma-user/work/Stage3Data/海岸线/RS-海岸线二级/Patches
+    - /home/ma-user/work/Stage3Data/海岸线/RS-海岸线一级/Patches
+  manifest_path: outputs/poc3_edge/coastline_manifest.json
+  image_size: 224
+  val_ratio: 0.2
+  val_split_seed: 42
+  num_workers: 2
+  line_width_eval: 1
+
+field:
+  max_radius_px: 32
+  ignore_vector_outside_radius: true
+  supervise_valid_outside_radius: true
+
+model:
+  rgb_vision:
+    arch: dual
+    global_encoder_name: dinov3_vitl16
+    local_source: dino
+    local_encoder_name: convnext_base
+    local_ckpt_path: ./dinov3_convnext_base_pretrain_lvd1689m-801f2ba9.pth
+    freeze_global: true
+    freeze_local: true
+    global_ckpt_path: ./dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth
+    input_size: [224, 224]
+    physical_prompt_dim: 4096
+    patch_dropout: 0.0
+    input_patchnorm: false
+    tune_pooler: false
+
+  vision_checkpoint: ./output/stage2/checkpoints/iter_2879_consolidated.pt
+
+  fpn:
+    in_channels: [128, 256, 512, 1024]
+    out_channels: 256
+    vit_in_channels: 1024
+
+  gdf_head:
+    type: single_scale
+    in_channels: 256
+    decoder_channels: [256, 128]
+    output_size: [224, 224]
+
+  init:
+    load_a2_checkpoint: outputs/poc3_edge/a2_8npu_ddp/checkpoints/epoch_000.pt
+    load_fpn: true
+
+train:
+  device: npu
+  epochs: 20
+  batch_size: 2
+  accum_steps: 8
+  lr_fpn: 2.0e-5
+  lr_gdf_head: 1.0e-4
+  weight_decay: 1.0e-4
+  max_grad_norm: 1.0
+  log_interval: 20
+  val_interval: 5
+  save_interval: 5
+
+loss:
+  lambda_vec: 1.0
+  lambda_dist: 0.5
+  lambda_valid: 0.5
+  lambda_consistency: 0.0
+
+voting:
+  valid_threshold: 0.5
+  use_dist_weight: true
+  tau: 16.0
+  smooth_sigma: 1.0
+  threshold_sweep: true
+  threshold_values: [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+
+postprocess:
+  min_component_area: 8
+  min_line_length_px: 10
+  max_components: 5
+  simplify_epsilon_px: 1.0
+
+eval:
+  max_val_batches: 0
