@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 import warnings
+import math
 try:
     import torch_npu  # noqa: F401
 except Exception:
@@ -331,6 +332,10 @@ class MoEProjection(nn.Module):
             router_noise: float = 0.1,
             gate_temperature: float = 1.0,
             moe_warmup_steps: int = 0,
+            force_balanced_topk: bool = False,
+            visual_descriptor: str = "mean",
+            visual_spatial_pool_sizes: Optional[List[int]] = None,
+            visual_gate_hidden_mult: float = 1.0,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -345,6 +350,13 @@ class MoEProjection(nn.Module):
         self.router_noise = float(router_noise)
         self.gate_temperature = float(gate_temperature)
         self.moe_warmup_steps = int(moe_warmup_steps)
+        self.force_balanced_topk = bool(force_balanced_topk)
+        self.visual_descriptor = str(visual_descriptor).lower()
+        raw_pool_sizes = visual_spatial_pool_sizes if visual_spatial_pool_sizes is not None else [1, 2, 4]
+        if hasattr(raw_pool_sizes, "to_list"):
+            raw_pool_sizes = raw_pool_sizes.to_list()
+        self.visual_spatial_pool_sizes = [max(1, int(s)) for s in raw_pool_sizes]
+        self.visual_gate_hidden_mult = float(visual_gate_hidden_mult)
         self._moe_step = 0
         self.text_embed_dim = int(text_embed_dim) if text_embed_dim is not None else int(encoder_hidden_size)
 
@@ -377,8 +389,15 @@ class MoEProjection(nn.Module):
         self.element_text_proj = nn.Linear(encoder_hidden_size, task_dim)
 
         # 3. 双驱动门控网络 (全局视觉特征 + 任务特征 + 要素特征 + 物理先验)
-        # 为门控对齐维度：将视觉全局和物理池化都投影到 task_dim
-        self.gate_img_proj = nn.Linear(encoder_hidden_size, task_dim)
+        # 视觉 gate 使用 mean/max/std/spatial pyramid 描述子，保留粗粒度空间结构。
+        self.visual_descriptor_dim = self._visual_gate_descriptor_dim(encoder_hidden_size)
+        visual_gate_hidden = max(task_dim, int(round(task_dim * self.visual_gate_hidden_mult)))
+        self.gate_img_proj = nn.Sequential(
+            nn.LayerNorm(self.visual_descriptor_dim),
+            nn.Linear(self.visual_descriptor_dim, visual_gate_hidden),
+            nn.GELU(),
+            nn.Linear(visual_gate_hidden, task_dim),
+        )
         supported_visual_dims = {
             int(encoder_hidden_size),
             int(hidden_size),
@@ -555,6 +574,123 @@ class MoEProjection(nn.Module):
         resized = F.interpolate(flat, size=self.encoder_hidden_size, mode="linear", align_corners=False)
         return resized.reshape(*image_embs.shape[:-1], self.encoder_hidden_size).to(dtype=orig_dtype)
 
+    def _visual_gate_descriptor_dim(self, channels: int) -> int:
+        if self.visual_descriptor in ("mean", "global_mean"):
+            return int(channels)
+        if self.visual_descriptor in ("mean_max_std", "mean_max_std_spatial"):
+            width = int(channels) * 3
+            if self.visual_descriptor.endswith("spatial"):
+                width += int(channels) * sum(s * s for s in self.visual_spatial_pool_sizes)
+            return width
+        raise ValueError(
+            f"Unsupported visual_descriptor={self.visual_descriptor!r}; "
+            "expected 'mean', 'mean_max_std', or 'mean_max_std_spatial'."
+        )
+
+    def _build_visual_gate_descriptor(self, image_embs: torch.Tensor) -> torch.Tensor:
+        if image_embs.dim() != 3:
+            raise ValueError(f"image_embs must be [B, L, C], got shape={tuple(image_embs.shape)}")
+
+        x = torch.nan_to_num(image_embs.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+        x = torch.clamp(x, min=-1e4, max=1e4)
+        mean = x.mean(dim=1)
+        if self.visual_descriptor in ("mean", "global_mean"):
+            return mean
+
+        parts = [mean, x.max(dim=1).values, x.std(dim=1, unbiased=False)]
+        if self.visual_descriptor.endswith("spatial"):
+            B, L, C = x.shape
+            side = math.isqrt(int(L))
+            if side * side == int(L):
+                grid = x.transpose(1, 2).reshape(B, C, side, side)
+                for pool_size in self.visual_spatial_pool_sizes:
+                    pooled = F.adaptive_avg_pool2d(grid, output_size=(pool_size, pool_size))
+                    parts.append(pooled.flatten(2).reshape(B, C * pool_size * pool_size))
+            else:
+                sequence = x.transpose(1, 2)
+                for pool_size in self.visual_spatial_pool_sizes:
+                    pooled = F.adaptive_avg_pool1d(sequence, output_size=pool_size * pool_size)
+                    parts.append(pooled.reshape(B, C * pool_size * pool_size))
+
+        descriptor = torch.cat(parts, dim=-1)
+        expected_width = int(getattr(self, "visual_descriptor_dim", descriptor.size(-1)))
+        if descriptor.size(-1) != expected_width:
+            raise RuntimeError(
+                f"visual descriptor width {descriptor.size(-1)} != expected {expected_width}"
+            )
+        return descriptor
+
+    def _build_visual_gate_feature(self, image_embs: torch.Tensor) -> torch.Tensor:
+        descriptor = self._build_visual_gate_descriptor(image_embs)
+        proj_dtype = next(self.gate_img_proj.parameters()).dtype
+        img_gate = self.gate_img_proj(descriptor.to(dtype=proj_dtype))
+        img_gate = torch.nan_to_num(img_gate, nan=0.0, posinf=1e4, neginf=-1e4)
+        img_gate = torch.clamp(img_gate, min=-1e4, max=1e4)
+        return img_gate.to(dtype=image_embs.dtype)
+
+    def _balanced_topk_enabled(self) -> bool:
+        return (
+            self.force_balanced_topk
+            and self.routing_strategy in ("two_stage", "task_then_element")
+            and self.task_expert_count > 0
+            and self.element_expert_count > 0
+            and self.top_k >= 2
+        )
+
+    def _select_topk_balanced(self, gate_weights: torch.Tensor):
+        if not self._balanced_topk_enabled():
+            top_weights, top_indices = torch.topk(gate_weights, self.top_k, dim=-1)
+            return top_weights, top_indices, False
+
+        task_weights = gate_weights[:, :self.task_expert_count]
+        element_weights = gate_weights[:, self.task_expert_count:]
+        task_top_weights, task_top_indices = torch.topk(task_weights, 1, dim=-1)
+        elem_top_weights, elem_top_indices = torch.topk(element_weights, 1, dim=-1)
+        elem_top_indices = elem_top_indices + self.task_expert_count
+
+        top_weights = torch.cat([task_top_weights, elem_top_weights], dim=-1)
+        top_indices = torch.cat([task_top_indices, elem_top_indices], dim=-1)
+
+        if self.top_k > 2:
+            selected_mask = torch.zeros_like(gate_weights, dtype=torch.bool)
+            selected_mask.scatter_(1, top_indices, True)
+            remaining_weights = gate_weights.masked_fill(selected_mask, -1.0)
+            extra_weights, extra_indices = torch.topk(remaining_weights, self.top_k - 2, dim=-1)
+            top_weights = torch.cat([top_weights, extra_weights], dim=-1)
+            top_indices = torch.cat([top_indices, extra_indices], dim=-1)
+
+        sort_order = torch.argsort(top_weights, dim=-1, descending=True)
+        top_weights = torch.gather(top_weights, 1, sort_order)
+        top_indices = torch.gather(top_indices, 1, sort_order)
+        return top_weights, top_indices, True
+
+    def _select_warmup_topk(self, gate_weights: torch.Tensor, step_idx: int):
+        B_dev = gate_weights.size(0)
+        k = self.top_k
+        device = gate_weights.device
+        rows = torch.arange(B_dev, device=device)
+
+        if self._balanced_topk_enabled():
+            task_base = (rows + step_idx) % self.task_expert_count
+            elem_base = self.task_expert_count + ((rows + step_idx) % self.element_expert_count)
+            top_indices = torch.stack([task_base, elem_base], dim=-1)
+            if k > 2:
+                global_base = (rows + step_idx) % self.num_experts
+                candidate_offsets = torch.arange(self.num_experts, device=device)
+                candidates = (global_base.unsqueeze(-1) + candidate_offsets.unsqueeze(0)) % self.num_experts
+                used = (candidates.unsqueeze(-1) == top_indices.unsqueeze(1)).any(dim=-1)
+                extras = candidates.masked_select(~used).reshape(B_dev, self.num_experts - 2)[:, : k - 2]
+                top_indices = torch.cat([top_indices, extras], dim=-1)
+            top_weights = torch.ones_like(top_indices, dtype=gate_weights.dtype) / float(k)
+            return top_weights, top_indices, True
+
+        base = (rows + step_idx) % self.num_experts
+        top_indices = base.unsqueeze(-1)
+        if k > 1:
+            top_indices = (base.unsqueeze(-1) + torch.arange(k, device=device)) % self.num_experts
+        top_weights = torch.ones_like(top_indices, dtype=gate_weights.dtype) / float(k)
+        return top_weights, top_indices, False
+
     def forward(
             self,
             image_embs: torch.Tensor,
@@ -582,17 +718,8 @@ class MoEProjection(nn.Module):
         # ==========================================
         # 1. 任务与要素双驱动的动态门控计算 (Sequence-level Routing)
         # ==========================================
-        # 获取宏观全局图像上下文并对齐到 task_dim
-        img_global = torch.nan_to_num(
-            image_embs.float().mean(dim=1),
-            nan=0.0,
-            posinf=1e4,
-            neginf=-1e4,
-        )  # [B, C]
-        img_global = torch.clamp(img_global, min=-1e4, max=1e4)
-        img_gate = self.gate_img_proj(img_global.to(dtype=self.gate_img_proj.weight.dtype))  # [B, task_dim]
-        img_gate = torch.nan_to_num(img_gate, nan=0.0, posinf=1e4, neginf=-1e4)
-        img_gate = torch.clamp(img_gate, min=-1e4, max=1e4)
+        # 获取宏观全局 + 粗粒度空间图像上下文并对齐到 task_dim
+        img_gate = self._build_visual_gate_feature(image_embs)  # [B, task_dim]
 
         # 从任务/要素文本 embedding 中提取语义上下文 h_task, h_element
         t_embs = self._pool_semantic_text(
@@ -807,24 +934,18 @@ class MoEProjection(nn.Module):
                     torch.abs(F.cosine_similarity(t_embs.float(), e_embs.float(), dim=-1))
                 ).to(gate_weights.dtype)
 
-        # 选取 Top-K 专家 (with warmup uniform routing per SOP Section 11)
+        # 选取 Top-K 专家；two-stage 可强制每次至少包含任务/要素各一个专家。
+        balanced_topk = False
         if self.training:
             warmup_steps = int(getattr(self, "moe_warmup_steps", 0))
             self._moe_step = getattr(self, "_moe_step", 0) + 1
             if self._moe_step <= warmup_steps:
-                B_dev = gate_weights.size(0)
-                k = self.top_k
                 step_idx = self._moe_step % self.num_experts
-                base = (torch.arange(B_dev, device=gate_weights.device) + step_idx) % self.num_experts
-                top_indices = base.unsqueeze(-1)
-                if k > 1:
-                    extra = (base.unsqueeze(-1) + torch.arange(k, device=gate_weights.device)) % self.num_experts
-                    top_indices = extra
-                top_weights = torch.ones_like(top_indices, dtype=gate_weights.dtype) / float(k)
+                top_weights, top_indices, balanced_topk = self._select_warmup_topk(gate_weights, step_idx)
             else:
-                top_weights, top_indices = torch.topk(gate_weights, self.top_k, dim=-1)
+                top_weights, top_indices, balanced_topk = self._select_topk_balanced(gate_weights)
         else:
-            top_weights, top_indices = torch.topk(gate_weights, self.top_k, dim=-1)  # [B, k]
+            top_weights, top_indices, balanced_topk = self._select_topk_balanced(gate_weights)
 
         # 权重重归一化
         top_weights = top_weights / (top_weights.sum(dim=-1, keepdim=True) + 1e-9)
@@ -837,6 +958,9 @@ class MoEProjection(nn.Module):
                 "element_expert_count": int(self.element_expert_count),
                 "num_experts": int(self.num_experts),
                 "top_k": int(self.top_k),
+                "balanced_topk": bool(balanced_topk),
+                "visual_descriptor": self.visual_descriptor,
+                "visual_spatial_pool_sizes": list(self.visual_spatial_pool_sizes),
                 "visual_token_length": int(L_v),
                 "physical_token_length": int(physical_prompts.size(1)) if physical_prompts is not None else 0,
                 "gate_logits": gate_logits.detach().float().cpu(),
@@ -881,6 +1005,7 @@ class MoEProjection(nn.Module):
                     "entropy": entropy.detach(),
                     "zloss": zloss.detach(),
                     "invalid_gate_ratio": invalid_gate_ratio.detach(),
+                    "balanced_topk": torch.tensor(float(balanced_topk), device=image_embs.device),
                     "task_route_loss": task_route_loss.detach(),
                     "element_route_loss": element_route_loss.detach(),
                     "task_route_kl": task_route_kl.detach(),

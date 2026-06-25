@@ -233,8 +233,8 @@ def _parse_option() -> ml_collections.ConfigDict:
     parser = ConfigArgumentParser()
     parser.add_argument("--opts", default=None, nargs="+")
 
-    parser.add_argument("--image-file", type=str, default="../GeoJsonData/GF1/Size_128/Image_TrueColor/海水养殖区_GF1_PMS2_E119.4_N34.9_20170210_浅海区_R004C021_128_True_WFQ.jpg")
-    parser.add_argument("--model-path", type=str, default="./output/stage3/mixed_v3/checkpoints/FINAL.pt")
+    parser.add_argument("--image-file", type=str, default="./Images/test.png")
+    parser.add_argument("--model-path", type=str, default="./output/checkpoints/FINAL_merged.pt")
     parser.add_argument("--seed", type=int, default=322)
     parser.add_argument("--temperature", type=float, default=0.4)
     parser.add_argument("--max-new-tokens", type=int, default=4096,

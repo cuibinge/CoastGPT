@@ -5,6 +5,7 @@ Conventions:
 - WGS84 coordinates: (lon, lat) tuples, written to GeoJSON as [lon, lat].
 - GeoJSON Polygon rings: closed (first == last).
 """
+import copy
 import numpy as np
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -156,6 +157,9 @@ def auto_repair_geometry(geom: dict) -> Tuple[dict, bool]:
       - Self-intersection → buffer(0)
       - LineString < 2 points after dedup → cannot repair
     """
+    # Deep-copy input to avoid mutating the caller's dict
+    geom = copy.deepcopy(geom)
+
     if not HAS_SHAPELY:
         return geom, False
 
@@ -170,12 +174,12 @@ def auto_repair_geometry(geom: dict) -> Tuple[dict, bool]:
     if geom_type == "Polygon":
         # Auto-close ring
         coords = geom["coordinates"]
-        for ring_idx, ring in enumerate(coords):
+        for ring in coords:
             if len(ring) < 3:
                 continue
             first = ring[0]
             last = ring[-1]
-            if first != last:
+            if abs(first[0] - last[0]) > 1e-12 or abs(first[1] - last[1]) > 1e-12:
                 ring.append(first)
                 repaired = True
 
@@ -406,7 +410,7 @@ def filter_sliver_features(
     features: List[dict],
     min_area_deg: float = 0.0,
     min_length_deg: float = 0.0,
-    min_points: int = 2,
+    min_points: int = 0,
 ) -> Tuple[List[dict], List[dict]]:
     """Filter sliver/tiny features.
 

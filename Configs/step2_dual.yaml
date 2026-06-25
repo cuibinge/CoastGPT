@@ -30,6 +30,10 @@ moe_proj:
   route_effect_margin: 0.3
   route_supervision_temperature: 0.5
 
+  force_balanced_topk: true
+  visual_descriptor: mean_max_std_spatial
+  visual_spatial_pool_sizes: [1, 2, 4]
+  visual_gate_hidden_mult: 1.0
 rgb_vision:
   arch: dual
   # global encoder uses DINOv3 ViT-L/16 (frozen)

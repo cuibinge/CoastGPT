@@ -12,11 +12,8 @@ Two-layer dedup:
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
-
 try:
     from shapely.geometry import shape as shapely_shape
-    from shapely.ops import unary_union
 
     HAS_SHAPELY = True
 except ImportError:
@@ -287,10 +284,10 @@ def dedup_within_source(
         if not feats:
             continue
         threshold = thresholds.get(family, 0.5)
-        dedup_fn = _FAMILY_DEDUP_FN.get(family, _iou_dedup)
+        dedup_fn = _FAMILY_DEDUP_FN[family]
         kwargs = dict(_FAMILY_EXTRA_KWARGS.get(family, {}))
         # Self-dedup: feats_a starts empty, each feature compared against kept
-        kept, _ = dedup_fn(
+        kept, removed = dedup_fn(
             feats_a=[],
             feats_b=feats,
             iou_threshold=threshold if family in ("area", "line") else 0.0,
@@ -299,16 +296,18 @@ def dedup_within_source(
             **kwargs,
         )
         kept_all.extend(kept)
+        removed_all.extend(removed)
 
     n_kept = len(kept_all)
+    n_removed = len(removed_all)
     report = DedupReport(
         kept_features=kept_all,
         removed_features=removed_all,
         stats={
             "n_input": n_input,
             "n_kept": n_kept,
-            "n_removed": n_input - n_kept,
-            "n_internal_merged": n_input - n_kept,
+            "n_removed": n_removed,
+            "n_internal_merged": n_removed,
         },
     )
     return kept_all, report
@@ -362,7 +361,7 @@ def dedup_cross_source(
             continue
         det_feats = det_by_family.get(family, [])
         threshold = thresholds.get(family, 0.5)
-        dedup_fn = _FAMILY_DEDUP_FN.get(family, _iou_dedup)
+        dedup_fn = _FAMILY_DEDUP_FN[family]
         kwargs = dict(_FAMILY_EXTRA_KWARGS.get(family, {}))
 
         keep_after, cross_removed = dedup_fn(

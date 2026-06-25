@@ -222,7 +222,7 @@ def prepare_model(config, model):
         freeze_vision=not config.tune_rgb_bk,
         freeze_text=not config.lora.enable,
         tune_multimodal=config.tune_multimodal,
-        model_path=config.model_path,
+        model_path=getattr(config, "model_path", None),
         tune_im_start=config.tune_im_start,
         compute_dtype=compute_dtype,
     )

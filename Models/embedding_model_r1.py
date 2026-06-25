@@ -63,6 +63,10 @@ class EmbeddingModel(nn.Module):
             router_noise=float(moe_cfg.get("router_noise", 0.1)),
             gate_temperature=float(moe_cfg.get("gate_temperature", 1.0)),
             moe_warmup_steps=int(moe_cfg.get("moe_warmup_steps", 0)),
+            force_balanced_topk=bool(moe_cfg.get("force_balanced_topk", False)),
+            visual_descriptor=str(moe_cfg.get("visual_descriptor", "mean")),
+            visual_spatial_pool_sizes=moe_cfg.get("visual_spatial_pool_sizes", [1, 2, 4]),
+            visual_gate_hidden_mult=float(moe_cfg.get("visual_gate_hidden_mult", 1.0)),
         )
 
     def _build_physical_prompts(

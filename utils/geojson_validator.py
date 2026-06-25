@@ -11,7 +11,7 @@ Validates:
 This is ONLY applied to LLM fallback results, not detection head results.
 """
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 
 @dataclass
@@ -98,7 +98,7 @@ def validate_llm_fallback(
 
     stats["n_passed"] = len(valid)
     report = ValidationReport(
-        passed=(stats["n_whitelist_violation"] == 0),
+        passed=(stats["n_whitelist_violation"] == 0 and stats["n_unknown_policy"] == 0),
         valid_features=valid,
         rejected_features=rejected,
         stats=stats,

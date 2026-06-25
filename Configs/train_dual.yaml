@@ -18,8 +18,12 @@ moe_proj:
   top_k: 2
   task_dim: 256
   include_physical_prompt: true
-  routing_strategy: joint
+  routing_strategy: two_stage
   task_expert_ratio: 0.5
+  force_balanced_topk: true
+  visual_descriptor: mean_max_std_spatial
+  visual_spatial_pool_sizes: [1, 2, 4]
+  visual_gate_hidden_mult: 1.0
   aux_balance_coef: 10.0
   aux_entropy_coef: 0.05
   aux_zloss_coef: 0.005

@@ -1,6 +1,6 @@
 MODEL_PATH="./output/checkpoints/FINAL.pt" # Path to the Stage1 model
 OUTPUT_PATH="./output/stage2"  # Path to save the output
-DATA_PATH="../Stage2Data"  # Path to the Stage 2 dataset
+DATA_PATH="../Stage2Data_v2"  # Path to the Stage 2 dataset
 CONFIG_PATH=./Configs/step2_dual.yaml
 SCRIPT_PATH=./train_stage_two.py
 
