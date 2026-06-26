@@ -1,0 +1,84 @@
+{
+  "model_type": "coastgpt_edge_head",
+  "architectures": [
+    "SingleScaleEdgeHead"
+  ],
+  "fpn": {
+    "in_channels": [
+      128,
+      256,
+      512,
+      1024
+    ],
+    "out_channels": 256,
+    "vit_in_channels": 1024
+  },
+  "edge_head": {
+    "in_channels": 256,
+    "decoder_channels": [
+      256,
+      128
+    ],
+    "output_size": [
+      224,
+      224
+    ],
+    "num_params": 2655105,
+    "type": "single_scale",
+    "loss": "Focal(α=0.75,γ=2.0) + Dice",
+    "labels": "GeoJSON-derived unified labels (P3-L)",
+    "train_samples": 701,
+    "val_samples": 253,
+    "input_size": [
+      224,
+      224
+    ],
+    "image_type": "4-band GF1/GF2 TIF (R,G,B,NIR)",
+    "shoreline_types": [
+      "生物岸线",
+      "盐田围堤"
+    ]
+  },
+  "performance": {
+    "buffered_f1_1px": 0.554,
+    "buffered_f1_3px": 0.782,
+    "chamfer_distance_px": 8.1,
+    "hausdorff_95_px": 36.7,
+    "by_category": {
+      "生物岸线": {
+        "threshold": 0.6,
+        "buffered_f1_1px": 0.533,
+        "buffered_f1_3px": 0.765
+      },
+      "盐田围堤": {
+        "threshold": 0.7,
+        "buffered_f1_1px": 0.586,
+        "buffered_f1_3px": 0.806
+      }
+    }
+  },
+  "training": {
+    "epochs": 12,
+    "batch_size": 2,
+    "lr_fpn": 5e-05,
+    "lr_edge_head": 0.0001,
+    "warm_start": "A1-relabel epoch 10",
+    "frozen_vision": true
+  },
+  "backbone": {
+    "global_encoder": "DINOv3 ViT-L/16",
+    "local_encoder": "ConvNeXt Base",
+    "frozen": true,
+    "input_size": [
+      224,
+      224
+    ]
+  },
+  "postprocessing": {
+    "skeletonize": true,
+    "simplify_epsilon_px": 0.1,
+    "threshold": "0.60 (生物岸线) / 0.70 (盐田围堤)",
+    "min_area": 4,
+    "min_path_length": 5
+  }
+}
