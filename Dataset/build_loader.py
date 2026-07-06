@@ -33,6 +33,21 @@ def _wavelet_dataset_kwargs(config: ml_collections.ConfigDict) -> dict:
     }
 
 
+def _task_aug_dataset_kwargs(config: ml_collections.ConfigDict) -> dict:
+    task_aug_cfg = getattr(config, "task_augmentation", None)
+    if task_aug_cfg is None or not bool(getattr(task_aug_cfg, "enabled", False)):
+        return {}
+
+    return {
+        "task_augmentation_enabled": True,
+        "task_aug_caption_keep_ratio": float(getattr(task_aug_cfg, "caption_keep_ratio", 1.0)),
+        "task_aug_yn_ratio": float(getattr(task_aug_cfg, "yn_ratio", 0.15)),
+        "task_aug_mc_ratio": float(getattr(task_aug_cfg, "mc_ratio", 0.15)),
+        "task_aug_hard_neg_ratio": float(getattr(task_aug_cfg, "hard_neg_ratio", 0.10)),
+        "task_aug_seed": int(getattr(task_aug_cfg, "seed", 42)),
+    }
+
+
 def build_loader_hepler(
     config: ml_collections.ConfigDict,
     dataset: torch.utils.data.Dataset,
@@ -95,6 +110,7 @@ def build_vlp_loader(
     torch.utils.data.DataLoader 或 wds.WebLoader: 数据加载器对象。
     """
     wavelet_dataset_kwargs = _wavelet_dataset_kwargs(config)
+    task_aug_kwargs = _task_aug_dataset_kwargs(config)
     wavelet_cfg = getattr(config, "wavelet_adapter", None)
     if wavelet_dataset_kwargs and bool(getattr(wavelet_cfg, "deterministic_transform", True)):
         config.transform.deterministic_resize = True
@@ -103,12 +119,21 @@ def build_vlp_loader(
     transform = build_vlp_transform(config, is_train=is_train, num_channels=num_channels)
     logger.info(f"Evaluate data transform:\n{transform}")
 
-    if is_train and config.stage == 1:
+    if is_train and config.stage == 0:
+        # Stage 0: contrastive pre-training — needs captions (Question/Answer pairs)
+        dataset = CaptionDatasetVQA(
+            root=config.data_path, transform=transform, **wavelet_dataset_kwargs, **kwargs
+        )
+    elif is_train and config.stage == 1:
         if "RS5M" in config.data_path:
             dataset = RS5MDataset(root=config.data_path, transform=transform, **kwargs)
         else:
             dataset = CaptionDatasetVQA(
-                root=config.data_path, transform=transform, **wavelet_dataset_kwargs, **kwargs
+                root=config.data_path,
+                transform=transform,
+                **wavelet_dataset_kwargs,
+                **task_aug_kwargs,
+                **kwargs,
             )
     elif is_train and config.stage >= 2:
         stage_value = int(getattr(config, "stage", 2))
@@ -127,6 +152,7 @@ def build_vlp_loader(
             geojson_kwargs["geojson_max_answer_tokens"] = int(config.geojson_max_answer_tokens)
         if hasattr(config, "repair_mojibake"):
             geojson_kwargs["repair_mojibake"] = bool(config.repair_mojibake)
+
         dataset = InstructDatasetWithTaskId(
             root=config.data_path,
             transform=transform,
@@ -135,6 +161,7 @@ def build_vlp_loader(
             geojson_priority=geojson_priority,
             **geojson_kwargs,
             **wavelet_dataset_kwargs,
+            **task_aug_kwargs,
             **kwargs,
         )
         if len(dataset) == 0:
@@ -142,6 +169,19 @@ def build_vlp_loader(
                 "Resolved instruction dataset is empty. "
                 f"data_path={config.data_path}. Please verify the instruction json root."
             )
+
+        # Wrap with cached vision features if enabled
+        use_cache = getattr(config, "use_vision_cache", None)
+        if use_cache and str(use_cache).strip():
+            from .cached_vision import VisionCache, CachedVisionDataset
+
+            cache = VisionCache(str(use_cache))
+            dataset = CachedVisionDataset(dataset, cache, config.data_path)
+            logger.info(
+                f"Vision cache enabled: {use_cache} "
+                f"(cache hit rate will be reported during training)"
+            )
+
         if config.weight_sample:
             from torch.utils.data import WeightedRandomSampler
             from .utils import DistributedSamplerWrapper

@@ -61,12 +61,26 @@ class EmbeddingModel(nn.Module):
             route_effect_margin=float(moe_cfg.get("route_effect_margin", 0.05)),
             route_supervision_temperature=float(moe_cfg.get("route_supervision_temperature", 1.0)),
             router_noise=float(moe_cfg.get("router_noise", 0.1)),
+            router_noise_end=float(moe_cfg.get("router_noise_end", 0.05)),
+            router_noise_warmup_steps=int(moe_cfg.get("router_noise_warmup_steps", 5000)),
             gate_temperature=float(moe_cfg.get("gate_temperature", 1.0)),
             moe_warmup_steps=int(moe_cfg.get("moe_warmup_steps", 0)),
             force_balanced_topk=bool(moe_cfg.get("force_balanced_topk", False)),
             visual_descriptor=str(moe_cfg.get("visual_descriptor", "mean")),
             visual_spatial_pool_sizes=moe_cfg.get("visual_spatial_pool_sizes", [1, 2, 4]),
             visual_gate_hidden_mult=float(moe_cfg.get("visual_gate_hidden_mult", 1.0)),
+            # v2 anti-collapse
+            residual_scale_start=float(moe_cfg.get("residual_scale_start", 0.1)),
+            residual_scale_end=float(moe_cfg.get("residual_scale_end", 0.3)),
+            residual_scale_warmup_steps=int(moe_cfg.get("residual_scale_warmup_steps", 1000)),
+            semantic_adapter_scale_init=float(moe_cfg.get("semantic_adapter_scale_init", 0.05)),
+            stage0_global_residual_scale=float(moe_cfg.get("stage0_global_residual_scale", 1.0)),
+            score_temperature=float(moe_cfg.get("score_temperature", 0.05)),
+            aux_variance_coef=float(moe_cfg.get("aux_variance_coef", 0.02)),
+            aux_token_diversity_coef=float(moe_cfg.get("aux_token_diversity_coef", 0.01)),
+            attention_diversity_weight=float(moe_cfg.get("attention_diversity_weight", 0.02)),
+            attention_diversity_margin=float(moe_cfg.get("attention_diversity_margin", 0.90)),
+            hard_load_balance_coef=float(moe_cfg.get("hard_load_balance_coef", 0.05)),
         )
 
     def _build_physical_prompts(
@@ -131,6 +145,8 @@ class EmbeddingModel(nn.Module):
         else:
             physical_prompt_mask = None
 
+        element_labels = data.get("element_text_labels", None)
+
         return self.projection(
             image_embs=image_embedding,
             physical_prompts=physical_prompts,
@@ -139,6 +155,7 @@ class EmbeddingModel(nn.Module):
             physical_prompt_mask=physical_prompt_mask,
             task_text_mask=task_text_mask,
             element_text_mask=element_text_mask,
+            element_text_labels=element_labels,
         )
 
     def encode_test(

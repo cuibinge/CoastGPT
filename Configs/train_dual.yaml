@@ -1,9 +1,38 @@
+# Reinitialize MoE projection (AttnPooler, gate, semantic_adapter) on start.
+# Set to True for v3 architecture when loading an old checkpoint.
+reset_moe: true
+
+# Cached vision features (pre-computed image_seq from frozen encoder)
+# Run scripts/cache_vision_features.py first, then set use_vision_cache path
+use_vision_cache: ""   # e.g., "../VisionCache" — empty = run encoder live
+
+# Task augmentation for visual conditioning (yes/no, multi-choice, hard negatives)
+task_augmentation:
+  enabled: true
+  caption_keep_ratio: 0.30 # keep 30% base caption samples
+  yn_ratio: 0.30           # add 30% yes/no questions
+  mc_ratio: 0.30           # add 30% multi-choice
+  hard_neg_ratio: 0.10     # add 10% hard negative samples
+  seed: 42
+
+# Stage 0: Contrastive pre-training (visual ↔ text alignment)
+stage0:
+  proj_dim: 512              # shared projection space dimension
+  temperature: 0.07          # contrastive temperature for text-anchored retrieval
+  learnable_temp: true       # auto-tune as training progresses
+  logit_scale_clip: 100.0    # CLIP-style clipping
+  mse_weight: 0.5             # regression keeps absolute semantic direction
+  contrastive_weight: 1.0     # retrieval term prevents mean-vector collapse
+  visual_diversity_weight: 0.25
+  visual_diversity_margin: 0.90
+  init_checkpoint: "./runs/stage0_mse_8npu_20260629_121909/checkpoints/FINAL.pt"        # Stage 1: copy the validated Stage0 FINAL.pt into MoE expert out_proj
+
 # Control
 alignment_dim: 1024
 adjust_norm: False
 generate: False
-prompt_template: "plain"
-stage: 1
+prompt_template: "llava_llama_2"
+stage: 1   # Stage 1: MoE projector training from validated Stage0 semantic projector
 weight_sample: False
 
 # Tune Parameter
@@ -24,7 +53,23 @@ moe_proj:
   visual_descriptor: mean_max_std_spatial
   visual_spatial_pool_sizes: [1, 2, 4]
   visual_gate_hidden_mult: 1.0
-  aux_balance_coef: 10.0
+  score_temperature: 0.05           # sweet spot: 106 eff_pos, 144 tokens differentiated
+  # v3 anti-collapse: variance-based losses + dynamic residual scale
+  residual_scale_start: 0.1
+  residual_scale_end: 0.3
+  residual_scale_warmup_steps: 45000         # ~3 epochs × 15000 steps
+  semantic_adapter_scale_init: 0.05          # keep Stage0 LN->Linear transfer dominant at startup
+  stage0_global_residual_scale: 1.0          # direct mean(image_seq)->LN->Stage0 Linear semantic anchor
+  aux_variance_coef: 0.5
+  aux_token_diversity_coef: 0.3
+  attention_diversity_weight: 0.02    # penalize 144 queries attending to same regions
+  attention_diversity_margin: 0.90    # cos threshold for attention maps
+  hard_load_balance_coef: 0.05        # penalize expert load imbalance (on soft gate_weights)
+  router_noise: 0.5                   # start high — force exploration
+  router_noise_end: 0.05               # decay to — let gate converge
+  router_noise_warmup_steps: 5000      # linear decay over ~1/3 epoch
+  moe_warmup_steps: 500                # first 500 steps: balanced round-robin routing
+  aux_balance_coef: 1.0            # was 10.0 — over-regularizing, routing already balanced
   aux_entropy_coef: 0.05
   aux_zloss_coef: 0.005
   aux_task_route_coef: 0.05
@@ -110,7 +155,9 @@ eval:
   dataset: AID
 
 # training config
-mm_moe_aux_weight: 0.2
+mm_moe_aux_weight: 0.03   # routing aux (balance/entropy/zloss/route) — keep small
+anti_collapse_weight: 0.3   # was 0.15 — stronger push against token/embedding collapse
+hard_load_balance_weight: 0.5  # expert load balance — independent direct path, higher weight
 dtype: float16
 bits: 16
 double_quant: True
@@ -147,7 +194,7 @@ schedule:
 
 # Physics branch configuration
 physics:
-  enabled: true
+  enabled: false          # Stage 1 no physics GT — only noise, skip
   out_channels: 1
   loss_weight: 1.0
   edge_weight: 0.0

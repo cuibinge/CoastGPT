@@ -486,6 +486,12 @@ class CaptionDatasetVQA(CaptionDataset):
 
     def __init__(self, tokenizer: transformers.PreTrainedTokenizer, **kwargs):
         self.tune_im_start = kwargs.pop("tune_im_start", False)
+        self.task_augmentation_enabled = bool(kwargs.pop("task_augmentation_enabled", False))
+        self.task_aug_caption_keep_ratio = float(kwargs.pop("task_aug_caption_keep_ratio", 1.0))
+        self.task_aug_yn_ratio = float(kwargs.pop("task_aug_yn_ratio", 0.15))
+        self.task_aug_mc_ratio = float(kwargs.pop("task_aug_mc_ratio", 0.15))
+        self.task_aug_hard_neg_ratio = float(kwargs.pop("task_aug_hard_neg_ratio", 0.10))
+        self.task_aug_seed = int(kwargs.pop("task_aug_seed", 42))
         prompt_type = kwargs.pop("prompt_type", "llava_llama_2")
         conversation_lib.default_conversation = conversation_lib.conv_templates[prompt_type]
         self.tokenizer = tokenizer
@@ -508,14 +514,45 @@ class CaptionDatasetVQA(CaptionDataset):
 
             self.cap_list[idx] = [conv_cap_1]
 
+        if self.task_augmentation_enabled:
+            from Dataset.task_augmentation import TaskAugmenter
+
+            aug = TaskAugmenter(
+                caption_keep_ratio=self.task_aug_caption_keep_ratio,
+                yn_ratio=self.task_aug_yn_ratio,
+                mc_ratio=self.task_aug_mc_ratio,
+                hard_neg_ratio=self.task_aug_hard_neg_ratio,
+                seed=self.task_aug_seed,
+            )
+            self.cap_list, self.img_list = aug.augment(self.cap_list, self.img_list)
+
     def __getitem__(self, idx: int) -> Dict:
         out_dict = super().__getitem__(idx)
-        out_dict["text"] = preprocess_multimodal(out_dict["text"], tune_im_start=self.tune_im_start)
+        conv = out_dict.get("text", [])
+        task_text = "描述"
+        element_text = "无"
+        model_text = []
+        if isinstance(conv, list) and len(conv) > 0 and isinstance(conv[0], dict):
+            for turn in conv:
+                if not isinstance(turn, dict):
+                    continue
+                if not model_text:
+                    task_text = turn.get("task_text") or task_text
+                    element_text = turn.get("element_text") or element_text
+                model_text.append({
+                    "Question": turn.get("Question", ""),
+                    "Answer": turn.get("Answer", turn.get("value", "")),
+                })
+        if not model_text:
+            model_text = conv
+        out_dict["text"] = preprocess_multimodal(model_text, tune_im_start=self.tune_im_start)
         out_dict["text"] = preprocess(out_dict["text"], self.tokenizer, has_image=True)
         out_dict["text"] = dict(
             input_ids=out_dict["text"]["input_ids"][0],
             labels=out_dict["text"]["labels"][0],
         )
+        out_dict["task_text"] = task_text
+        out_dict["element_text"] = element_text
 
         return out_dict
 
@@ -540,6 +577,12 @@ class InstructDataset(CaptionDataset):
         # disables the filter.
         self.geojson_max_answer_tokens = int(kwargs.pop("geojson_max_answer_tokens", 0))
         self.repair_mojibake = bool(kwargs.pop("repair_mojibake", True))
+        self.task_augmentation_enabled = bool(kwargs.pop("task_augmentation_enabled", False))
+        self.task_aug_caption_keep_ratio = float(kwargs.pop("task_aug_caption_keep_ratio", 1.0))
+        self.task_aug_yn_ratio = float(kwargs.pop("task_aug_yn_ratio", 0.15))
+        self.task_aug_mc_ratio = float(kwargs.pop("task_aug_mc_ratio", 0.15))
+        self.task_aug_hard_neg_ratio = float(kwargs.pop("task_aug_hard_neg_ratio", 0.10))
+        self.task_aug_seed = int(kwargs.pop("task_aug_seed", 42))
         self.tune_im_start = kwargs.pop("tune_im_start", False)
         prompt_type = kwargs.pop("prompt_type", "llava_llama_2")
         conversation_lib.default_conversation = conversation_lib.conv_templates[prompt_type]
@@ -641,6 +684,26 @@ class InstructDataset(CaptionDataset):
 
         self.cap_list = new_cap_list
         self.img_list = new_img_list
+
+        # ── Task augmentation: yes/no, multi-choice, hard negatives ──
+        if getattr(self, "task_augmentation_enabled", False):
+            from Dataset.task_augmentation import TaskAugmenter
+
+            yn_ratio = float(getattr(self, "task_aug_yn_ratio", 0.15))
+            mc_ratio = float(getattr(self, "task_aug_mc_ratio", 0.15))
+            hn_ratio = float(getattr(self, "task_aug_hard_neg_ratio", 0.10))
+            aug_seed = int(getattr(self, "task_aug_seed", 42))
+
+            aug = TaskAugmenter(
+                caption_keep_ratio=float(getattr(self, "task_aug_caption_keep_ratio", 1.0)),
+                yn_ratio=yn_ratio,
+                mc_ratio=mc_ratio,
+                hard_neg_ratio=hn_ratio,
+                seed=aug_seed,
+            )
+            self.cap_list, self.img_list = aug.augment(
+                self.cap_list, self.img_list
+            )
 
     def load_physics(self, idx: int):
         """
@@ -1527,6 +1590,16 @@ class InstructDatasetWithTaskId(InstructDataset):
     def __getitem__(self, idx: int) -> Dict:
         out_dict = super().__getitem__(idx)
 
+        # Try to get task/element from conversation item (set by task augmentation)
+        conv = out_dict.get("text", [])
+        aug_task_text = None
+        aug_element_text = None
+        if isinstance(conv, list) and len(conv) > 0:
+            first = conv[0]
+            if isinstance(first, dict):
+                aug_task_text = first.get("task_text", None)
+                aug_element_text = first.get("element_text", None)
+
         # 添加task_id和category_id
         if idx < len(self.task_ids):
             out_dict["task_id"] = self.task_ids[idx]
@@ -1538,8 +1611,12 @@ class InstructDatasetWithTaskId(InstructDataset):
         else:
             out_dict["category_id"] = self._default_element_id()
 
-        out_dict["task_text"] = self.task_texts[idx] if idx < len(self.task_texts) else self._default_task_text()
-        out_dict["element_text"] = self.element_texts[idx] if idx < len(self.element_texts) else self._default_element_text()
+        out_dict["task_text"] = aug_task_text or (
+            self.task_texts[idx] if idx < len(self.task_texts) else self._default_task_text()
+        )
+        out_dict["element_text"] = aug_element_text or (
+            self.element_texts[idx] if idx < len(self.element_texts) else self._default_element_text()
+        )
 
         meta = self.sample_phys_meta[idx] if idx < len(self.sample_phys_meta) else None
         out_dict["physical_prompt"] = self._build_physical_prompt(meta)
@@ -1875,9 +1952,11 @@ class DataCollatorForSupervisedDataset(object):
             )
             batch["element_text_ids"] = element_tokens.input_ids
             batch["element_text_attention_mask"] = element_tokens.attention_mask
+            batch["element_text_labels"] = element_texts   # raw strings for hard-neg loss
         else:
             batch["element_text_ids"] = None
             batch["element_text_attention_mask"] = None
+            batch["element_text_labels"] = None
 
         return batch
 

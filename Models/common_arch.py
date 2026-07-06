@@ -1,5 +1,5 @@
 from collections import OrderedDict
-from typing import Callable, List, Optional, Union, Dict
+from typing import Callable, List, Optional, Tuple, Union, Dict
 
 import torch
 import torch.nn as nn
@@ -81,9 +81,23 @@ class LinearProjection(nn.Module):
         return x
 
 
-class AttnPooler(nn.Module):
+class ImageConditionedPooler(nn.Module):
     """
-    Attention Pooler (Expert 序列压缩专家)
+    Image-Conditioned Pooler v3 — queries derived FROM image content, NOT free parameters.
+
+    Pipeline:
+      image_seq [B, L, C]
+        │
+        ├─→ ScoreNet: per-position → Q-head scores → softmax selection
+        │   → content_queries [B, Q, C]  ← different for every image!
+        │
+        ├─→ Cross-Attention refinement (content_queries attend back to image_seq)
+        │
+        ├─→ Content residual (small scale, safety net)
+        ├─→ Semantic Adapter
+        └─→ out_proj → [B, Q, output_size]
+
+    No learnable query tokens. Queries ARE the image content → cannot collapse.
     """
 
     def __init__(
@@ -98,21 +112,58 @@ class AttnPooler(nn.Module):
             checkpoint: bool = False,
             stage_num: Union[List, int] = [64, 48, 32],
             split_part: List = [256, 256, 256],
+            content_residual_scale: float = 1.0,       # kept for ckpt compat, ignored
+            residual_scale_start: float = 0.1,
+            residual_scale_end: float = 0.3,
+            residual_scale_warmup_steps: int = 1000,
+            semantic_adapter_scale_init: float = 0.05,
+            stage0_global_residual_scale: float = 1.0,
+            # ScoreNet config
+            score_hidden_mult: float = 2.0,
+            score_temperature: float = 0.05,  # 106 eff_pos, balanced specialization
     ):
         super().__init__()
         self.checkpoint = checkpoint
         self.num_query = num_query
         self.stage_num = stage_num
         self.split_part = split_part
+        self.residual_scale_start = float(residual_scale_start)
+        self.residual_scale_end = float(residual_scale_end)
+        self.residual_scale_warmup_steps = max(1, int(residual_scale_warmup_steps))
+        self.content_residual_scale = float(content_residual_scale)
+        self.semantic_adapter_scale_init = float(semantic_adapter_scale_init)
+        self.stage0_global_residual_scale = float(stage0_global_residual_scale)
+        self.score_temperature = float(score_temperature)
+        self._current_step = 0
 
-        self.query = nn.Parameter(torch.zeros(1, num_query, hidden_size))
-        nn.init.trunc_normal_(self.query, std=0.01, mean=0.0)
+        # ── ScoreNet: image content → query selection weights ──
+        # For each spatial position, predict Q scores = how much this position
+        # contributes to each of the Q query tokens.
+        score_hidden = max(1, int(round(hidden_size * score_hidden_mult)))
+        # 2D sinusoidal position embedding so ScoreNet knows WHICH region to attend
+        self.register_buffer('_score_pos_embed', self._make_2d_sincos_embed(hidden_size), persistent=False)
+        # Per-query learnable 2D position bias: query i prefers certain spatial regions
+        # [Q, H, W] flattened to [L, Q]. Content modulates but bias ensures baseline diversity.
+        self.query_pos_bias = nn.Parameter(torch.zeros(num_query, 32, 32))
+        nn.init.trunc_normal_(self.query_pos_bias, std=0.5, mean=0.0)
+        # Per-query learnable "seed" embedding: each query has a unique identity
+        # that persists even when image content is uniform.
+        # Added at small scale (0.1) after content-weighted aggregation.
+        self.query_seed = nn.Parameter(torch.zeros(1, num_query, hidden_size))
+        nn.init.trunc_normal_(self.query_seed, std=0.3, mean=0.0)
+        self.score_net = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, score_hidden),
+            nn.GELU(),
+            nn.Linear(score_hidden, num_query),
+        )
 
         if encoder_hidden_size != hidden_size:
             self.in_proj = nn.Linear(encoder_hidden_size, hidden_size)
         else:
             self.in_proj = None
 
+        # ── Cross-Attention layers for query refinement ──
         self.layers = nn.ModuleList(
             [
                 ResidualAttentionBlock(
@@ -128,109 +179,217 @@ class AttnPooler(nn.Module):
 
         self.out_proj = nn.Linear(hidden_size, output_size)
 
+        # ── Semantic adapter (after content residual) ──
+        adapter_hidden = hidden_size * 2
+        self.semantic_adapter = nn.Sequential(
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, adapter_hidden),
+            nn.GELU(),
+            nn.Linear(adapter_hidden, hidden_size),
+            # NO final LayerNorm — it kills cross-image variance
+            # by normalizing every token to mean=0, std=1.
+        )
+        self.adapter_scale = nn.Parameter(torch.ones(hidden_size) * self.semantic_adapter_scale_init)
+
+        # Stage0 trains mean(image_seq) -> LayerNorm -> Linear(1024, LLM).
+        # Keep the same normalizer immediately before out_proj so copied Stage0
+        # weights see a compatible input distribution.
+        norm_cls = norm_layer or nn.LayerNorm
+        self.pre_out_norm = norm_cls(hidden_size)
+
+    @staticmethod
+    def _make_2d_sincos_embed(dim: int, max_h: int = 32, max_w: int = 32) -> torch.Tensor:
+        """2D sinusoidal position embedding [max_h*max_w, dim]."""
+        assert dim % 4 == 0, f"dim must be divisible by 4, got {dim}"
+        half = dim // 2
+        y_embed = torch.zeros(max_h, half)
+        x_embed = torch.zeros(max_w, half)
+        pos_y = torch.arange(max_h, dtype=torch.float32).unsqueeze(1)
+        pos_x = torch.arange(max_w, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(torch.arange(0, half // 2, dtype=torch.float32) * (-math.log(10000.0) / (half // 2)))
+        y_embed[:, 0::2] = torch.sin(pos_y * div)
+        y_embed[:, 1::2] = torch.cos(pos_y * div)
+        x_embed[:, 0::2] = torch.sin(pos_x * div)
+        x_embed[:, 1::2] = torch.cos(pos_x * div)
+        embed = torch.zeros(max_h, max_w, dim)
+        embed[:, :, :half] = y_embed.unsqueeze(1)
+        embed[:, :, half:] = x_embed.unsqueeze(0)
+        return embed.reshape(-1, dim)
+
+    def _get_residual_scale(self) -> float:
+        if self._current_step >= self.residual_scale_warmup_steps:
+            return self.residual_scale_end
+        progress = self._current_step / max(1, self.residual_scale_warmup_steps)
+        return self.residual_scale_start + (
+            self.residual_scale_end - self.residual_scale_start
+        ) * progress
+
+    def _build_content_queries(self, image_embs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Build query tokens from image content via ScoreNet.
+
+        Returns:
+            queries: [B, Q, C] — content-derived query tokens
+            weights: [B, Q, L] — attention weights over spatial positions (for diagnostics)
+        """
+        B, L, C = image_embs.shape
+        # Add 2D position encoding so ScoreNet can differentiate regions
+        pos = self._score_pos_embed[:L].to(device=image_embs.device, dtype=image_embs.dtype)
+        scored_input = image_embs + pos.unsqueeze(0)  # [B, L, C]
+        scores = self.score_net(scored_input)  # [B, L, Q]
+        # Add per-query position bias: query i has learned spatial preference
+        H = W = int(L ** 0.5) if abs((int(L**0.5))**2 - L) < 1e-4 else None
+        if H is not None:
+            bias = self.query_pos_bias[:, :H, :W].reshape(self.num_query, -1).T  # [L, Q]
+        else:
+            bias = F.adaptive_avg_pool1d(
+                self.query_pos_bias.view(self.num_query, -1).T.unsqueeze(0).float(),
+                output_size=L
+            ).squeeze(0).to(dtype=scores.dtype)  # [L, Q]
+        scores = scores + bias.unsqueeze(0)  # [B, L, Q]
+        scores = scores / max(self.score_temperature, 0.01)
+        weights = F.softmax(scores.transpose(1, 2), dim=-1)  # [B, Q, L]
+        queries = torch.bmm(weights, image_embs)  # [B, Q, C]
+        # Add per-query seed at meaningful scale. image_seq positions are
+        # near-identical (cos≈0.98), so weighted sums will be similar
+        # regardless of attention distribution. The seed gives each query
+        # a learnable identity that content modulates around.
+        queries = queries * 0.7 + self.query_seed * 0.3
+        return queries, weights
+
+    def _resample_content_tokens(self, image_embs: torch.Tensor, target_tokens: int) -> torch.Tensor:
+        if target_tokens <= 0:
+            raise ValueError(f"target_tokens must be positive, got {target_tokens}")
+        if image_embs.size(1) == target_tokens:
+            content = image_embs
+        else:
+            content = F.adaptive_avg_pool1d(
+                image_embs.transpose(1, 2).float(),
+                output_size=target_tokens,
+            ).transpose(1, 2)
+            content = content.to(dtype=image_embs.dtype)
+        # LayerNorm on content kills cross-image variance.
+        # Content tokens are already well-conditioned after adaptive_pool.
+        # Just scale to reasonable magnitude.
+        content = content / (content.float().square().mean(dim=-1, keepdim=True).sqrt() + 1e-6)
+        return content.to(dtype=image_embs.dtype)
+
+    def reset_parameters(self):
+        """Reinitialize all trainable components."""
+        nn.init.trunc_normal_(self.query_pos_bias, std=0.5, mean=0.0)
+        nn.init.trunc_normal_(self.query_seed, std=0.02, mean=0.0)
+        for mod in self.score_net:
+            if hasattr(mod, 'reset_parameters'):
+                mod.reset_parameters()
+
+    def calibrate_score_net(self, image_embs: torch.Tensor):
+        """Scale ScoreNet output so scores/temperature has RMS ≈ 2.0.
+
+        Ensures softmax produces meaningful spatial selection regardless
+        of initial weight scale. Call once after reset_parameters().
+        """
+        with torch.no_grad():
+            raw_scores = self.score_net(image_embs)  # [B, L, Q]
+            actual_rms = raw_scores.float().square().mean().sqrt().item()
+            # Target: scores / temperature ≈ 2.0 → scores.rms ≈ 2.0 * temperature
+            target_rms = 2.0 * max(self.score_temperature, 0.01)
+            scale = target_rms / max(actual_rms, 1e-8)
+            last_linear = self.score_net[3]  # Linear(2048→144)
+            last_linear.weight.data.mul_(scale)
+            last_linear.bias.data.mul_(scale)
+        if self.in_proj is not None:
+            nn.init.xavier_uniform_(self.in_proj.weight)
+            nn.init.zeros_(self.in_proj.bias)
+        for layer in self.layers:
+            if hasattr(layer, 'attn'):
+                if hasattr(layer.attn, 'in_proj_weight'):
+                    nn.init.xavier_uniform_(layer.attn.in_proj_weight)
+                if hasattr(layer.attn, 'in_proj_bias'):
+                    nn.init.zeros_(layer.attn.in_proj_bias)
+                if hasattr(layer.attn, 'out_proj'):
+                    nn.init.xavier_uniform_(layer.attn.out_proj.weight)
+                    nn.init.zeros_(layer.attn.out_proj.bias)
+            for mod in layer.mlp:
+                if hasattr(mod, 'reset_parameters'):
+                    mod.reset_parameters()
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+        for mod in self.semantic_adapter:
+            if hasattr(mod, 'reset_parameters'):
+                mod.reset_parameters()
+        if hasattr(self.pre_out_norm, 'reset_parameters'):
+            self.pre_out_norm.reset_parameters()
+        nn.init.constant_(self.adapter_scale, self.semantic_adapter_scale_init)
+        self._current_step = 0
+
     def forward(
             self,
             image_embs: torch.Tensor,
             physical_queries: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        image_embs: [B, L, C] key/value 序列 (通常为视觉+物理提示拼接后的 Z_tilde)
-        physical_queries: [B, L_p, C] 可选的物理提示查询，与可学习查询一起参与注意力
+        image_embs: [B, L, C]
+        physical_queries: optional [B, L_p, C]
         """
         if self.in_proj is not None:
             image_embs = self.in_proj(image_embs)
             if physical_queries is not None:
                 physical_queries = self.in_proj(physical_queries)
 
-        query_tokens = self.query.expand(image_embs.size(0), -1, -1)
+        B, L, C = image_embs.shape
+        global_content = image_embs.float().mean(dim=1).to(dtype=image_embs.dtype)
 
-        if isinstance(self.stage_num, int):
-            stage1_query, stage2_query, stage3_query = torch.split(
-                query_tokens, self.num_query // self.stage_num, dim=1
-            )
-            stage_query_sizes = [
-                self.num_query // self.stage_num,
-                self.num_query // self.stage_num,
-                self.num_query // self.stage_num,
-            ]
-        else:
-            stage_query_sizes = list(self.stage_num)
-            if len(stage_query_sizes) != 3:
-                raise ValueError(f"stage_num must have 3 parts, got: {stage_query_sizes}")
-            if sum(stage_query_sizes) != self.num_query:
-                # Keep training robust when num_query changes from default 144.
-                even = self.num_query // 3
-                stage_query_sizes = [even, even, self.num_query - 2 * even]
-            stage1_query, stage2_query, stage3_query = torch.split(
-                query_tokens, stage_query_sizes, dim=1
-            )
+        # ── 1. Build content-derived queries via ScoreNet ──
+        query_tokens, score_weights = self._build_content_queries(image_embs)  # [B, Q, C]
 
-        # 动态切分，兼容拼接了物理特征后长度 L 变长的情况
-        L = image_embs.size(1)
-        preset_sum = sum(self.split_part) if isinstance(self.split_part, (list, tuple)) else None
-        if isinstance(self.split_part, (list, tuple)) and preset_sum == L:
-            split_sizes = list(self.split_part)
-        else:
-            base = sum(stage_query_sizes)
-            if base == 0:
-                split_sizes = [L // 3, L // 3, L - 2 * (L // 3)]
-            else:
-                sizes = [int(round(L * s / base)) for s in stage_query_sizes]
-                diff = L - sum(sizes)
-                sizes[-1] += diff
-                split_sizes = sizes
-
-        stage1_image, stage2_image, stage3_image = torch.split(image_embs, split_sizes, dim=1)
+        # Apply physical query correction if present
         if physical_queries is not None:
-            Lp = physical_queries.size(1)
-            # 按照视觉分段比例切分物理查询；避免空段
-            if L > 0:
-                phy_sizes = [max(1, int(round(Lp * s / L))) for s in split_sizes]
-                diff_phy = Lp - sum(phy_sizes)
-                phy_sizes[-1] += diff_phy
-            else:
-                phy_sizes = [Lp // 3, Lp // 3, Lp - 2 * (Lp // 3)]
-            stage1_phy, stage2_phy, stage3_phy = torch.split(physical_queries, phy_sizes, dim=1)
-        else:
-            stage1_phy = stage2_phy = stage3_phy = None
+            phy_scores = self.score_net(physical_queries)
+            phy_scores = phy_scores / max(self.score_temperature, 0.01)
+            phy_weights = F.softmax(phy_scores.transpose(1, 2), dim=-1)
+            phy_queries = torch.bmm(phy_weights, physical_queries)
+            query_tokens = query_tokens + phy_queries
 
-        all_tokens = []
-        spatial_attns = []
-        for sub_token, sub_image, sub_phy in zip(
-                [stage1_query, stage2_query, stage3_query],
-                [stage1_image, stage2_image, stage3_image],
-                [stage1_phy, stage2_phy, stage3_phy],
-        ):
-            if sub_phy is not None:
-                # 让物理提示也作为查询参与专家内部注意力
-                sub_token = torch.cat([sub_token, sub_phy], dim=1)
-            # key/value 仅由图像特征和物理序列组成，避免查询看到自身
-            kv_parts = [sub_image]
-            if sub_phy is not None:
-                kv_parts.append(sub_phy)
-            cat_embs = torch.cat(kv_parts, dim=1)
-            cat_embs = cat_embs.permute(1, 0, 2)
-            sub_token = sub_token.permute(1, 0, 2)
+        # ── 2. Cross-attention refinement: queries attend back to image_seq ──
+        pre_attn_queries = query_tokens  # save for early token diversity loss
+        kv = image_embs.permute(1, 0, 2)  # [L, B, C]
+        q_in = query_tokens.permute(1, 0, 2)  # [Q, B, C]
+        for layer in self.layers:
+            q_in = layer(q_in, kv, kv)
 
-            for layer in self.layers:
-                sub_token = layer(sub_token, cat_embs, cat_embs)
+        if not self.training and hasattr(self.layers[-1], "_last_attn_weights"):
+            self._last_spatial_attn = self.layers[-1]._last_attn_weights.mean(dim=1)[0].cpu()
 
-            if not self.training and hasattr(self.layers[-1], "_last_attn_weights"):
-                attn = self.layers[-1]._last_attn_weights
-                img_len = sub_image.size(1)
-                img_attn = attn[:, :, :img_len].mean(dim=1)
-                spatial_attns.append(img_attn)
+        query_tokens = q_in.permute(1, 0, 2)  # [B, Q, C]
 
-            sub_token = sub_token.permute(1, 0, 2)
-            all_tokens.append(sub_token)
+        # ── 3. Content residual (small scale, safety net) ──
+        current_scale = self._get_residual_scale()
+        content_tokens = self._resample_content_tokens(image_embs, query_tokens.size(1))
+        query_tokens = query_tokens + content_tokens * current_scale
 
-        if not self.training and len(spatial_attns) == 3:
-            full_spatial_attn = torch.cat(spatial_attns, dim=1)
-            self._last_spatial_attn = full_spatial_attn[0].cpu()
+        # ── 4. Semantic adapter ──
+        # Adapter is a small residual. Replacing the content tokens here breaks
+        # Stage0 transfer because the copied out_proj then receives random MLP
+        # activations instead of normalized visual content.
+        adapter_delta = self.semantic_adapter(query_tokens) * self.adapter_scale
+        query_tokens = query_tokens + adapter_delta
 
-        query_tokens = torch.cat(all_tokens, dim=1)
-        out = self.out_proj(query_tokens)
+        # ── 5. Output projection ──
+        out = self.out_proj(self.pre_out_norm(query_tokens))
+        if self.stage0_global_residual_scale != 0:
+            global_out = self.out_proj(self.pre_out_norm(global_content)).unsqueeze(1)
+            out = out + global_out * self.stage0_global_residual_scale
+
+        if self.training:
+            self._current_step += 1
+            self._last_score_weights = score_weights.detach()
+            self._last_content_queries = pre_attn_queries.detach()
+
         return out
+
+
+# Alias for backward compatibility
+AttnPooler = ImageConditionedPooler
 
 
 class RMSNorm(nn.Module):
@@ -330,12 +489,26 @@ class MoEProjection(nn.Module):
             route_effect_margin: float = 0.05,
             route_supervision_temperature: float = 1.0,
             router_noise: float = 0.1,
+            router_noise_end: float = 0.05,
+            router_noise_warmup_steps: int = 5000,
             gate_temperature: float = 1.0,
             moe_warmup_steps: int = 0,
             force_balanced_topk: bool = False,
             visual_descriptor: str = "mean",
             visual_spatial_pool_sizes: Optional[List[int]] = None,
             visual_gate_hidden_mult: float = 1.0,
+            # ── new v2 anti-collapse params ──
+            score_temperature: float = 0.05,
+            residual_scale_start: float = 0.1,
+            residual_scale_end: float = 0.3,
+            residual_scale_warmup_steps: int = 1000,
+            semantic_adapter_scale_init: float = 0.05,
+            stage0_global_residual_scale: float = 1.0,
+            aux_variance_coef: float = 0.02,
+            aux_token_diversity_coef: float = 0.01,
+            attention_diversity_weight: float = 0.02,
+            attention_diversity_margin: float = 0.90,
+            hard_load_balance_coef: float = 0.05,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -348,6 +521,8 @@ class MoEProjection(nn.Module):
         self.routing_strategy = str(routing_strategy).lower()
         self.task_expert_ratio = float(task_expert_ratio)
         self.router_noise = float(router_noise)
+        self.router_noise_end = float(router_noise_end)
+        self.router_noise_warmup_steps = int(router_noise_warmup_steps)
         self.gate_temperature = float(gate_temperature)
         self.moe_warmup_steps = int(moe_warmup_steps)
         self.force_balanced_topk = bool(force_balanced_topk)
@@ -357,10 +532,23 @@ class MoEProjection(nn.Module):
             raw_pool_sizes = raw_pool_sizes.to_list()
         self.visual_spatial_pool_sizes = [max(1, int(s)) for s in raw_pool_sizes]
         self.visual_gate_hidden_mult = float(visual_gate_hidden_mult)
+        self.score_temperature = float(score_temperature)
+        # v2 anti-collapse
+        self.residual_scale_start = float(residual_scale_start)
+        self.residual_scale_end = float(residual_scale_end)
+        self.residual_scale_warmup_steps = int(residual_scale_warmup_steps)
+        self.semantic_adapter_scale_init = float(semantic_adapter_scale_init)
+        self.stage0_global_residual_scale = float(stage0_global_residual_scale)
+        self.aux_variance_coef = float(aux_variance_coef)
+        self.aux_token_diversity_coef = float(aux_token_diversity_coef)
+        self.attention_diversity_weight = float(attention_diversity_weight)
+        self.attention_diversity_margin = float(attention_diversity_margin)
+        self.hard_load_balance_coef = float(hard_load_balance_coef)
         self._moe_step = 0
+        self._element_labels = None  # stored for variance loss
         self.text_embed_dim = int(text_embed_dim) if text_embed_dim is not None else int(encoder_hidden_size)
 
-        # 1. 专家组：基于交叉注意力的序列压缩器 (AttnPooler)
+        # 1. 专家组：基于交叉注意力的序列压缩器 (AttnPooler) v2
         self.experts = nn.ModuleList([
             AttnPooler(
                 num_query=num_query,
@@ -371,6 +559,12 @@ class MoEProjection(nn.Module):
                 output_size=output_size,
                 norm_layer=norm_layer,
                 checkpoint=checkpoint,
+                score_temperature=self.score_temperature,
+                residual_scale_start=self.residual_scale_start,
+                residual_scale_end=self.residual_scale_end,
+                residual_scale_warmup_steps=self.residual_scale_warmup_steps,
+                semantic_adapter_scale_init=self.semantic_adapter_scale_init,
+                stage0_global_residual_scale=self.stage0_global_residual_scale,
             ) for _ in range(num_experts)
         ])
 
@@ -628,6 +822,112 @@ class MoEProjection(nn.Module):
         img_gate = torch.clamp(img_gate, min=-1e4, max=1e4)
         return img_gate.to(dtype=image_embs.dtype)
 
+    def _variance_loss(
+            self,
+            embeddings: torch.Tensor,
+            element_labels: Optional[List[str]] = None,
+            soft_margin: float = 0.85,
+            hard_margin: float = 0.70,
+    ) -> torch.Tensor:
+        """Two-tier anti-collapse: soft margin for all pairs, hard margin for different-class pairs."""
+        B = embeddings.size(0)
+        if B < 2:
+            return torch.zeros((), device=embeddings.device, dtype=embeddings.dtype)
+        if embeddings.dim() == 3:
+            pooled = embeddings.float().mean(dim=1)  # [B, D]
+        else:
+            pooled = embeddings.float()
+        norms = F.normalize(pooled, dim=-1, eps=1e-6)  # [B, D]
+        cos_mat = torch.matmul(norms, norms.T)  # [B, B]
+        mask = ~torch.eye(B, device=cos_mat.device, dtype=torch.bool)
+
+        # ── A. Soft: all pairs, margin=0.85 (don't collapse to same direction) ──
+        soft_excess = F.relu(cos_mat[mask] - soft_margin)
+        soft_loss = soft_excess.mean()
+
+        # ── B. Hard: only different-class pairs, margin=0.70 ──
+        hard_loss = torch.zeros((), device=embeddings.device, dtype=embeddings.dtype)
+        if element_labels is not None and len(element_labels) == B:
+            # Build same-class mask
+            same_class = torch.zeros(B, B, dtype=torch.bool, device=cos_mat.device)
+            for i in range(B):
+                for j in range(i + 1, B):
+                    if element_labels[i] and element_labels[j] and element_labels[i] == element_labels[j]:
+                        same_class[i, j] = True
+                        same_class[j, i] = True
+            hard_mask = mask & ~same_class
+            if hard_mask.any():
+                hard_excess = F.relu(cos_mat[hard_mask] - hard_margin)
+                hard_loss = hard_excess.mean()
+
+        loss = 0.5 * soft_loss + 0.5 * hard_loss
+        return torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0).to(dtype=embeddings.dtype)
+
+    def _attention_diversity_loss(
+            self, attn_weights: torch.Tensor, max_cos: float = 0.90
+    ) -> torch.Tensor:
+        """Penalize similar attention distributions across queries.
+
+        attn_weights: [B, Q, L] — softmax attention over L spatial positions.
+        Different queries should attend to different regions.
+        """
+        B, Q, L = attn_weights.shape
+        if Q < 2:
+            return torch.zeros((), device=attn_weights.device, dtype=attn_weights.dtype)
+        # Mean over batch to get [Q, L]
+        w_mean = attn_weights.float().mean(dim=0)  # [Q, L]
+        w_norm = F.normalize(w_mean, dim=-1, eps=1e-6)  # [Q, L]
+        intra_cos = torch.matmul(w_norm, w_norm.T)  # [Q, Q]
+        mask = ~torch.eye(Q, device=intra_cos.device, dtype=torch.bool)
+        excess = F.relu(intra_cos[mask] - max_cos)
+        loss = excess.mean()
+        return torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0).to(dtype=attn_weights.dtype)
+
+    def _get_router_noise(self) -> float:
+        """Dynamic router noise: decays from router_noise → router_noise_end."""
+        if self._moe_step >= self.router_noise_warmup_steps:
+            return self.router_noise_end
+        progress = self._moe_step / max(1, self.router_noise_warmup_steps)
+        return self.router_noise + (self.router_noise_end - self.router_noise) * progress
+
+    def _hard_load_balance_loss(
+            self,
+            gate_weights: torch.Tensor,
+            num_experts: int,
+            top_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Balance soft importance and actual top-k expert coverage.
+
+        The soft gate can look balanced while hard dispatch starves an expert after
+        top-k selection. Use a straight-through top-k coverage term so the loss
+        reflects the routed experts while gradients still flow through gate_weights.
+        """
+        soft_load = gate_weights.float().mean(dim=0)
+        target = 1.0 / num_experts
+        soft_loss = (soft_load - target).abs().mean()
+        if top_indices is None:
+            return soft_loss.to(dtype=gate_weights.dtype)
+
+        hard_load = torch.zeros(num_experts, device=gate_weights.device, dtype=torch.float32)
+        for i in range(num_experts):
+            hard_load[i] = ((top_indices == i).any(dim=1)).float().mean()
+        target = float(top_indices.size(-1)) / float(num_experts)
+        hard_proxy = hard_load + (soft_load - soft_load.detach())
+        relative_error = (hard_proxy - target) / max(target, 1e-6)
+        hard_loss = 2.0 * relative_error.pow(2).mean()
+        return (soft_loss + hard_loss).to(dtype=gate_weights.dtype)
+
+    def _token_diversity_loss(self, proj_emb: torch.Tensor, max_sim: float = 0.5) -> torch.Tensor:
+        """Penalize high cosine similarity between query tokens within each sample."""
+        if proj_emb.size(1) < 2:
+            return torch.zeros((), device=proj_emb.device, dtype=proj_emb.dtype)
+        norms = F.normalize(proj_emb.float(), dim=-1)  # [B, Q, D]
+        intra_cos = torch.matmul(norms, norms.transpose(1, 2))  # [B, Q, Q]
+        mask = ~torch.eye(intra_cos.size(1), device=intra_cos.device, dtype=torch.bool)
+        excess = F.relu(intra_cos[:, mask] - float(max_sim))
+        loss = excess.mean()
+        return torch.nan_to_num(loss, nan=0.0, posinf=0.0, neginf=0.0).to(dtype=proj_emb.dtype)
+
     def _balanced_topk_enabled(self) -> bool:
         return (
             self.force_balanced_topk
@@ -646,6 +946,19 @@ class MoEProjection(nn.Module):
         element_weights = gate_weights[:, self.task_expert_count:]
         task_top_weights, task_top_indices = torch.topk(task_weights, 1, dim=-1)
         elem_top_weights, elem_top_indices = torch.topk(element_weights, 1, dim=-1)
+
+        if self.training:
+            if gate_weights.size(0) >= self.num_experts:
+                task_top_indices = self._ensure_branch_coverage(task_weights, task_top_indices)
+                elem_top_indices = self._ensure_branch_coverage(element_weights, elem_top_indices)
+            else:
+                rows = torch.arange(gate_weights.size(0), device=gate_weights.device)
+                step = int(getattr(self, '_moe_step', 0))
+                task_top_indices = ((rows + step) % self.task_expert_count).unsqueeze(-1)
+                elem_top_indices = ((rows + step) % self.element_expert_count).unsqueeze(-1)
+            task_top_weights = task_weights.gather(1, task_top_indices)
+            elem_top_weights = element_weights.gather(1, elem_top_indices)
+
         elem_top_indices = elem_top_indices + self.task_expert_count
 
         top_weights = torch.cat([task_top_weights, elem_top_weights], dim=-1)
@@ -663,6 +976,32 @@ class MoEProjection(nn.Module):
         top_weights = torch.gather(top_weights, 1, sort_order)
         top_indices = torch.gather(top_indices, 1, sort_order)
         return top_weights, top_indices, True
+
+    @staticmethod
+    def _ensure_branch_coverage(
+            branch_weights: torch.Tensor,
+            selected_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Ensure each branch expert receives at least one routed sample."""
+        if selected_indices.size(1) != 1:
+            return selected_indices
+        num_branch_experts = branch_weights.size(1)
+        if num_branch_experts <= 1 or branch_weights.size(0) < num_branch_experts:
+            return selected_indices
+
+        selected = selected_indices.clone()
+        for expert_idx in range(num_branch_experts):
+            if (selected[:, 0] == expert_idx).any():
+                continue
+            order = torch.argsort(branch_weights[:, expert_idx], descending=True)
+            for row in order:
+                row_idx = int(row.item())
+                current = int(selected[row_idx, 0].item())
+                if (selected[:, 0] == current).sum() <= 1:
+                    continue
+                selected[row_idx, 0] = expert_idx
+                break
+        return selected
 
     def _select_warmup_topk(self, gate_weights: torch.Tensor, step_idx: int):
         B_dev = gate_weights.size(0)
@@ -700,6 +1039,7 @@ class MoEProjection(nn.Module):
             physical_prompt_mask: Optional[torch.Tensor] = None,
             task_text_mask: Optional[torch.Tensor] = None,
             element_text_mask: Optional[torch.Tensor] = None,
+            element_text_labels: Optional[List[str]] = None,
     ) -> torch.Tensor:
         """
         image_embs: [B, L_v, C] 多尺度视觉特征序列 (Z_visual)
@@ -711,6 +1051,14 @@ class MoEProjection(nn.Module):
         if isinstance(image_embs, (list, tuple)):
             image_embs = torch.cat(image_embs, dim=1)
         image_embs = self._project_image_embs(image_embs)
+
+        # Lazy ScoreNet calibration: on first training step, scale weights
+        # so scores/temperature has RMS ≈ 2 (meaningful softmax selection).
+        if self.training and not getattr(self, '_score_nets_calibrated', True):
+            for expert in self.experts:
+                expert.calibrate_score_net(image_embs)
+            self._score_nets_calibrated = True
+
         B, L_v, C = image_embs.shape
         has_task_text = task_text_embs is not None
         has_element_text = element_text_embs is not None
@@ -720,6 +1068,10 @@ class MoEProjection(nn.Module):
         # ==========================================
         # 获取宏观全局 + 粗粒度空间图像上下文并对齐到 task_dim
         img_gate = self._build_visual_gate_feature(image_embs)  # [B, task_dim]
+        # v3: two-tier anti-collapse (soft margin 0.85 all pairs + hard margin 0.70 diff-class)
+        visual_gate_variance_loss = torch.zeros((), device=image_embs.device, dtype=image_embs.dtype)
+        if self.training and self.aux_variance_coef > 0:
+            visual_gate_variance_loss = self._variance_loss(img_gate.unsqueeze(1), element_labels=element_text_labels)
 
         # 从任务/要素文本 embedding 中提取语义上下文 h_task, h_element
         t_embs = self._pool_semantic_text(
@@ -817,9 +1169,9 @@ class MoEProjection(nn.Module):
         invalid_gate_ratio = (~torch.isfinite(gate_logits)).float().mean()
         gate_logits = torch.nan_to_num(gate_logits, nan=0.0, posinf=15.0, neginf=-15.0)
         gate_logits = torch.clamp(gate_logits, min=-15.0, max=15.0)
-        # Router noise for exploration (SOP Section 8)
+        # Router noise: decays from router_noise → router_noise_end over warmup
         if self.training:
-            noise_std = float(getattr(self, "router_noise", 0.1))
+            noise_std = self._get_router_noise()
             if noise_std > 0:
                 gate_logits = gate_logits + torch.randn_like(gate_logits) * noise_std
 
@@ -992,16 +1344,25 @@ class MoEProjection(nn.Module):
                 "task_route": task_route_loss,
                 "element_route": element_route_loss,
                 "task_element_orth": task_element_orth,
+                "gate_variance": visual_gate_variance_loss,
+                "proj_variance": torch.zeros((), device=image_embs.device, dtype=image_embs.dtype),
+                "token_diversity": torch.zeros((), device=image_embs.device, dtype=image_embs.dtype),
             }
 
             with torch.no_grad():
+                # top-1 load
                 top1_indices = top_indices[:, 0]
                 load = torch.zeros(self.num_experts, device=image_embs.device, dtype=torch.float32)
                 for i in range(self.num_experts):
                     load[i] = (top1_indices == i).float().mean()
+                # top-k load: fraction of samples where expert appears in ANY position
+                load_topk = torch.zeros(self.num_experts, device=image_embs.device, dtype=torch.float32)
+                for i in range(self.num_experts):
+                    load_topk[i] = ((top_indices == i).any(dim=1)).float().mean()
                 self._gate_stats = {
                     "importance": importance_soft.detach(),
                     "load": load,
+                    "load_topk": load_topk,
                     "entropy": entropy.detach(),
                     "zloss": zloss.detach(),
                     "invalid_gate_ratio": invalid_gate_ratio.detach(),
@@ -1013,6 +1374,7 @@ class MoEProjection(nn.Module):
                     "task_route_effect": task_route_effect.detach(),
                     "element_route_effect": element_route_effect.detach(),
                     "task_element_orth": task_element_orth.detach(),
+                    "gate_variance_loss": visual_gate_variance_loss.detach(),
                 }
             if self.routing_strategy in ("two_stage", "task_then_element") and self.task_expert_count > 0:
                 task_mass = gate_weights[:, :self.task_expert_count].sum(dim=-1).mean()
@@ -1068,9 +1430,45 @@ class MoEProjection(nn.Module):
             final_output = final_output + expert_out * expert_weight
 
         # ==========================================
+        # 3.5 Attention diversity + hard load balance
+        # ==========================================
+        attn_div_loss = torch.zeros((), device=image_embs.device, dtype=image_embs.dtype)
+        hard_load_loss = torch.zeros((), device=image_embs.device, dtype=image_embs.dtype)
+        if self.training:
+            if self.attention_diversity_weight > 0:
+                attn_losses = []
+                for e_id in range(self.num_experts):
+                    sw = getattr(self.experts[e_id], '_last_score_weights', None)
+                    if sw is not None and sw.size(1) >= 2:
+                        attn_losses.append(self._attention_diversity_loss(
+                            sw, max_cos=self.attention_diversity_margin
+                        ))
+                if attn_losses:
+                    attn_div_loss = torch.stack(attn_losses).mean()
+            if self.hard_load_balance_coef > 0:
+                hard_load_loss = self._hard_load_balance_loss(
+                    gate_weights, self.num_experts, top_indices
+                )
+            self._aux_terms['attn_diversity'] = attn_div_loss
+            self._aux_terms['hard_load_balance'] = hard_load_loss
+            self._gate_stats['attn_diversity_loss'] = attn_div_loss.detach()
+            self._gate_stats['hard_load_balance_loss'] = hard_load_loss.detach()
+
+        # ==========================================
         # 4. 特征对齐与约束输出
         # ==========================================
         final_output = self.final_norm(final_output) * self.output_gain
+        if self.training and (self.aux_variance_coef > 0 or self.aux_token_diversity_coef > 0):
+            proj_variance_loss = torch.zeros((), device=image_embs.device, dtype=image_embs.dtype)
+            tok_div_loss = torch.zeros((), device=image_embs.device, dtype=image_embs.dtype)
+            if self.aux_variance_coef > 0:
+                proj_variance_loss = self._variance_loss(final_output, element_labels=element_text_labels)
+            if self.aux_token_diversity_coef > 0:
+                tok_div_loss = self._token_diversity_loss(final_output)
+            self._aux_terms["proj_variance"] = proj_variance_loss
+            self._aux_terms["token_diversity"] = tok_div_loss
+            self._gate_stats["proj_variance_loss"] = proj_variance_loss.detach()
+            self._gate_stats["token_diversity_loss"] = tok_div_loss.detach()
 
         return final_output
 
@@ -1103,6 +1501,15 @@ class MoEProjection(nn.Module):
         task_element_orth = self._aux_terms.get(
             "task_element_orth", torch.tensor(0.0, device=self.gate.weight.device)
         )
+        gate_variance = self._aux_terms.get(
+            "gate_variance", torch.tensor(0.0, device=self.gate.weight.device)
+        )
+        proj_variance = self._aux_terms.get(
+            "proj_variance", torch.tensor(0.0, device=self.gate.weight.device)
+        )
+        token_diversity = self._aux_terms.get(
+            "token_diversity", torch.tensor(0.0, device=self.gate.weight.device)
+        )
 
         total = (
             self.aux_balance_coef * balance_loss
@@ -1115,6 +1522,40 @@ class MoEProjection(nn.Module):
         total = torch.nan_to_num(total, nan=0.0, posinf=0.0, neginf=0.0)
 
         return total.to(self.gate.weight.dtype)
+
+    def reset_gate_and_experts(self):
+        """Reinitialize gate_img_proj, all experts (AttnPooler), and gates."""
+        self._score_nets_calibrated = False  # will calibrate on first forward
+        # Reinit gate_img_proj
+        for mod in self.gate_img_proj:
+            if hasattr(mod, 'reset_parameters'):
+                mod.reset_parameters()
+        # Reinit each expert
+        for expert in self.experts:
+            expert.reset_parameters()
+        # Reinit task/element text projections
+        nn.init.trunc_normal_(self.task_text_query, std=0.02)
+        nn.init.trunc_normal_(self.element_text_query, std=0.02)
+        if hasattr(self, 'task_text_in_proj') and not isinstance(self.task_text_in_proj, nn.Identity):
+            if hasattr(self.task_text_in_proj, 'reset_parameters'):
+                self.task_text_in_proj.reset_parameters()
+        if hasattr(self, 'element_text_in_proj') and not isinstance(self.element_text_in_proj, nn.Identity):
+            if hasattr(self.element_text_in_proj, 'reset_parameters'):
+                self.element_text_in_proj.reset_parameters()
+        if hasattr(self, 'task_text_proj'):
+            self.task_text_proj.reset_parameters()
+        if hasattr(self, 'element_text_proj'):
+            self.element_text_proj.reset_parameters()
+        # Reinit gate layers
+        for gate_attr in ['gate', 'task_gate', 'element_gate']:
+            g = getattr(self, gate_attr, None)
+            if g is not None:
+                nn.init.normal_(g.weight, mean=0.0, std=1e-3)
+                nn.init.zeros_(g.bias)
+        # Reset step counter
+        self._moe_step = 0
+        # Reset output gain
+        nn.init.constant_(self.output_gain, 0.3)
 
 
 
